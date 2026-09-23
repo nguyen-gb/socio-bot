@@ -1,0 +1,19 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: socio-api
+  namespace: socio
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: socio-api }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: socio-browser-worker
+  namespace: socio
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: socio-browser-worker }

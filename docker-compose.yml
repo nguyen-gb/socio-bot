@@ -1,0 +1,241 @@
+name: socio
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: socio
+      POSTGRES_USER: socio
+      POSTGRES_PASSWORD: socio
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U socio -d socio"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports: ["5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+
+  temporal:
+    image: temporalio/auto-setup:1.31.2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: socio
+      POSTGRES_PWD: socio
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    ports: ["7233:7233"]
+
+  temporal-ui:
+    image: temporalio/ui:2.53.0
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports: ["8080:8080"]
+
+  minio:
+    image: minio/minio:RELEASE.2025-10-15T17-29-55Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: socio
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?Set S3_SECRET_KEY}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio-data:/data"]
+
+  api:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      API_PORT: 3001
+      WEB_ORIGIN: http://localhost:3000
+      CONTROL_API_KEY: ${CONTROL_API_KEY:?Set CONTROL_API_KEY}
+      REMOTE_SESSION_SECRET: ${REMOTE_SESSION_SECRET:?Set REMOTE_SESSION_SECRET}
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:?Set ACCESS_TOKEN_SECRET}
+      PROFILE_ENCRYPTION_KEY: ${PROFILE_ENCRYPTION_KEY:?Set PROFILE_ENCRYPTION_KEY}
+      ACCESS_TOKEN_TTL_SECONDS: 3600
+      REFRESH_TOKEN_TTL_DAYS: 30
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?Set BOOTSTRAP_ADMIN_PASSWORD}
+      OBJECT_STORAGE_DRIVER: ${OBJECT_STORAGE_DRIVER:-local}
+      OBJECT_STORAGE_ROOT: /var/lib/socio/object-storage
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: socio-assets
+      S3_ACCESS_KEY: socio
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY}
+      S3_FORCE_PATH_STYLE: "true"
+      DATABASE_URL: postgresql://socio:socio@postgres:5432/socio?schema=public
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: browser-automation
+      LOG_FILE: /var/log/socio/api.jsonl
+    ports: ["3001:3001"]
+    volumes:
+      - browser-objects:/var/lib/socio/object-storage
+      - socio-logs:/var/log/socio
+    networks: [default, monitoring]
+    restart: unless-stopped
+    init: true
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  browser-worker:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: infra/docker/browser-worker.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://socio:socio@postgres:5432/socio?schema=public
+      REDIS_URL: redis://redis:6379
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: browser-automation
+      PROFILE_ROOT: /var/lib/socio/profiles
+      ARTIFACT_ROOT: /var/lib/socio/artifacts
+      OBJECT_STORAGE_DRIVER: ${OBJECT_STORAGE_DRIVER:-local}
+      OBJECT_STORAGE_ROOT: /var/lib/socio/object-storage
+      PROFILE_ENCRYPTION_KEY: ${PROFILE_ENCRYPTION_KEY:?Set PROFILE_ENCRYPTION_KEY}
+      SECRET_ROOT: /run/secrets/socio
+      BROWSER_HEADLESS: "true"
+      BROWSER_MAX_SLOTS: 4
+      REMOTE_SESSION_PORT: 3010
+      REMOTE_SESSION_PUBLIC_URL: ${REMOTE_SESSION_PUBLIC_URL:-ws://localhost:3010}
+      REMOTE_SESSION_SECRET: ${REMOTE_SESSION_SECRET:?Set REMOTE_SESSION_SECRET}
+      REMOTE_SESSION_REDIS_RELAY: "false"
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: socio-assets
+      S3_ACCESS_KEY: socio
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY}
+      S3_FORCE_PATH_STYLE: "true"
+      LOG_FILE: /var/log/socio/browser-worker.jsonl
+    ports: ["3010:3010"]
+    volumes:
+      - browser-profiles:/var/lib/socio/profiles
+      - browser-artifacts:/var/lib/socio/artifacts
+      - browser-objects:/var/lib/socio/object-storage
+      - socio-logs:/var/log/socio
+      - ./secrets:/run/secrets/socio:ro
+    networks: [default, monitoring]
+    restart: unless-stopped
+    init: true
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3010/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    profiles: [monitoring]
+    image: prom/prometheus:v3.13.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    volumes:
+      - ./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./secrets/control-api-key:/run/secrets/control-api-key:ro
+      - prometheus-data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [monitoring]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  loki:
+    profiles: [monitoring]
+    image: grafana/loki:3.7.7
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./infra/observability/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    networks: [monitoring]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  promtail:
+    profiles: [monitoring]
+    image: grafana/promtail:3.7.7
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    depends_on: [loki]
+    volumes:
+      - ./infra/observability/promtail.yml:/etc/promtail/promtail.yml:ro
+      - socio-logs:/var/log/socio:ro
+    networks: [monitoring]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  grafana:
+    profiles: [monitoring]
+    image: grafana/grafana:13.2.1
+    depends_on: [prometheus, loki]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3002:3000"]
+    networks: [monitoring]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+  web:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    depends_on: [api]
+    environment:
+      API_INTERNAL_URL: http://api:3001
+    ports: ["3000:3000"]
+    restart: unless-stopped
+    init: true
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  browser-profiles:
+  browser-artifacts:
+  browser-objects:
+  socio-logs:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+
+networks:
+  monitoring:
+    internal: true

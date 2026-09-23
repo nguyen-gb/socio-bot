@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: socio-browser-worker
+  namespace: socio
+spec:
+  replicas: 2
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app: socio-browser-worker }
+  template:
+    metadata:
+      labels: { app: socio-browser-worker }
+    spec:
+      serviceAccountName: socio
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 900
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: browser-worker
+          image: ghcr.io/replace/socio-browser-worker:0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: socio-config }
+            - secretRef: { name: socio-secrets }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: WORKER_NAME
+              value: $(POD_NAME)
+          ports:
+            - { name: remote, containerPort: 3010 }
+          readinessProbe:
+            httpGet: { path: /health, port: remote }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: remote }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "2", memory: 3Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: profiles, mountPath: /var/lib/socio/profiles }
+            - { name: artifacts, mountPath: /var/lib/socio/artifacts }
+            - { name: proxy-secrets, mountPath: /run/secrets/socio, readOnly: true }
+      volumes:
+        - name: profiles
+          emptyDir: { sizeLimit: 4Gi }
+        - name: artifacts
+          emptyDir: { sizeLimit: 2Gi }
+        - name: proxy-secrets
+          secret: { secretName: socio-proxy-secrets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: socio-browser-worker
+  namespace: socio
+spec:
+  selector: { app: socio-browser-worker }
+  ports:
+    - { name: remote, port: 3010, targetPort: remote }

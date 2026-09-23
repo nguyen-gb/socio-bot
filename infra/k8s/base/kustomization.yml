@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yml
+  - service-account.yml
+  - configmap.yml
+  - api.yml
+  - web.yml
+  - browser-worker.yml
+  - migrate-job.yml
+  - autoscaling.yml
+  - availability.yml
+  - ingress.yml
+  - network-policy.yml

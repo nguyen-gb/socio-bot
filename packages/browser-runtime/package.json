@@ -1,0 +1,24 @@
+{
+  "name": "@socio/browser-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test dist/slot-pool.test.js dist/browser-runtime.test.js"
+  },
+  "dependencies": {
+    "@socio/object-storage": "workspace:*",
+    "@socio/platform-core": "workspace:*",
+    "playwright": "1.63.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "7.0.2"
+  }
+}

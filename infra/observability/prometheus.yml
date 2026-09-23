@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: socio-api
+    metrics_path: /api/metrics
+    authorization:
+      type: Service
+      credentials_file: /run/secrets/control-api-key
+    static_configs:
+      - targets: [api:3001]
+
+  - job_name: socio-browser-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: [browser-worker:3010]

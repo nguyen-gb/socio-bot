@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: socio-api
+  namespace: socio
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: socio-api }
+  template:
+    metadata:
+      labels: { app: socio-api }
+    spec:
+      serviceAccountName: socio
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: ghcr.io/replace/socio-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: [node, apps/api/dist/main.js]
+          envFrom:
+            - configMapRef: { name: socio-config }
+            - secretRef: { name: socio-secrets }
+          ports:
+            - { name: http, containerPort: 3001 }
+          readinessProbe:
+            httpGet: { path: /api/health/ready, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/health/live, port: http }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: socio-api
+  namespace: socio
+spec:
+  selector: { app: socio-api }
+  ports:
+    - { name: http, port: 3001, targetPort: http }

@@ -1,0 +1,20 @@
+{
+  "name": "@socio/temporal-workflows",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@socio/contracts": "workspace:*",
+    "@temporalio/workflow": "1.23.0"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

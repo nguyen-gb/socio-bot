@@ -1,0 +1,492 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrganizationRole {
+  OWNER
+  ADMIN
+  OPERATOR
+  VIEWER
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum Platform {
+  FACEBOOK
+  INSTAGRAM
+  TIKTOK
+  X
+}
+
+enum AccountStatus {
+  CREATED
+  LOGIN_REQUIRED
+  READY
+  RUNNING
+  CHALLENGED
+  EXPIRED
+  DISABLED
+  ERROR
+}
+
+enum ProfileStatus {
+  CREATED
+  AVAILABLE
+  LEASED
+  SNAPSHOTTING
+  ERROR
+}
+
+enum ProxyProtocol {
+  HTTP
+  HTTPS
+  SOCKS5
+}
+
+enum ProxyStatus {
+  CREATED
+  HEALTHY
+  UNHEALTHY
+  DISABLED
+}
+
+enum TaskStatus {
+  DRAFT
+  PAUSED
+  SCHEDULED
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  REQUIRES_ACTION
+}
+
+enum TaskRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum TaskApprovalStatus {
+  NOT_REQUIRED
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum WorkerStatus {
+  STARTING
+  READY
+  DRAINING
+  OFFLINE
+  ERROR
+}
+
+enum WorkerSlotStatus {
+  AVAILABLE
+  RESERVED
+  RUNNING
+  ERROR
+}
+
+enum BrowserSessionStatus {
+  STARTING
+  RUNNING
+  AUTHENTICATED
+  IDLE
+  CLOSING
+  CLOSED
+  EXPIRED
+  CRASHED
+}
+
+enum BrowserSessionMode {
+  LOGIN
+  AUTOMATION
+}
+
+enum MediaStatus {
+  PENDING
+  READY
+  FAILED
+  DELETED
+}
+
+model Organization {
+  id            String                @id @default(uuid()) @db.Uuid
+  name          String
+  slug          String                @unique
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  members       OrganizationMember[]
+  accounts      PlatformAccount[]
+  profiles      BrowserProfile[]
+  proxies       Proxy[]
+  tasks         Task[]
+  schedules     Schedule[]
+  mediaAssets   MediaAsset[]
+  secretRefs    SecretReference[]
+  auditLogs     AuditLog[]
+  refreshTokens RefreshToken[]
+  facebookGroups FacebookGroupMembership[]
+  facebookCampaigns FacebookCampaign[]
+}
+
+model User {
+  id          String                @id @default(uuid()) @db.Uuid
+  email       String                @unique
+  displayName String?
+  passwordHash String?
+  status      UserStatus            @default(ACTIVE)
+  lastLoginAt DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  memberships OrganizationMember[]
+  auditLogs   AuditLog[]
+  refreshTokens RefreshToken[]
+  approvedTasks Task[]               @relation("TaskApprover")
+}
+
+model RefreshToken {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @db.Uuid
+  organizationId String       @db.Uuid
+  tokenHash      String       @unique
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime     @default(now())
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([organizationId])
+}
+
+model OrganizationMember {
+  organizationId String           @db.Uuid
+  userId         String           @db.Uuid
+  role           OrganizationRole @default(VIEWER)
+  createdAt      DateTime         @default(now())
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([organizationId, userId])
+  @@index([userId])
+}
+
+model PlatformAccount {
+  id            String                @id @default(uuid()) @db.Uuid
+  organizationId String               @db.Uuid
+  platform      Platform
+  username      String?
+  externalId    String?
+  status        AccountStatus         @default(CREATED)
+  metadata      Json?
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  organization  Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  browserProfile BrowserProfile?
+  proxyBinding  AccountProxyBinding?
+  tasks         Task[]
+  schedules     Schedule[]
+  facebookGroups FacebookGroupMembership[]
+
+  @@unique([organizationId, platform, externalId])
+  @@index([organizationId, platform, status])
+}
+
+model BrowserProfile {
+  id              String                 @id @default(uuid()) @db.Uuid
+  organizationId  String                 @db.Uuid
+  accountId       String                 @unique @db.Uuid
+  storageUri      String
+  snapshotVersion Int                    @default(0)
+  status          ProfileStatus          @default(CREATED)
+  metadata        Json?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  organization    Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  account         PlatformAccount        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  snapshots       ProfileSnapshot[]
+  sessions        BrowserSession[]
+
+  @@index([organizationId, status])
+}
+
+model ProfileSnapshot {
+  id          String         @id @default(uuid()) @db.Uuid
+  profileId   String         @db.Uuid
+  version     Int
+  storageUri  String
+  checksum    String?
+  sizeBytes   BigInt?
+  encrypted   Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+  profile     BrowserProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, version])
+}
+
+model Proxy {
+  id             String                @id @default(uuid()) @db.Uuid
+  organizationId String                @db.Uuid
+  name           String
+  protocol       ProxyProtocol
+  host           String
+  port           Int
+  credentialsRef String?
+  status         ProxyStatus           @default(CREATED)
+  lastCheckedAt  DateTime?
+  latencyMs      Int?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  organization   Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  accountBindings AccountProxyBinding[]
+
+  @@index([organizationId, status])
+}
+
+model AccountProxyBinding {
+  accountId String          @id @db.Uuid
+  proxyId   String          @db.Uuid
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  account   PlatformAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  proxy     Proxy           @relation(fields: [proxyId], references: [id], onDelete: Restrict)
+
+  @@index([proxyId])
+}
+
+model Task {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @db.Uuid
+  accountId      String          @db.Uuid
+  idempotencyKey String
+  workflowId     String?         @unique
+  platform       Platform
+  action         String
+  payload        Json
+  campaignId     String?         @db.Uuid
+  campaign       FacebookCampaign? @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+  priority       Int             @default(50)
+  status         TaskStatus      @default(QUEUED)
+  scheduledAt    DateTime?
+  maxAttempts    Int             @default(3)
+  attemptCount   Int             @default(0)
+  approvalStatus TaskApprovalStatus @default(NOT_REQUIRED)
+  approvedByUserId String?       @db.Uuid
+  approvedAt     DateTime?
+  rejectedAt     DateTime?
+  lastError      String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  account        PlatformAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  approvedBy     User?           @relation("TaskApprover", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  runs           TaskRun[]
+  artifacts      Artifact[]
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, status, scheduledAt])
+  @@index([accountId, status])
+  @@index([organizationId, approvalStatus])
+  @@index([campaignId, status])
+}
+
+model FacebookGroupMembership {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @db.Uuid
+  accountId      String          @db.Uuid
+  groupUrl       String
+  groupName      String?
+  status         String          @default("UNKNOWN")
+  lastSyncedAt   DateTime         @default(now())
+  lastPostAt     DateTime?
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  account        PlatformAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, groupUrl])
+  @@index([organizationId, status])
+}
+
+model FacebookCampaign {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  idempotencyKey String
+  name           String
+  kind           String
+  payload        Json
+  approvedAt     DateTime?
+  pausedAt       DateTime?
+  cancelledAt    DateTime?
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tasks          Task[]
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, createdAt])
+}
+
+model TaskRun {
+  id         String        @id @default(uuid()) @db.Uuid
+  taskId     String        @db.Uuid
+  workerId   String?       @db.Uuid
+  status     TaskRunStatus @default(RUNNING)
+  startedAt  DateTime      @default(now())
+  finishedAt DateTime?
+  errorCode  String?
+  error      String?
+  result     Json?
+  task       Task          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  worker     WorkerNode?   @relation(fields: [workerId], references: [id], onDelete: SetNull)
+  artifacts  Artifact[]
+
+  @@index([taskId, startedAt])
+  @@index([workerId, status])
+}
+
+model Schedule {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @db.Uuid
+  accountId      String          @db.Uuid
+  name           String
+  cronExpression String
+  timezone       String          @default("UTC")
+  action         String
+  payload        Json
+  priority       Int             @default(50)
+  maxAttempts    Int             @default(3)
+  enabled        Boolean         @default(true)
+  nextRunAt      DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  account        PlatformAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, enabled, nextRunAt])
+}
+
+model WorkerNode {
+  id            String       @id @default(uuid()) @db.Uuid
+  name          String       @unique
+  status        WorkerStatus @default(STARTING)
+  hostname      String
+  capacity      Int
+  version       String?
+  metadata      Json?
+  lastHeartbeat DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  slots         WorkerSlot[]
+  sessions      BrowserSession[]
+  taskRuns      TaskRun[]
+}
+
+model WorkerSlot {
+  id        String           @id @default(uuid()) @db.Uuid
+  workerId  String           @db.Uuid
+  slotIndex Int
+  status    WorkerSlotStatus @default(AVAILABLE)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  worker    WorkerNode       @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  sessions  BrowserSession[]
+
+  @@unique([workerId, slotIndex])
+  @@index([status])
+}
+
+model BrowserSession {
+  id            String               @id @default(uuid()) @db.Uuid
+  profileId     String               @db.Uuid
+  workerId      String?              @db.Uuid
+  slotId        String?              @db.Uuid
+  workflowId    String?              @unique
+  mode          BrowserSessionMode   @default(LOGIN)
+  status        BrowserSessionStatus @default(STARTING)
+  debugEndpoint String?
+  processId     Int?
+  forceCloseRequestedAt DateTime?
+  expiresAt     DateTime
+  lastError     String?
+  startedAt     DateTime             @default(now())
+  lastActiveAt  DateTime             @default(now())
+  closedAt      DateTime?
+  profile       BrowserProfile       @relation(fields: [profileId], references: [id], onDelete: Restrict)
+  worker        WorkerNode?          @relation(fields: [workerId], references: [id], onDelete: Restrict)
+  slot          WorkerSlot?          @relation(fields: [slotId], references: [id], onDelete: Restrict)
+
+  @@index([profileId, status])
+  @@index([workerId, status])
+}
+
+model MediaAsset {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  fileName       String
+  contentType    String
+  sizeBytes      BigInt
+  storageUri     String
+  checksum       String?
+  status         MediaStatus  @default(PENDING)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+}
+
+model Artifact {
+  id         String    @id @default(uuid()) @db.Uuid
+  taskId     String    @db.Uuid
+  taskRunId  String?   @db.Uuid
+  type       String
+  storageUri String
+  contentType String?
+  sizeBytes  BigInt?
+  createdAt  DateTime  @default(now())
+  task       Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  taskRun    TaskRun?  @relation(fields: [taskRunId], references: [id], onDelete: SetNull)
+
+  @@index([taskId, type])
+}
+
+model SecretReference {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  provider       String
+  path           String
+  purpose        String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, provider, path])
+}
+
+model AuditLog {
+  id             String        @id @default(uuid()) @db.Uuid
+  organizationId String        @db.Uuid
+  actorUserId    String?       @db.Uuid
+  action         String
+  resourceType   String
+  resourceId     String?
+  metadata       Json?
+  ipAddress      String?
+  createdAt      DateTime      @default(now())
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actor          User?         @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([resourceType, resourceId])
+}

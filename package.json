@@ -1,0 +1,22 @@
+{
+  "name": "socio-bot",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "corepack pnpm -r --sort build",
+    "dev": "corepack pnpm -r --parallel dev",
+    "test": "corepack pnpm -r --sort test",
+    "typecheck": "corepack pnpm -r --sort typecheck",
+    "db:generate": "corepack pnpm --filter @socio/database prisma:generate",
+    "db:migrate": "corepack pnpm --filter @socio/database prisma:migrate",
+    "db:studio": "corepack pnpm --filter @socio/database prisma:studio"
+  },
+  "devDependencies": {
+    "turbo": "2.10.12",
+    "typescript": "7.0.2"
+  }
+}

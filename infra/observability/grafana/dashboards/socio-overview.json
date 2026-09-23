@@ -1,0 +1,34 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Active remote sessions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "sum(socio_worker_remote_sessions)", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tasks by status",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "socio_tasks_total", "legendFormat": "{{status}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 0 }
+    },
+    {
+      "type": "logs",
+      "title": "Application logs",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [{ "expr": "{job=\u0022socio\u0022}", "refId": "A" }],
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 }
+    }
+  ],
+  "schemaVersion": 41,
+  "tags": ["socio"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "title": "Socio overview",
+  "uid": "socio-overview",
+  "version": 1
+}

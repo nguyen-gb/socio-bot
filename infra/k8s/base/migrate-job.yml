@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: socio-database-migrate
+  namespace: socio
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      serviceAccountName: socio
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          image: ghcr.io/replace/socio-api:0.1.0
+          command: [corepack, pnpm, --filter, "@socio/database", prisma:deploy]
+          envFrom:
+            - configMapRef: { name: socio-config }
+            - secretRef: { name: socio-secrets }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }

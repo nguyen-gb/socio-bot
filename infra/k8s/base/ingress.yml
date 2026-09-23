@@ -1,0 +1,48 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: socio
+  namespace: socio
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 30m
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [socio.example.com]
+      secretName: socio-tls
+  rules:
+    - host: socio.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: socio-api, port: { name: http } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: socio-web, port: { name: http } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: socio-remote-session
+  namespace: socio
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [socio.example.com]
+      secretName: socio-tls
+  rules:
+    - host: socio.example.com
+      http:
+        paths:
+          - path: /worker(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service: { name: socio-browser-worker, port: { name: remote } }

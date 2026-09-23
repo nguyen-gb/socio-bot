@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: socio-config
+  namespace: socio
+data:
+  NODE_ENV: production
+  API_PORT: "3001"
+  WEB_ORIGIN: https://socio.example.com
+  API_INTERNAL_URL: http://socio-api:3001
+  REDIS_URL: redis://redis-master.data.svc.cluster.local:6379
+  TEMPORAL_ADDRESS: temporal-frontend.temporal.svc.cluster.local:7233
+  TEMPORAL_NAMESPACE: default
+  TEMPORAL_TASK_QUEUE: browser-automation
+  OBJECT_STORAGE_DRIVER: s3
+  S3_ENDPOINT: https://s3.example.com
+  S3_REGION: us-east-1
+  S3_BUCKET: socio-assets
+  S3_FORCE_PATH_STYLE: "false"
+  PROFILE_ROOT: /var/lib/socio/profiles
+  ARTIFACT_ROOT: /var/lib/socio/artifacts
+  SECRET_ROOT: /run/secrets/socio
+  BROWSER_HEADLESS: "true"
+  BROWSER_MAX_SLOTS: "2"
+  PROFILE_LEASE_TTL_MS: "1200000"
+  REMOTE_SESSION_PORT: "3010"
+  REMOTE_SESSION_PUBLIC_URL: wss://socio.example.com/worker
+  REMOTE_SESSION_REDIS_RELAY: "true"
+  ACCESS_TOKEN_TTL_SECONDS: "3600"
+  REFRESH_TOKEN_TTL_DAYS: "30"
