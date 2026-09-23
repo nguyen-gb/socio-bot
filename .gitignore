@@ -13,7 +13,7 @@ coverage/
 
 profiles/
 artifacts/
-object-storage/
+/object-storage/
 secrets/
 tmp/
 .local/

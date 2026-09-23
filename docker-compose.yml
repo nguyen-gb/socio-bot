@@ -27,7 +27,7 @@ services:
     volumes: ["redis-data:/data"]
 
   temporal:
-    image: temporalio/auto-setup:1.31.2
+    image: temporalio/auto-setup:1.29.7
     depends_on:
       postgres:
         condition: service_healthy
@@ -41,7 +41,7 @@ services:
     ports: ["7233:7233"]
 
   temporal-ui:
-    image: temporalio/ui:2.53.0
+    image: temporalio/ui:2.54.1
     depends_on: [temporal]
     environment:
       TEMPORAL_ADDRESS: temporal:7233
@@ -49,7 +49,7 @@ services:
     ports: ["8080:8080"]
 
   minio:
-    image: minio/minio:RELEASE.2025-10-15T17-29-55Z
+    image: quay.io/minio/minio:RELEASE.2025-06-13T11-33-47Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: socio
