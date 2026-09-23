@@ -11,12 +11,12 @@ coverage/
 .env.*.local
 !.env.example
 
-profiles/
-artifacts/
+/profiles/
+/artifacts/
 /object-storage/
-secrets/
-tmp/
-.local/
+/secrets/
+/tmp/
+/.local/
 
 playwright-report/
 test-results/
