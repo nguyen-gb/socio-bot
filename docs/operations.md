@@ -38,7 +38,7 @@ Check `http://localhost:3001/api/health/ready` before using the dashboard. `/hea
 
 Application logs are newline-delimited JSON. Propagate `x-request-id` from the ingress; the API generates one when absent and returns it in the response.
 
-The optional Compose monitoring profile exposes Grafana (`127.0.0.1:3002`) and Prometheus (`127.0.0.1:9090`) only on localhost. Loki has no host port and requires a tenant header. Promtail reads only the dedicated `socio-logs` volume. Create `secrets/control-api-key` with the exact control key before starting the profile.
+The optional Compose monitoring profile exposes Grafana (`127.0.0.1:3002`) and Prometheus (`127.0.0.1:9090`) only on localhost. Loki has no host port and requires a tenant header. API and browser-worker logs use separate volumes so their non-root runtime users retain write access; Promtail mounts both volumes read-only. Create `secrets/control-api-key` with the exact control key before starting the profile.
 
 ## Scaling
 

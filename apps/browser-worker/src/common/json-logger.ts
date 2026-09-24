@@ -1,5 +1,5 @@
 import type { LoggerService } from '@nestjs/common';
-import { mkdirSync, createWriteStream, type WriteStream } from 'node:fs';
+import { mkdirSync, createWriteStream } from 'node:fs';
 import { dirname } from 'node:path';
 
 export class JsonLogger implements LoggerService {
@@ -23,13 +23,37 @@ export class JsonLogger implements LoggerService {
     });
     if (level === 'error') process.stderr.write(`${entry}\n`);
     else process.stdout.write(`${entry}\n`);
-    this.file?.write(`${entry}\n`);
+    this.file?.(`${entry}\n`);
   }
 }
 
-function logFileStream(): WriteStream | undefined {
+function logFileStream(): ((entry: string) => void) | undefined {
   const path = process.env.LOG_FILE;
   if (!path) return undefined;
-  mkdirSync(dirname(path), { recursive: true });
-  return createWriteStream(path, { flags: 'a' });
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const stream = createWriteStream(path, { flags: 'a' });
+    let writable = true;
+    stream.on('error', (error) => {
+      writable = false;
+      reportFileError(path, error);
+    });
+    return (entry) => {
+      if (writable) stream.write(entry);
+    };
+  } catch (error) {
+    reportFileError(path, error);
+    return undefined;
+  }
+}
+
+function reportFileError(path: string, error: unknown): void {
+  process.stderr.write(`${JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'error',
+    service: 'socio-browser-worker',
+    message: 'File logging disabled; continuing with stdout/stderr',
+    path,
+    error: error instanceof Error ? error.message : String(error),
+  })}\n`);
 }

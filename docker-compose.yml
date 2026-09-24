@@ -96,7 +96,7 @@ services:
     ports: ["3001:3001"]
     volumes:
       - browser-objects:/var/lib/socio/object-storage
-      - socio-logs:/var/log/socio
+      - api-logs:/var/log/socio
     networks: [default, monitoring]
     restart: unless-stopped
     init: true
@@ -150,7 +150,7 @@ services:
       - browser-profiles:/var/lib/socio/profiles
       - browser-artifacts:/var/lib/socio/artifacts
       - browser-objects:/var/lib/socio/object-storage
-      - socio-logs:/var/log/socio
+      - browser-worker-logs:/var/log/socio
       - ./secrets:/run/secrets/socio:ro
     networks: [default, monitoring]
     restart: unless-stopped
@@ -193,7 +193,8 @@ services:
     depends_on: [loki]
     volumes:
       - ./infra/observability/promtail.yml:/etc/promtail/promtail.yml:ro
-      - socio-logs:/var/log/socio:ro
+      - api-logs:/var/log/socio/api:ro
+      - browser-worker-logs:/var/log/socio/browser-worker:ro
     networks: [monitoring]
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
@@ -233,7 +234,8 @@ volumes:
   browser-profiles:
   browser-artifacts:
   browser-objects:
-  socio-logs:
+  api-logs:
+  browser-worker-logs:
   prometheus-data:
   loki-data:
   grafana-data:

@@ -15,7 +15,13 @@ scrape_configs:
       - targets: [localhost]
         labels:
           job: socio
-          __path__: /var/log/socio/*.jsonl
+          service_source: api
+          __path__: /var/log/socio/api/*.jsonl
+      - targets: [localhost]
+        labels:
+          job: socio
+          service_source: browser-worker
+          __path__: /var/log/socio/browser-worker/*.jsonl
     pipeline_stages:
       - json:
           expressions:
