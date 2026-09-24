@@ -39,6 +39,8 @@ services:
       POSTGRES_SEEDS: postgres
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
     ports: ["7233:7233"]
+    volumes:
+      - ./infra/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
 
   temporal-ui:
     image: temporalio/ui:2.54.1
