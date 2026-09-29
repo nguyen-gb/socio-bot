@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/facebook-adapter.test.js dist/facebook-groups.test.js dist/facebook-post-confirmation.test.js"
+    "test": "node --test dist/facebook-adapter.test.js dist/facebook-groups.test.js dist/facebook-post-confirmation.test.js dist/facebook-group-sync.test.js dist/facebook-messages.test.js dist/facebook-comments.test.js"
   },
   "dependencies": {
     "@socio/contracts": "workspace:*",

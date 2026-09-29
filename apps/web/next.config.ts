@@ -4,6 +4,8 @@ const nextConfig: NextConfig = {
   agentRules: false,
   output: 'standalone',
   reactStrictMode: true,
+  // Multipart adds overhead to the media API's 25 MB file limit.
+  experimental: { proxyClientMaxBodySize: '26mb' },
   async headers() {
     return [
       {

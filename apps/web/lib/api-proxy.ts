@@ -33,10 +33,11 @@ export async function forwardAuthenticated(
     }
   }
 
-  const outgoing = new NextResponse(await response.text(), {
+  const outgoing = new NextResponse(await response.arrayBuffer(), {
     status: response.status,
     headers: {
       'content-type': response.headers.get('content-type') ?? 'application/json',
+      'cache-control': 'private, no-store',
     },
   });
   if (refreshed) setAuthCookies(outgoing, refreshed);

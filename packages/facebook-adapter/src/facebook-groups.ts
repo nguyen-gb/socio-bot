@@ -2,6 +2,8 @@ import { normalizeFacebookGroupUrl, type ActionResult } from '@socio/contracts';
 import { LoginRequiredError, type PlatformSession } from '@socio/platform-core';
 import type { Locator, Page, Request, Response } from 'playwright';
 import { isTaskPostRequest, readPostConfirmation, type FacebookPostConfirmation } from './facebook-post-confirmation';
+import { attachFacebookImages } from './facebook-images';
+import { scanJoinedFacebookGroups, type GroupSyncTiming } from './facebook-group-sync';
 
 const JOIN = /^(Join group|Join|Request to join(?: group)?|Join again|Tham gia nhóm|Yêu cầu tham gia(?: nhóm)?|Tham gia lại|Accept invitation|Chấp nhận lời mời)$/i;
 const JOINED = /^(Joined|Member|You(?:'|’)re a member|Đã tham gia|Bạn là thành viên|Leave group|Rời nhóm)$/i;
@@ -19,38 +21,12 @@ const MENTIONS = /^(Mentions suggestions|Gợi ý nhắc đến|Gợi ý đề c
 const normalizeText = (text: string) => text.replace(/\s+/g, ' ').trim();
 
 export class FacebookGroupsAutomation {
-  constructor(private readonly timing: { mainTimeoutMs?: number; controlTimeoutMs?: number; joinConfirmationTimeoutMs?: number; postConfirmationTimeoutMs?: number } = {}) {}
+  constructor(private readonly timing: GroupSyncTiming & { mainTimeoutMs?: number; controlTimeoutMs?: number; joinConfirmationTimeoutMs?: number; postConfirmationTimeoutMs?: number; imageUploadTimeoutMs?: number } = {}) {}
   async sync(session: PlatformSession): Promise<ActionResult> {
     const page = automationPage(session);
-    const blocked = await openGroupsPage(page, 'https://www.facebook.com/groups/joins/');
+    const blocked = await openGroupsPage(page, 'https://www.facebook.com/groups/joins/', this.timing.mainTimeoutMs);
     if (blocked) return blocked;
-    // Only collect the account's joined-groups page, not recommendations/feed links.
-    if (!new URL(page.url()).pathname.startsWith('/groups/joins')) return manual('Facebook không mở được danh sách nhóm đã tham gia');
-    const groups = new Map<string, string>();
-    let stalled = 0;
-    let complete = false;
-    for (let iteration = 0; iteration < 40; iteration++) {
-      const entries = await page.locator('[role="main"] a[href*="/groups/"]').evaluateAll((anchors) => anchors.filter((anchor) => !anchor.closest('nav,[role="navigation"]')).map((anchor) => ({
-        url: (anchor as HTMLAnchorElement).href,
-        name: (anchor.textContent ?? '').trim(),
-      })));
-      const previousSize = groups.size;
-      for (const entry of entries) {
-        try {
-          const groupUrl = normalizeFacebookGroupUrl(entry.url);
-          if (entry.name) groups.set(groupUrl, entry.name.slice(0, 255));
-        } catch { /* Ignore navigation, posts and non-group links. */ }
-      }
-      if (groups.size >= 1000) break;
-      stalled = groups.size === previousSize ? stalled + 1 : 0;
-      if (stalled >= 3) { complete = true; break; }
-      await page.mouse.wheel(0, 1800);
-      await page.waitForTimeout(700);
-      const interrupted = await guard(page);
-      if (interrupted) return interrupted;
-    }
-    if (!groups.size) return manual('Không đọc được nhóm nào. Kiểm tra account và danh sách nhóm trong browser.');
-    return { ok: true, data: { groups: [...groups].slice(0, 1000).map(([groupUrl, groupName]) => ({ groupUrl, groupName })), complete } };
+    return scanJoinedFacebookGroups(page, () => guard(page), this.timing);
   }
 
   async join(session: PlatformSession, inputUrl: string): Promise<ActionResult> {
@@ -91,7 +67,10 @@ export class FacebookGroupsAutomation {
     return manual('Đã bấm tham gia nhưng chưa xác nhận được kết quả. Không tự gửi lại yêu cầu.', { ...data, membershipStatus: 'UNKNOWN' });
   }
 
-  async post(session: PlatformSession, inputUrl: string, text: string): Promise<ActionResult> {
+  async post(session: PlatformSession, inputUrl: string, text: string, mediaAssetIds: string[] = []): Promise<ActionResult> {
+    if (mediaAssetIds.length && !session.resolveMediaAssets) throw new Error('Worker chưa hỗ trợ tải ảnh; chưa gửi bài.');
+    const images = mediaAssetIds.length ? await session.resolveMediaAssets!(mediaAssetIds) : [];
+    if (images.length !== mediaAssetIds.length) throw new Error('Không tải đủ ảnh của bài viết; chưa gửi bài.');
     const page = automationPage(session);
     const groupUrl = normalizeFacebookGroupUrl(inputUrl);
     const blocked = await openGroupsPage(page, groupUrl, this.timing.mainTimeoutMs);
@@ -122,6 +101,7 @@ export class FacebookGroupsAutomation {
     if (!(await textbox.isVisible())) return manual('Không tìm thấy trường nội dung bài đăng', { groupUrl });
     await textbox.fill(text);
     if (normalizeText(await textbox.innerText()) !== normalizeText(text)) return manual('Nội dung trong khung soạn chưa khớp; chưa gửi bài', { groupUrl });
+    const imagesReady = images.length ? await attachFacebookImages(page, dialog, images, this.timing.imageUploadTimeoutMs) : async () => true;
     const submit = dialog.getByRole('button', { name: /^(Post|Đăng|Submit|Gửi)$/i }).first();
     await submit.waitFor({ state: 'visible', timeout: this.timing.controlTimeoutMs ?? 15_000 }).catch(() => undefined);
     const enabledUntil = Date.now() + (this.timing.controlTimeoutMs ?? 15_000);
@@ -153,6 +133,7 @@ export class FacebookGroupsAutomation {
     const beforeSubmit = await guard(page);
     if (beforeSubmit) return beforeSubmit;
     if (!isGroupPage(page, groupUrl)) return manual('Facebook đã chuyển sang nhóm khác; không gửi bài.', { groupUrl });
+    if (!(await imagesReady())) return manual('Ảnh trong khung soạn chưa sẵn sàng hoặc đã thay đổi; chưa gửi bài.', { groupUrl });
     await session.beforeExternalAction?.();
     const afterMarker = await guard(page);
     if (afterMarker) return afterMarker;
@@ -170,7 +151,8 @@ export class FacebookGroupsAutomation {
     }
     await submit.focus();
     if (!(await submit.evaluate(element => document.activeElement === element)) || !(await submit.isEnabled())
-      || !isGroupPage(page, groupUrl) || !(await dialog.isVisible()) || normalizeText(await textbox.innerText()) !== normalizeText(text)) return manual('Không focus được nút Đăng hoặc nội dung đã thay đổi; chưa kích hoạt gửi.', { groupUrl });
+      || !isGroupPage(page, groupUrl) || !(await dialog.isVisible()) || normalizeText(await textbox.innerText()) !== normalizeText(text)
+      || !(await imagesReady())) return manual('Không focus được nút Đăng hoặc nội dung/ảnh đã thay đổi; chưa kích hoạt gửi.', { groupUrl });
     const actorId = (await page.context().cookies('https://www.facebook.com/')).find(cookie => cookie.name === 'c_user')?.value ?? '';
     let creation: FacebookPostConfirmation | undefined;
     let listening = true;
@@ -179,7 +161,7 @@ export class FacebookGroupsAutomation {
       const endpoint = new URL(request.url());
       return endpoint.protocol === 'https:' && ['facebook.com', 'www.facebook.com', 'm.facebook.com'].includes(endpoint.hostname)
         && (!endpoint.port || endpoint.port === '443') && /^\/api\/graphql\/?$/.test(endpoint.pathname) && request.method() === 'POST'
-        && isTaskPostRequest(request.postData() ?? '', groupUrl, text, actorId);
+        && isTaskPostRequest(request.postData() ?? '', groupUrl, text, actorId, images.length);
     };
     const observeRequest = (request: Request) => { if (matchesCreation(request)) creationObserved = true; };
     const observeCreation = (response: Response) => {
@@ -206,9 +188,9 @@ export class FacebookGroupsAutomation {
           data: { groupUrl, publicationStatus: creation.status, postUrl: creation.postUrl, confirmationSource: 'CREATION_RESPONSE' },
         };
         const pendingNotice = page.getByText(PENDING_POST).first();
-        if (!pendingBefore && await pendingNotice.isVisible()) return { ok: true, data: { groupUrl, publicationStatus: 'PENDING_APPROVAL' } };
+        if (!pendingBefore && (!images.length || creationObserved) && await pendingNotice.isVisible()) return { ok: true, data: { groupUrl, publicationStatus: 'PENDING_APPROVAL' } };
         const posted = page.getByRole('article').filter({ hasText: excerpt, visible: true });
-        if (!creationObserved && !(await dialog.isVisible()) && await posted.count() > previousPosts) {
+        if (!images.length && excerpt && !creationObserved && !(await dialog.isVisible()) && await posted.count() > previousPosts) {
           const permalink = posted.last().locator('a[href*="/posts/"],a[href*="permalink"]').first();
           const href = await permalink.count() ? await permalink.getAttribute('href') : null;
           const link = href ? new URL(href, groupUrl).href : null;

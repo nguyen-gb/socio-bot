@@ -17,7 +17,7 @@ interface ScheduledTaskActivities {
 const { materializeScheduledTask, executeBrowserTask } =
   proxyActivities<ScheduledTaskActivities>({
     startToCloseTimeout: '15 minutes',
-    heartbeatTimeout: '30 seconds',
+    heartbeatTimeout: '2 minutes',
     retry: {
       maximumAttempts: 5,
       initialInterval: '5 seconds',

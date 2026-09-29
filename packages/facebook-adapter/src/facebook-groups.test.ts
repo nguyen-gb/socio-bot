@@ -70,6 +70,63 @@ test('missing login cookie prevents joining', async () => fixture('<button>Join 
   await assert.rejects(() => automation.join({ page, profileId: 'fixture' }, url), /interactive login/);
 }, false));
 const composer = (after: string) => `<button>Joined</button><button onclick="document.querySelector('[role=dialog]').hidden=false">Write something</button><div role="dialog" hidden><div role="textbox" contenteditable="true"></div><button onclick="${after}">Post</button></div>`;
+
+const photoBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
+for (const scenario of ['caption', 'photo-only', 'file-chooser', 'upload-error', 'partial-upload', 'removed-before-send', 'missing-attachment-request', 'pending-photo', 'large-images']) {
+  test(`image posting in Chromium: ${scenario}`, async () => {
+    const text = scenario === 'photo-only' ? '' : 'Fixture post';
+    const ids = scenario === 'large-images' ? Array.from({ length: 6 }, (_, index) => `photo-${index}`) : ['photo-a', 'photo-b'];
+    const body = new URLSearchParams({ fb_api_req_friendly_name: 'ComposerStoryCreateMutation', variables: JSON.stringify({ input: {
+      audience: { to_id: '123456' }, actor_id: 'fixture-user', message: text ? { text } : null,
+      attachments: (scenario === 'missing-attachment-request' ? ids.slice(0, 1) : ids).map(id => ({ photo: { id } })),
+    } }) }).toString();
+    const html = composer('') + `<script>
+      const dialog = document.querySelector('[role=dialog]'), post = dialog.querySelector('button');
+      const input = document.createElement('input'); input.type='file'; input.accept='image/*'; input.multiple=true; input.hidden=true;
+      ${scenario === 'file-chooser' ? `document.body.append(input); const add=document.createElement('button'); add.textContent='Photo/video'; add.onclick=()=>input.click(); dialog.prepend(add);` : 'dialog.append(input);'}
+      input.onchange=()=>{
+        window.files=[...input.files].map(file=>file.name); post.disabled=true;
+        const progress=document.createElement('div'); progress.setAttribute('role','progressbar'); progress.textContent='Uploading'; dialog.append(progress);
+        setTimeout(()=>{
+          progress.remove();
+          ${scenario === 'upload-error' ? `const error=document.createElement('p');error.textContent='Failed to upload';dialog.append(error);` : `for(const file of [...input.files].slice(0,${scenario === 'partial-upload' ? 1 : ids.length})){const image=document.createElement('img');image.src=URL.createObjectURL(file);image.width=80;image.height=80;dialog.append(image);}`}
+          post.disabled=false;
+        },200);
+      };
+      post.onclick=()=>{window.posts=(window.posts||0)+1;dialog.hidden=true;fetch('/api/graphql/',{method:'POST',body:${JSON.stringify(body)}});};
+    </script>`;
+    await fixture(html, async page => {
+      let markers = 0;
+      const reply = JSON.parse(JSON.stringify(creationReply));
+      reply.data.story_create.group_feed_story_edge.node.comet_sections.content.story.message = text ? { text } : null;
+      if (scenario === 'pending-photo') reply.data.story_create.story.if_viewer_can_learn_more_about_pending_post = { __typename: 'PendingPost' };
+      await page.route('**/api/graphql/', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify(reply) }));
+      const session = { page, profileId: 'fixture', resolveMediaAssets: async (requested: string[]) => {
+        assert.deepEqual(requested, ids);
+        const buffer = scenario === 'large-images' ? Buffer.alloc(9 * 1024 * 1024) : photoBytes;
+        if (scenario === 'large-images') photoBytes.copy(buffer);
+        return ids.map(id => ({ name: `${id}.png`, mimeType: 'image/png', buffer }));
+      }, beforeExternalAction: async () => {
+        markers++;
+        assert.equal(await page.getByRole('progressbar').count(), 0);
+        assert.equal(await page.getByRole('dialog').locator('img').count(), ids.length);
+        if (scenario === 'removed-before-send') await page.getByRole('dialog').locator('img').last().evaluate(element => element.remove());
+      } };
+      const imagesAutomation = new FacebookGroupsAutomation({ controlTimeoutMs: 600, imageUploadTimeoutMs: 1800, postConfirmationTimeoutMs: 800 });
+      if (scenario === 'upload-error' || scenario === 'partial-upload') {
+        await assert.rejects(imagesAutomation.post(session, url, text, ids), /ảnh/);
+        assert.equal(markers, 0); assert.equal(await page.evaluate('window.posts||0'), 0);
+      } else {
+        const result = await imagesAutomation.post(session, url, text, ids);
+        const succeeds = !['removed-before-send', 'missing-attachment-request'].includes(scenario);
+        assert.equal(result.ok, succeeds);
+        assert.equal(await page.evaluate('window.posts||0'), scenario === 'removed-before-send' ? 0 : 1);
+        if (succeeds) assert.equal(result.data?.publicationStatus, scenario === 'pending-photo' ? 'PENDING_APPROVAL' : 'PUBLISHED');
+      }
+      assert.deepEqual(await page.evaluate('window.files'), scenario === 'large-images' ? ids.map((_, index) => `${index}.png`) : ['photo-a.png', 'photo-b.png']);
+    });
+  });
+}
 test('post never presses Enter in the editor when focus is redirected away from Post', async () => fixture(composer('window.submitted=true').replace('<button onclick="window.submitted', '<button onfocus="document.querySelector(\'[role=textbox]\').focus()" onclick="window.submitted'), async page => {
   let markers = 0;
   await page.addInitScript(() => document.addEventListener('keydown', event => { if (event.key === 'Enter') (window as unknown as { enters: number }).enters = 1; }));

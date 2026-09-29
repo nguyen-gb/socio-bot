@@ -12,6 +12,19 @@ test('creation request must match task group, full text, actor and mutation', ()
   assert.equal(isTaskPostRequest(request().replace('ComposerStoryCreateMutation', 'OtherMutation'), group, 'Test', 'fixture-user'), false);
   assert.equal(isTaskPostRequest('not JSON', group, 'Test', 'fixture-user'), false);
 });
+
+test('photo creation must match attachment count; photo-only requests may omit message', () => {
+  const attachments = [{ photo: { id: 'photo1' } }, { photo: { id: 'photo2' } }];
+  assert.equal(isTaskPostRequest(request({ attachments }), group, 'Test', 'fixture-user', 2), true);
+  assert.equal(isTaskPostRequest(request({ attachments }), group, 'Test', 'fixture-user', 1), false);
+  assert.equal(isTaskPostRequest(request(), group, 'Test', 'fixture-user', 2), false);
+  assert.equal(isTaskPostRequest(request({ attachments, message: null }), group, '', 'fixture-user', 2), true);
+  assert.equal(isTaskPostRequest(request({ attachments: [{ video: { id: 'video1' } }] }), group, 'Test', 'fixture-user', 1), false);
+  const value = response();
+  (value.data.story_create.group_feed_story_edge.node.comet_sections.content.story as any).message = null;
+  assert.equal(readPostConfirmation(JSON.stringify(value), group, '')?.status, 'PUBLISHED');
+  assert.equal(readPostConfirmation(JSON.stringify(value), group, 'Expected text'), undefined);
+});
 test('observed Facebook FALLBACK response confirms public feed post despite null top-level post_id', () => {
   assert.deepEqual(readPostConfirmation(JSON.stringify(response()), group, 'Test'), { status: 'PUBLISHED', postUrl: `${group}permalink/789/` });
 });

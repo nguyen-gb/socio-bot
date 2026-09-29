@@ -10,7 +10,7 @@ Nguồn tham khảo: [Linear UI](https://linear.app/changelog/2024-03-20-new-lin
 - URL hash giữ khu vực đang xem khi reload, Back/Forward và quay về từ browser.
 - Profiles có tìm kiếm và lọc trạng thái. Popup hiển thị đồng thời cookie, username và password; sửa dữ liệu đã lưu trực tiếp.
 - Proxy hiển thị địa chỉ, trạng thái, xác thực và các profile được gán. Cột dài được giới hạn trong bảng.
-- Facebook tách Chiến dịch và Nhóm, có tiến độ thật và hướng dẫn khi cần thao tác. Mọi chiến dịch phải được duyệt trước khi chạy.
+- Facebook tách Chiến dịch và Nhóm, có tiến độ thật và hướng dẫn khi cần thao tác. Đồng bộ/tham gia/nhắn tin cần duyệt trước khi chạy; đăng bài được lên lịch ngay sau khi tạo.
 - Tạo lịch trong popup, xóa có xác nhận. Lỗi lưu giữ popup mở và không làm mất dữ liệu đã nhập.
 - Thư viện vẫn cho tải media; giải thích rõ chiến dịch nhóm hiện hỗ trợ bài chữ, chưa hỗ trợ đăng trực tiếp lên trang cá nhân.
 - Trình duyệt kết thúc không hiển thị spinner vô hạn. Các điều khiển bị tắt khi hết phiên.

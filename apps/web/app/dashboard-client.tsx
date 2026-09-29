@@ -105,6 +105,7 @@ interface TaskItem {
   approvalStatus?: string;
   campaignId?: string;
   lastError?: string;
+  runs?: Array<{ result?: { groupCount?: number; complete?: boolean } }>;
   account: Account;
 }
 
@@ -876,8 +877,8 @@ export default function DashboardClient() {
               <div className="composer-panel">
                 <span className="summary-icon"><Icon name="media" size={28} /></span>
                 <Typography.Title level={4} style={{ margin: 0 }}>Nội dung cho chiến dịch</Typography.Title>
-                <Typography.Paragraph type="secondary" style={{ margin: 0 }}>Tải ảnh và video vào thư viện để quản lý tập trung. Đăng bài vào nhóm được thực hiện trong khu vực Facebook, nơi bạn chọn profile, nhóm đích và duyệt nội dung trước khi chạy.</Typography.Paragraph>
-                <Alert type="info" showIcon title="Hiện tại chiến dịch nhóm hỗ trợ bài chữ." description="Đính kèm media và đăng trực tiếp lên trang cá nhân chưa được hỗ trợ." />
+                <Typography.Paragraph type="secondary" style={{ margin: 0 }}>Tải ảnh và video vào thư viện để quản lý tập trung. Đăng bài vào nhóm được thực hiện trong khu vực Facebook, nơi bạn chọn profile và nhóm đích; bài đăng được lên lịch ngay sau khi tạo.</Typography.Paragraph>
+                <Alert type="info" showIcon title="Chiến dịch nhóm hỗ trợ bài chữ và ảnh." description="Chọn ảnh từ thư viện hoặc tải ảnh trong Soạn bài nhóm. Hỗ trợ JPG, PNG, WebP; tối đa 10 ảnh, 10 MB/ảnh. Chưa hỗ trợ video và đăng lên trang cá nhân." />
                 <Flex><Button type="primary" icon={<Icon name="arrow" />} onClick={() => navigate('facebook')}>Soạn bài nhóm Facebook</Button></Flex>
               </div>
             </Col>
@@ -899,7 +900,7 @@ export default function DashboardClient() {
             { title: 'Trạng thái', dataIndex: 'status', render: statusTag },
             { title: 'Phê duyệt', dataIndex: 'approvalStatus', render: (value: string) => STATUS_LABELS[value] ?? value },
             { title: 'Ngày tạo', render: (_: unknown, item: TaskItem) => new Date(item.createdAt).toLocaleString('vi-VN') },
-            { title: 'Chi tiết', dataIndex: 'lastError', render: (value?: string) => <Typography.Text type="secondary">{value ?? '—'}</Typography.Text> },
+            { title: 'Chi tiết', render: (_: unknown, item: TaskItem) => <Space orientation="vertical" size={2}>{item.action === 'SYNC_FACEBOOK_GROUPS' && typeof item.runs?.[0]?.result?.groupCount === 'number' ? <Typography.Text>Đã đồng bộ {item.runs[0].result.groupCount} nhóm{item.runs[0].result.complete === false ? ' · Chưa đọc hết danh sách' : ''}</Typography.Text> : null}<Typography.Text type="secondary">{item.lastError ?? (item.action === 'SYNC_FACEBOOK_GROUPS' && item.runs?.[0]?.result?.complete ? 'Đã quét hết danh sách nhóm Facebook tải được.' : '—')}</Typography.Text></Space> },
             { title: 'Quyết định', width: 100, render: (_: unknown, item: TaskItem) => item.campaignId ? <Button type="link" onClick={() => navigate('facebook')}>Chiến dịch</Button> : item.approvalStatus === 'PENDING' ? <Space><ActionButton label="Duyệt" icon="approve" disabled={!canAdmin} onClick={() => void perform(`approve-${item.id}`, () => mutate(`/api/tasks/${item.id}/approve`), ['tasks'])} /><ActionButton label="Từ chối" icon="reject" danger disabled={!canAdmin} onClick={() => void perform(`reject-${item.id}`, () => mutate(`/api/tasks/${item.id}/reject`), ['tasks'])} /></Space> : null },
           ]} />
         </Card>

@@ -12,7 +12,7 @@ export interface LoginSessionActivities {
 
 const { runInteractiveLoginSession } = proxyActivities<LoginSessionActivities>({
   startToCloseTimeout: '35 minutes',
-  heartbeatTimeout: '30 seconds',
+  heartbeatTimeout: '2 minutes',
   cancellationType: 'WAIT_CANCELLATION_COMPLETED',
   retry: { maximumAttempts: 1 },
 });

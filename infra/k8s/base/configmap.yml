@@ -20,7 +20,6 @@ data:
   PROFILE_ROOT: /var/lib/socio/profiles
   ARTIFACT_ROOT: /var/lib/socio/artifacts
   SECRET_ROOT: /run/secrets/socio
-  BROWSER_HEADLESS: "true"
   BROWSER_MAX_SLOTS: "2"
   PROFILE_LEASE_TTL_MS: "1200000"
   REMOTE_SESSION_PORT: "3010"

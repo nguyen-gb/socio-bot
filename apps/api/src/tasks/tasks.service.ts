@@ -4,6 +4,7 @@ import { requiresExternalApproval, type CreateTaskInput } from '@socio/contracts
 import { Prisma, type Task } from '@socio/database';
 import { PrismaService } from '../database/prisma.service';
 import { TemporalClientService } from '../temporal/temporal-client.service';
+import { validateFacebookImages } from '../media/facebook-images';
 
 @Injectable()
 export class TasksService {
@@ -46,6 +47,10 @@ export class TasksService {
       select: { id: true },
     });
     if (!account) throw new NotFoundException('Account not found');
+
+    if (input.action.action === 'POST_FACEBOOK_GROUP' || input.action.action === 'MESSAGE_FACEBOOK_RECIPIENT') {
+      await validateFacebookImages(this.prisma, organizationId, input.action.payload.mediaAssetIds);
+    }
 
     if (input.action.action === 'PUBLISH_POST' && input.action.payload.mediaAssetIds.length > 0) {
       const mediaCount = await this.prisma.mediaAsset.count({

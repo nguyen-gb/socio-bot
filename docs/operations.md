@@ -58,6 +58,10 @@ Back up PostgreSQL and the object-storage volume together. Profile snapshot rows
 
 ## External publishing boundary
 
+### Browser compatibility
+
+The worker can use a locally installed Chrome-compatible channel with `BROWSER_CHANNEL=chrome`, and set `BROWSER_LOCALE`/`BROWSER_TIMEZONE_ID` to match the authorized profile. Campaign/automation mode is derived from `NODE_ENV`: development workers run headed for debugging, while production workers run headless for throughput. Interactive sessions opened from **Profiles** always run headed in either environment. The runtime uses a persistent profile, native user-agent, normal viewport behavior, touch/device defaults and enabled service workers. It deliberately does not spoof `navigator.webdriver`, disable security features, rotate fingerprints or bypass CAPTCHA; Facebook verification still requires manual action.
+
 Reviewed Facebook group join/text-post campaigns are enabled separately from the generic connector. See [facebook.md](facebook.md). Test on authorized groups before use; questions, CAPTCHA, account restrictions and ambiguous outcomes require manual action.
 
 `PUBLISH_POST` requests require ADMIN approval and remain held as `DRAFT`. This repository does not send them to an external platform by default. Enabling a real connector requires explicit authorization for the target Page/account, a platform-issued token supplied through a secret provider, and a staging verification before production dispatch.

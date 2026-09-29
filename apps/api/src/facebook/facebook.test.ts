@@ -1,21 +1,63 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { distributePostTargets, FacebookService, retrySafety } from './facebook.service';
+import { distributeMessageTargets, distributePostTargets, distributeReplyCounts, FacebookService, retrySafety } from './facebook.service';
 
 const account = (id: string) => ({ id, username: id, browserProfile: { sessions: [] }, proxyBinding: null });
+
+test('sync creates an approval-controlled Facebook campaign for all or selected profiles', async () => {
+  const ids = [1, 2].map(i => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`);
+  let created: any;
+  const prisma = { platformAccount: { findMany: async (query: any) => {
+    assert.equal(query.where.organizationId, 'org'); assert.equal(query.where.platform, 'FACEBOOK'); assert.equal(query.where.status, 'READY');
+    return ids.filter(id => !query.where.id || query.where.id.in.includes(id)).map(account);
+  } }, facebookCampaign: {
+    findUnique: async () => null,
+    create: async (input: any) => { created = input.data; return { id: 'campaign', ...input.data }; },
+  } };
+  const service = new FacebookService(prisma as never, {} as never, {} as never);
+  const all = await service.sync('org', { scope: 'ALL', accountIds: [], idempotencyKey: 'sync-all-key' });
+  assert.equal(all.kind, 'SYNC'); assert.equal(created.name, 'Đồng bộ tất cả nhóm Facebook');
+  assert.deepEqual(created.tasks.create.map((task: any) => task.accountId), ids);
+  assert.ok(created.tasks.create.every((task: any) => task.action === 'SYNC_FACEBOOK_GROUPS' && task.status === 'DRAFT' && task.approvalStatus === 'PENDING'));
+  const selected = await service.sync('org', { scope: 'SELECTED', accountIds: [ids[1]!], idempotencyKey: 'sync-selected-key' });
+  assert.equal(selected.kind, 'SYNC'); assert.deepEqual(created.tasks.create.map((task: any) => task.accountId), [ids[1]]);
+  await assert.rejects(service.sync('org', { scope: 'SELECTED', accountIds: [], idempotencyKey: 'invalid-sync-key' }), /Chọn ít nhất một/);
+});
 function setup(ids = ['a', 'b']) {
   let data: any;
+  let campaign: any;
   const starts: any[] = [];
-  const prisma = {
-    platformAccount: { findMany: async (input: any) => { assert.equal(input.where.organizationId, 'org'); assert.equal(input.where.platform, 'FACEBOOK'); return ids.map(account); } },
+  const createCampaign = async (input: any) => {
+    data = input.data;
+    campaign = {
+      ...data,
+      id: 'campaign',
+      approvedAt: data.approvedAt ?? null,
+      pausedAt: null,
+      cancelledAt: null,
+      tasks: data.tasks.create.map((task: any) => ({ ...task, account: account(task.accountId), runs: [] })),
+    };
+    return campaign;
+  };
+  const prisma: any = {
+    platformAccount: { findMany: async (input: any) => { assert.equal(input.where.organizationId, 'org'); assert.equal(input.where.platform, 'FACEBOOK'); const selected = input.where.id?.in ? ids.filter(id => input.where.id.in.includes(id)) : ids; return selected.map(account); } },
     facebookGroupMembership: { findMany: async (input: any) => {
       assert.equal(input.where.organizationId, 'org');
       const selectedIds = input.where.accountId?.in ?? [input.where.accountId];
       const urls = input.where.groupUrl?.in ?? ['1', '2', '3'].map(id => `https://www.facebook.com/groups/${id}/`);
       return selectedIds.flatMap((accountId: string) => urls.map((groupUrl: string) => ({ accountId, groupUrl })));
     } },
-    facebookCampaign: { findUnique: async () => null, create: async (input: any) => { data = input.data; return { ...data, id: 'campaign' }; } },
+    facebookCampaign: { findUnique: async () => null, findFirst: async () => campaign, create: createCampaign, findUniqueOrThrow: async () => campaign },
+    facebookGroupCollection: { findMany: async () => [] },
+    facebookOptInRecipient: { findMany: async () => [] },
+    task: { findMany: async () => [], count: async () => 0, updateMany: async () => ({ count: 1 }) },
   };
+  prisma.$transaction = async (callback: (tx: any) => unknown) => callback({
+    $executeRaw: async () => 0,
+    platformAccount: prisma.platformAccount,
+    facebookCampaign: { create: createCampaign, updateMany: async () => ({ count: 1 }) },
+    task: { count: async () => 0, updateMany: async () => ({ count: 1 }) },
+  });
   const temporal = { startTask: async (...args: any[]) => { starts.push(args); } };
   return { service: new FacebookService(prisma as never, {} as never, temporal as never), prisma, starts, data: () => data };
 }
@@ -27,6 +69,31 @@ test('join snapshots every account/link pair as un-dispatched draft with no retr
   for (const job of jobs) { assert.equal(job.status, 'DRAFT'); assert.equal(job.approvalStatus, 'PENDING'); assert.equal(job.maxAttempts, 1); }
   assert.equal(context.starts.length, 0);
 });
+
+test('photo campaign validates workspace ownership and freezes images in every task', async () => {
+  const context = setup();
+  const mediaAssetIds = ['00000000-0000-4000-8000-000000000001'];
+  const prisma = context.prisma as any;
+  prisma.mediaAsset = { count: async (input: any) => {
+    assert.equal(input.where.organizationId, 'org');
+    assert.equal(input.where.status, 'READY');
+    assert.deepEqual(input.where.id.in, mediaAssetIds);
+    assert.deepEqual(input.where.contentType.in, ['image/jpeg', 'image/png', 'image/webp']);
+    assert.equal(input.where.sizeBytes.lte, 10 * 1024 * 1024);
+    return 1;
+  } };
+  const input = { name: 'Images', idempotencyKey: 'photo-key', accountIds: [], selection: 'ALL' as const, maxGroupsPerAccount: 2, text: '', mediaAssetIds, intervalSeconds: 60 };
+  await context.service.post('org', input);
+  assert.deepEqual(context.data().payload.mediaAssetIds, mediaAssetIds);
+  for (const task of context.data().tasks.create) {
+    assert.deepEqual(task.payload.mediaAssetIds, mediaAssetIds);
+    assert.equal(task.status, 'SCHEDULED');
+    assert.equal(task.approvalStatus, 'APPROVED');
+  }
+  assert.ok(context.data().approvedAt);
+  prisma.mediaAsset.count = async () => 0;
+  await assert.rejects(context.service.post('org', input), /Ảnh phải thuộc workspace/);
+});
 test('post distributes unique groups round-robin with an independent per-account maximum', async () => {
   const context = setup();
   await context.service.post('org', { name: 'Post', idempotencyKey: 'test-key', accountIds: [], selection: 'ALL', maxGroupsPerAccount: 2, text: 'Frozen post', intervalSeconds: 60 });
@@ -36,13 +103,14 @@ test('post distributes unique groups round-robin with an independent per-account
     ['b', 'https://www.facebook.com/groups/2/'],
     ['a', 'https://www.facebook.com/groups/3/'],
   ]);
-  assert.ok(jobs.every((job: any) => job.payload.text === 'Frozen post')); assert.equal(context.starts.length, 0);
+  assert.ok(jobs.every((job: any) => job.payload.text === 'Frozen post' && job.status === 'SCHEDULED' && job.approvalStatus === 'APPROVED')); assert.equal(context.starts.length, 3);
   assert.equal(context.data().payload.maxGroupsPerAccount, 2);
 });
 test('post ALL includes all joined groups for selected account', async () => {
   const context = setup(['a']);
   await context.service.post('org', { name: 'Post', idempotencyKey: 'test-key', accountIds: ['a'], selection: 'ALL', maxGroupsPerAccount: 5, text: 'Post', intervalSeconds: 60 });
   assert.equal(context.data().tasks.create.length, 3);
+  assert.equal(context.starts.length, 3);
 });
 
 test('post CUSTOM uses inventory mapping without imposing a membership-status gate', async () => {
@@ -61,10 +129,10 @@ test('post CUSTOM uses inventory mapping without imposing a membership-status ga
   assert.deepEqual(jobs.filter((job: any) => job.accountId === 'a').map((job: any) => job.payload.groupUrl), [urls[0], urls[2]]);
   assert.deepEqual(jobs.filter((job: any) => job.accountId === 'b').map((job: any) => job.payload.groupUrl), [urls[1]]);
   assert.equal(jobs.filter((job: any) => job.accountId === 'c').length, 0);
-  assert.ok(jobs.every((job: any) => job.status === 'DRAFT' && job.approvalStatus === 'PENDING' && job.action === 'POST_FACEBOOK_GROUP' && job.payload.text === 'Explicit post'));
+  assert.ok(jobs.every((job: any) => job.status === 'SCHEDULED' && job.approvalStatus === 'APPROVED' && job.action === 'POST_FACEBOOK_GROUP' && job.payload.text === 'Explicit post'));
   assert.deepEqual(context.data().payload.groupUrls, urls);
   assert.equal(context.data().payload.selection, 'CUSTOM');
-  assert.equal(context.starts.length, 0);
+  assert.equal(context.starts.length, 3);
 });
 test('CUSTOM rejects missing groups and insufficient per-account capacity before writes', async () => {
   const context = setup();
@@ -80,6 +148,152 @@ test('CUSTOM rejects groups absent from selected profiles inventory without writ
   context.prisma.facebookGroupMembership.findMany = async () => [];
   await assert.rejects(context.service.post('org', { name: 'Custom', idempotencyKey: 'custom-key', accountIds: ['a'], selection: 'CUSTOM', groupUrls: ['https://www.facebook.com/groups/not-joined/'], maxGroupsPerAccount: 2, text: 'Post', intervalSeconds: 60 }), /không có trong danh sách/);
   assert.equal(context.data(), undefined);
+});
+
+test('COLLECTIONS unions overlapping collections, snapshots them and distributes each group once', async () => {
+  const context = setup(['a', 'b']);
+  const firstId = '00000000-0000-4000-8000-000000000011';
+  const secondId = '00000000-0000-4000-8000-000000000012';
+  const one = 'https://www.facebook.com/groups/one/';
+  const shared = 'https://www.facebook.com/groups/shared/';
+  const two = 'https://www.facebook.com/groups/two/';
+  context.prisma.facebookGroupCollection.findMany = async (input: any) => {
+    assert.equal(input.where.organizationId, 'org');
+    assert.deepEqual(input.where.id.in, [firstId, secondId]);
+    return [
+      { id: secondId, name: 'Quần áo', items: [{ groupUrl: shared }, { groupUrl: two }] },
+      { id: firstId, name: 'Hải sản', items: [{ groupUrl: one }, { groupUrl: shared }] },
+    ];
+  };
+  await context.service.post('org', { name: 'Theo ngành', idempotencyKey: 'collections-key', accountIds: [], selection: 'COLLECTIONS', collectionIds: [firstId, secondId, firstId], maxGroupsPerAccount: 2, text: 'Bài theo tập hợp', intervalSeconds: 60 });
+  assert.deepEqual(context.data().payload.groupUrls, [one, shared, two]);
+  assert.deepEqual(context.data().payload.collectionIds, [firstId, secondId]);
+  assert.deepEqual(context.data().payload.collectionNames, ['Hải sản', 'Quần áo']);
+  assert.equal(context.data().tasks.create.length, 3);
+  assert.equal(context.starts.length, 3);
+});
+
+test('COLLECTIONS rejects missing or inaccessible collections before campaign creation', async () => {
+  const context = setup(['a']);
+  const collectionId = '00000000-0000-4000-8000-000000000011';
+  await assert.rejects(context.service.post('org', { name: 'Missing', idempotencyKey: 'collections-key', accountIds: [], selection: 'COLLECTIONS', collectionIds: [collectionId], maxGroupsPerAccount: 2, text: 'Post', intervalSeconds: 60 }), /không còn tồn tại/);
+  assert.equal(context.data(), undefined);
+});
+
+test('group collection CRUD is workspace-scoped and only accepts synchronized group URLs', async () => {
+  const url = 'https://www.facebook.com/groups/seafood/';
+  let createdData: any;
+  const tx: any = {
+    facebookGroupCollection: {
+      update: async (input: any) => input,
+      findUniqueOrThrow: async () => ({ id: 'collection', name: 'Hải sản mới', items: [{ groupUrl: url }] }),
+    },
+    facebookGroupCollectionItem: { deleteMany: async () => ({ count: 1 }), createMany: async () => ({ count: 1 }) },
+  };
+  const prisma: any = {
+    facebookGroupMembership: { findMany: async (input: any) => input.where.organizationId === 'org' ? [{ groupUrl: url }] : [] },
+    facebookGroupCollection: {
+      create: async (input: any) => { createdData = input.data; return { id: 'collection', ...input.data, items: [{ groupUrl: url }] }; },
+      findFirst: async (input: any) => input.where.organizationId === 'org' ? { id: input.where.id } : null,
+      deleteMany: async (input: any) => ({ count: input.where.organizationId === 'org' ? 1 : 0 }),
+    },
+    $transaction: async (callback: any) => callback(tx),
+  };
+  const service = new FacebookService(prisma, {} as never, {} as never);
+  await service.createGroupCollection('org', { name: 'Hải sản', description: '', groupUrls: [url] });
+  assert.equal(createdData.organizationId, 'org');
+  assert.deepEqual(createdData.items.create, [{ groupUrl: url }]);
+  assert.equal((await service.updateGroupCollection('org', 'collection', { name: 'Hải sản mới', description: 'Mô tả', groupUrls: [url] })).name, 'Hải sản mới');
+  assert.deepEqual(await service.deleteGroupCollection('org', 'collection'), { deleted: true });
+  await assert.rejects(service.updateGroupCollection('other', 'collection', { name: 'Sai workspace', description: '', groupUrls: [url] }), /Không tìm thấy/);
+  await assert.rejects(service.createGroupCollection('other', { name: 'Không hợp lệ', description: '', groupUrls: [url] }), /không còn trong danh sách/);
+});
+
+test('message campaign splits each group\'s requested attempts across its joined profiles', async () => {
+  const context = setup(['a', 'b']);
+  const groupOne = 'https://www.facebook.com/groups/one/';
+  const groupTwo = 'https://www.facebook.com/groups/two/';
+  await context.service.message('org', {
+    name: 'Chăm sóc khách hàng', idempotencyKey: 'message-key', accountIds: [], text: 'Tin nhắn', mediaAssetIds: [],
+    groupUrls: [groupOne, groupTwo], maxRecipientsPerGroup: 2, intervalSeconds: 120,
+  });
+  const tasks = context.data().tasks.create;
+  assert.equal(tasks.length, 4);
+  assert.deepEqual(tasks.map((task: any) => task.accountId), ['a', 'b', 'a', 'b']);
+  assert.deepEqual(tasks.map((task: any) => task.payload.groupUrl), [groupOne, groupOne, groupTwo, groupTwo]);
+  assert.ok(tasks.every((task: any) => !('profileUrl' in task.payload) && !('recipientId' in task.payload)));
+  assert.ok(tasks.every((task: any) => task.action === 'MESSAGE_FACEBOOK_RECIPIENT' && task.status === 'DRAFT' && task.maxAttempts === 1));
+  assert.equal(context.data().payload.maxRecipientsPerGroup, 2);
+});
+
+test('message target distribution splits ten attempts five-five between two joined profiles', () => {
+  const groupUrl = 'https://www.facebook.com/groups/one/';
+  const targets = distributeMessageTargets([groupUrl], [
+    { accountId: 'a', groupUrl }, { accountId: 'b', groupUrl },
+  ], 10);
+  assert.equal(targets.length, 10);
+  assert.equal(targets.filter(target => target.accountId === 'a').length, 5);
+  assert.equal(targets.filter(target => target.accountId === 'b').length, 5);
+});
+
+test('message campaign uses every joined group when no group is selected', async () => {
+  const context = setup(['a']);
+  await context.service.message('org', {
+    name: 'Tất cả nhóm', idempotencyKey: 'message-all-groups', accountIds: [], text: 'Tin nhắn', mediaAssetIds: [], maxRecipientsPerGroup: 1, intervalSeconds: 120,
+  });
+  const tasks = context.data().tasks.create;
+  assert.deepEqual(tasks.map((task: any) => task.payload.groupUrl), [
+    'https://www.facebook.com/groups/1/', 'https://www.facebook.com/groups/2/', 'https://www.facebook.com/groups/3/',
+  ]);
+  assert.deepEqual(context.data().payload.groupUrls, tasks.map((task: any) => task.payload.groupUrl));
+});
+
+test('comment scan campaign creates one approval task per selected READY profile', async () => {
+  const context = setup(['a', 'b']);
+  const campaign = await context.service.scanComments('org', {
+    name: 'Quét bình luận', idempotencyKey: 'scan-comments-key', accountIds: [],
+    postUrl: 'https://www.facebook.com/groups/123/posts/456', intervalSeconds: 60,
+  });
+  const tasks = context.data().tasks.create;
+  assert.equal(campaign.kind, 'SCAN_COMMENTS');
+  assert.equal(context.data().payload.postUrl, 'https://www.facebook.com/groups/123/posts/456');
+  assert.deepEqual(tasks.map((task: any) => task.accountId), ['a', 'b']);
+  assert.ok(tasks.every((task: any) => task.action === 'SCAN_FACEBOOK_POST_COMMENTS' && task.payload.postUrl === 'https://www.facebook.com/groups/123/posts/456' && task.status === 'DRAFT' && task.approvalStatus === 'PENDING' && task.maxAttempts === 1));
+});
+
+test('comment reply campaign splits the configured total evenly across profiles', async () => {
+  const context = setup(['a', 'b']);
+  const campaign = await context.service.replyComments('org', {
+    name: 'Rep bình luận', idempotencyKey: 'reply-comments-key', accountIds: [],
+    postUrl: 'https://www.facebook.com/groups/123/posts/456', text: 'Cảm ơn bạn', maxReplies: 10, intervalSeconds: 120,
+  });
+  const tasks = context.data().tasks.create;
+  assert.equal(campaign.kind, 'REPLY_COMMENTS');
+  assert.deepEqual(tasks.map((task: any) => task.payload.maxReplies), [5, 5]);
+  assert.ok(tasks.every((task: any) => task.action === 'REPLY_FACEBOOK_POST_COMMENTS' && task.status === 'DRAFT' && task.approvalStatus === 'PENDING' && task.maxAttempts === 1));
+  assert.deepEqual([...distributeReplyCounts(['a', 'b', 'c'], 5).entries()], [['a', 2], ['b', 2], ['c', 1]]);
+});
+
+test('opt-in recipient records are workspace scoped and revocation is retained', async () => {
+  const groupUrl = 'https://www.facebook.com/groups/one/';
+  const profileUrl = 'https://www.facebook.com/person.one/';
+  let record: any;
+  const prisma: any = {
+    facebookGroupMembership: { findMany: async () => [{ groupUrl }] },
+    facebookOptInRecipient: {
+      create: async (input: any) => (record = { id: 'recipient', ...input.data }),
+      updateMany: async (input: any) => input.where.organizationId === 'org' ? (Object.assign(record, input.data), { count: 1 }) : ({ count: 0 }),
+      findFirstOrThrow: async () => record,
+    },
+  };
+  const service = new FacebookService(prisma, {} as never, {} as never);
+  const input = { groupUrl, profileUrl, displayName: 'Person', consentSource: 'Form', consentNote: '', consentRecordedAt: '2026-09-26T00:00:00.000Z' };
+  await service.createOptInRecipient('org', input);
+  assert.equal(record.organizationId, 'org'); assert.ok(record.consentRecordedAt instanceof Date);
+  assert.deepEqual(await service.revokeOptInRecipient('org', 'recipient'), { revoked: true }); assert.ok(record.revokedAt instanceof Date);
+  await assert.rejects(service.updateOptInRecipient('other', 'recipient', input), /Không tìm thấy/);
+  await service.updateOptInRecipient('org', 'recipient', { ...input, consentSource: 'Đồng ý lại' }, true);
+  assert.equal(record.revokedAt, null); assert.equal(record.consentSource, 'Đồng ý lại');
 });
 
 test('round-robin distribution is deterministic, balanced and respects group eligibility', () => {

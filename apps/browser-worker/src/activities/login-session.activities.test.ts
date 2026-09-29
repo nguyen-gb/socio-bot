@@ -108,6 +108,7 @@ test('interactive login revalidates READY and preserves it when platform tabs ar
     for (const loggedIn of [false, true, 'closed-platform-tab']) {
       const fixture = sessionFixture(loggedIn ? [{ name: 'c_user', value: 'valid' }] : []);
       const statuses: string[] = [];
+      let openedOptions: Record<string, unknown> | undefined;
       let reads = 0;
       let captured = false;
       const prisma = {
@@ -133,10 +134,11 @@ test('interactive login revalidates READY and preserves it when platform tabs ar
         { restore: async () => {}, capture: async () => { captured = true; } } as never,
         {} as never,
         { get: (name: string) => name === 'remoteSessionPublicUrl' ? 'ws://localhost:3010' : true } as never,
-        { openProfile: async () => fixture.session } as never,
+        { openProfile: async (options: Record<string, unknown>) => { openedOptions = options; return fixture.session; } } as never,
       );
       const result = await service.runInteractiveLoginSession({ sessionId: 'session' });
       assert.equal(result.status, 'CLOSED');
+      assert.equal(openedOptions?.headless, false, 'Interactive profile sessions must always be visible');
       assert.deepEqual(statuses, loggedIn ? [] : ['LOGIN_REQUIRED']);
       assert.equal(captured, true);
       assert.equal(fixture.events.includes('close'), true);

@@ -2,8 +2,10 @@ import {
   BadRequestException,
   Controller,
   Get,
+  Header,
   Param,
   Post,
+  StreamableFile,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
@@ -31,6 +33,14 @@ export class MediaController {
   @Get(':id')
   get(@OrganizationId() organizationId: string, @Param('id') id: string) {
     return this.media.get(organizationId, id);
+  }
+
+  @Get(':id/content')
+  @Header('Cache-Control', 'private, no-store')
+  @Header('X-Content-Type-Options', 'nosniff')
+  async image(@OrganizationId() organizationId: string, @Param('id') id: string) {
+    const image = await this.media.image(organizationId, id);
+    return new StreamableFile(image.bytes, { type: image.contentType, disposition: 'inline' });
   }
 
   @Post()

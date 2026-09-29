@@ -1,5 +1,6 @@
 export * from './accounts';
 export * from './facebook';
+export * from './media';
 export * from './actions';
 export * from './auth';
 export * from './sessions';

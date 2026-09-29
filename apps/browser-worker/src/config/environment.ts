@@ -12,6 +12,9 @@ export interface WorkerEnvironment {
   secretRoot: string;
   browserSlots: number;
   browserHeadless: boolean;
+  browserChannel?: string;
+  browserLocale?: string;
+  browserTimezoneId?: string;
   redisUrl: string;
   profileLeaseTtlMs: number;
   remoteSessionPort: number;
@@ -64,7 +67,14 @@ export function loadEnvironment(): WorkerEnvironment {
     profileEncryptionKey,
     secretRoot: process.env.SECRET_ROOT ?? './secrets',
     browserSlots: positiveInteger(process.env.BROWSER_MAX_SLOTS, 4),
-    browserHeadless: booleanValue(process.env.BROWSER_HEADLESS, true),
+    // Keep the execution mode deterministic by deployment environment:
+    // development workers stay visible for debugging, while production
+    // workers run headless for throughput. BROWSER_HEADLESS is intentionally
+    // not an override so a production worker cannot accidentally open UI.
+    browserHeadless: nodeEnv === 'production',
+    browserChannel: optionalString(process.env.BROWSER_CHANNEL),
+    browserLocale: optionalString(process.env.BROWSER_LOCALE),
+    browserTimezoneId: optionalString(process.env.BROWSER_TIMEZONE_ID),
     redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
     profileLeaseTtlMs: positiveInteger(
       process.env.PROFILE_LEASE_TTL_MS,
@@ -105,4 +115,9 @@ function booleanValue(value: string | undefined, fallback: boolean): boolean {
   if (value === 'true') return true;
   if (value === 'false') return false;
   throw new Error(`Expected true or false, received ${value}`);
+}
+
+function optionalString(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized || undefined;
 }

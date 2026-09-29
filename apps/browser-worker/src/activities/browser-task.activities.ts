@@ -33,6 +33,9 @@ import { ProfileSnapshotsService } from '../storage/profile-snapshots.service';
 import { TaskArtifactsService } from '../storage/task-artifacts.service';
 import { WorkerRegistryService } from '../worker-registry/worker-registry.service';
 import { SecretsService } from '../secrets/secrets.service';
+import type { ObjectStorage } from '@socio/object-storage';
+import { OBJECT_STORAGE } from '../storage/object-storage.providers';
+import { loadTaskImages } from '../storage/task-images';
 import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, profileLoginSettings } from './platform-login';
 
 @Injectable()
@@ -48,6 +51,7 @@ export class BrowserTaskActivities {
     private readonly secrets: SecretsService,
     private readonly config: ConfigService<WorkerEnvironment, true>,
     @Inject(BROWSER_RUNTIME) private readonly runtime: BrowserRuntime,
+    @Inject(OBJECT_STORAGE) private readonly objects: ObjectStorage,
   ) {
     const facebook = new FacebookAdapter();
     this.adapters = new PlatformAdapterRegistry([
@@ -134,8 +138,13 @@ export class BrowserTaskActivities {
       return { ok: false, data: { requiresAction: true, reason: 'Uncertain previous attempt; automatic retry disabled' } };
     }
     if (!externalAction && Context.current().info.attempt > task.maxAttempts) {
+      const message = `Tác vụ vượt quá giới hạn ${task.maxAttempts.toString()} lần thử.`;
+      await this.prisma.task.updateMany({
+        where: { id: task.id, status: { in: ['QUEUED', 'SCHEDULED', 'RUNNING'] } },
+        data: { status: 'FAILED', lastError: message },
+      });
       throw ApplicationFailure.nonRetryable(
-        `Task exceeded its maximum of ${task.maxAttempts.toString()} attempts`,
+        message,
         'MAX_ATTEMPTS_EXCEEDED',
       );
     }
@@ -166,11 +175,12 @@ export class BrowserTaskActivities {
     if (workflowId && current.workflowId !== workflowId) return { ok: false, data: { skipped: true, reason: 'stale_workflow' } };
     if (current.status === 'CANCELLED') return { ok: false, data: { cancelled: true } };
     if (current.status === 'PAUSED' || current.campaign?.pausedAt || current.campaign?.cancelledAt) return { ok: false, data: { paused: true } };
-    if (action.action.includes('FACEBOOK_GROUP') && current.account.status !== 'READY') {
+    const facebookBrowserAction = ['SYNC_FACEBOOK_GROUPS', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS'].includes(action.action);
+    if (facebookBrowserAction && current.account.status !== 'READY') {
       await this.prisma.task.update({ where: { id: task.id }, data: { status: 'REQUIRES_ACTION', lastError: 'Account không ở trạng thái READY; hãy đăng nhập hoặc xử lý xác minh trước.' } });
       return { ok: false, data: { requiresAction: true, reason: 'Account is not READY' } };
     }
-    if (action.action.includes('FACEBOOK_GROUP') && (current.account.browserProfile?.sessions.length || current.account.proxyBinding && current.account.proxyBinding.proxy.status !== 'HEALTHY')) {
+    if (facebookBrowserAction && (current.account.browserProfile?.sessions.length || current.account.proxyBinding && current.account.proxyBinding.proxy.status !== 'HEALTHY')) {
       const reason = 'Browser đang mở hoặc proxy chưa HEALTHY. Đóng browser và kiểm tra proxy trước khi chạy.';
       await this.prisma.task.update({ where: { id: task.id }, data: { status: 'REQUIRES_ACTION', lastError: reason } });
       return { ok: false, data: { requiresAction: true, reason } };
@@ -218,6 +228,9 @@ export class BrowserTaskActivities {
               this.secrets,
             ),
             headless: this.config.get('browserHeadless', { infer: true }),
+            channel: this.config.get('browserChannel', { infer: true }),
+            locale: this.config.get('browserLocale', { infer: true }),
+            timezoneId: this.config.get('browserTimezoneId', { infer: true }),
             recordHarPath: harPath,
           },
           async (session) => {
@@ -246,7 +259,7 @@ export class BrowserTaskActivities {
               .catch(() => undefined);
             try {
               let blocked: ActionResult | undefined;
-              if (action.platform === 'FACEBOOK' && action.action.includes('FACEBOOK_GROUP')) {
+              if (action.platform === 'FACEBOOK' && facebookBrowserAction) {
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
                 await initializePlatformSession(session, 'FACEBOOK', credentials);
@@ -258,7 +271,14 @@ export class BrowserTaskActivities {
                 }
                 authenticated = !blocked;
               }
-              const actionResult = blocked ?? await adapter.execute(action, { ...session, beforeExternalAction: async () => {
+              const actionResult = blocked ?? await adapter.execute(action, { ...session,
+                resolveMediaAssets: async ids => {
+                  const approvedMediaIds = 'mediaAssetIds' in action.payload ? action.payload.mediaAssetIds : [];
+                  if (!['POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT'].includes(action.action) || ids.some(id => !approvedMediaIds.includes(id))) {
+                    throw new Error('Ảnh không thuộc nội dung tác vụ đã duyệt');
+                  }
+                  return loadTaskImages(this.prisma, this.objects, task.organizationId, ids);
+              }, beforeExternalAction: async () => {
                 session.signal?.throwIfAborted();
                 const state = await this.prisma.browserSession.findUnique({ where: { id: browserSession.id }, select: { status: true } });
                 if (state?.status !== 'RUNNING') throw new Error('Browser đã được yêu cầu đóng; dừng trước khi gửi');
@@ -386,8 +406,8 @@ export class BrowserTaskActivities {
     result: ActionResult,
   ) {
     const data = result.data ?? {};
-    if (task.action === 'SYNC_FACEBOOK_GROUPS' && result.ok && Array.isArray(data.groups)) {
-      const groups = data.groups as Array<{ groupUrl: string; groupName: string }>;
+    if (task.action === 'SYNC_FACEBOOK_GROUPS' && (result.ok || data.syncSource === 'JOINED_GROUPS_PAGE') && Array.isArray(data.groups)) {
+      const groups = data.groups as Array<{ groupUrl: string; groupName: string | null }>;
       await this.prisma.$transaction(async (tx) => {
         // A dynamically-loaded list is not proof that an unobserved group was left.
         // Check composer availability on the target page before posting instead.
@@ -396,7 +416,7 @@ export class BrowserTaskActivities {
           await tx.facebookGroupMembership.upsert({
             where: { accountId_groupUrl: { accountId: task.accountId, groupUrl } },
             create: { organizationId: task.organizationId, accountId: task.accountId, groupUrl, groupName: group.groupName, status: 'JOINED' },
-            update: { groupName: group.groupName, status: 'JOINED', lastSyncedAt: new Date() },
+            update: { ...(group.groupName ? { groupName: group.groupName } : {}), status: 'JOINED', lastSyncedAt: new Date() },
           });
         }
       }, { timeout: 60_000 });

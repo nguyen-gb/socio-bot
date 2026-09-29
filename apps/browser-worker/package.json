@@ -8,7 +8,7 @@
     "dev": "node ../../scripts/nest-dev.mjs",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.build.json --noEmit",
-    "test": "tsx --test src/activities/browser-task.activities.test.ts src/activities/login-session.activities.test.ts src/activities/proxy-check.activities.test.ts src/leases/profile-lease.service.test.ts src/remote-session/remote-session.gateway.test.ts src/secrets/secrets.service.test.ts"
+    "test": "tsx --test src/config/environment.test.ts src/activities/browser-task.activities.test.ts src/activities/login-session.activities.test.ts src/activities/proxy-check.activities.test.ts src/leases/profile-lease.service.test.ts src/remote-session/remote-session.gateway.test.ts src/secrets/secrets.service.test.ts src/storage/task-images.test.ts"
   },
   "dependencies": {
     "@nestjs/common": "11.2.3",

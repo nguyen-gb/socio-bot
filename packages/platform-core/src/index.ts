@@ -9,10 +9,17 @@ export interface BrowserPage {
   };
 }
 
+export interface PlatformMediaFile {
+  name: string;
+  mimeType: string;
+  buffer: Buffer;
+}
+
 export interface PlatformSession {
   page: BrowserPage;
   profileId: string;
   beforeExternalAction?: () => Promise<void>;
+  resolveMediaAssets?: (ids: string[]) => Promise<PlatformMediaFile[]>;
 }
 
 export interface PlatformAdapter {

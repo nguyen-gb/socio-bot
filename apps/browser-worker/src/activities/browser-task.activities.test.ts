@@ -4,6 +4,30 @@ import { Context } from '@temporalio/activity';
 import { BrowserTaskActivities } from './browser-task.activities';
 
 const id = '00000000-0000-4000-8000-000000000001';
+
+test('sync persists groups outside campaigns, including partial scans, without erasing known names or memberships', async () => {
+  const writes: any[] = [];
+  const tx = { facebookGroupMembership: { upsert: async (input: any) => { writes.push(input); } } };
+  const prisma = { $transaction: async (callback: any) => callback(tx) };
+  const service = new BrowserTaskActivities(prisma as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  await (service as any).persistFacebookResult({ organizationId: 'org', accountId: id, action: 'SYNC_FACEBOOK_GROUPS' }, {
+    ok: false, data: { syncSource: 'JOINED_GROUPS_PAGE', complete: false, groups: [
+      { groupUrl: 'https://www.facebook.com/groups/outside-campaign/', groupName: 'Joined manually' },
+      { groupUrl: 'https://www.facebook.com/groups/123/', groupName: null },
+    ] },
+  });
+  assert.equal(writes.length, 2);
+  assert.equal(writes[0].create.organizationId, 'org'); assert.equal(writes[0].create.accountId, id);
+  assert.equal(writes[0].create.status, 'JOINED'); assert.equal(writes[0].update.groupName, 'Joined manually');
+  assert.equal(writes[1].create.groupName, null); assert.equal('groupName' in writes[1].update, false);
+  assert.equal(writes[1].update.status, 'JOINED');
+  // No bulk deletion or marking unobserved groups as left is performed.
+});
+test('random-member message does not require a pre-recorded recipient', async () => {
+  const prisma = {};
+  const service = new BrowserTaskActivities(prisma as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  await (service as any).persistFacebookResult({ organizationId: 'org', accountId: id, action: 'MESSAGE_FACEBOOK_RECIPIENT', payload: { groupUrl: 'https://www.facebook.com/groups/123/' } }, { ok: true, data: { messageStatus: 'SENT' } });
+});
 const task = (override: Record<string, unknown> = {}) => ({ id, accountId: id, action: 'JOIN_FACEBOOK_GROUP', platform: 'FACEBOOK', payload: { groupUrl: 'https://www.facebook.com/groups/123/' }, status: 'QUEUED', approvalStatus: 'APPROVED', attemptCount: 0, maxAttempts: 1, account: { status: 'READY', browserProfile: { id: 'profile', sessions: [] } }, ...override });
 async function scenario(row: any, attempt = 1, claim = 0, workflowId?: string) {
   const updates: any[] = []; let opened = false; let leased = false;
@@ -17,9 +41,13 @@ async function scenario(row: any, attempt = 1, claim = 0, workflowId?: string) {
     };
     const leases = { withLease: async (_: string, callback: any) => { leased = true; return callback(); } };
     const runtime = { withProfile: async () => { opened = true; throw new Error('Must not open browser'); } };
-    const service = new BrowserTaskActivities(prisma as never, leases as never, {} as never, {} as never, {} as never, {} as never, {} as never, runtime as never);
-    const result = await service.executeBrowserTask({ taskId: id, workflowId });
-    return { result, opened, updates, leased };
+    const service = new BrowserTaskActivities(prisma as never, leases as never, {} as never, {} as never, {} as never, {} as never, {} as never, runtime as never, {} as never);
+    try {
+      const result = await service.executeBrowserTask({ taskId: id, workflowId });
+      return { result, opened, updates, leased };
+    } catch (error) {
+      return { error, opened, updates, leased };
+    }
   } finally { Context.current = original; }
 }
 test('unapproved Facebook write never acquires lease or opens browser', async () => {
@@ -53,6 +81,13 @@ test('a Temporal delivery retry before the task was claimed is not mistaken for 
   assert.equal(context.leased, true);
   assert.equal(context.updates[0].data.status, 'RUNNING');
   assert.equal(context.result.data?.requiresAction, undefined);
+});
+test('a sync retry beyond its limit is marked failed instead of staying queued', async () => {
+  const context = await scenario(task({ action: 'SYNC_FACEBOOK_GROUPS', approvalStatus: 'NOT_REQUIRED' }), 2);
+  assert.match(String(context.error), /vượt quá giới hạn/i);
+  assert.equal(context.opened, false);
+  assert.equal(context.updates[0].data.status, 'FAILED');
+  assert.match(context.updates[0].data.lastError, /vượt quá giới hạn/i);
 });
 test('challenged accounts stop following group tasks', async () => {
   const context = await scenario(task({ account: { status: 'CHALLENGED', browserProfile: { id: 'profile' } } }));
@@ -114,6 +149,7 @@ test('worker restores the current snapshot and seeds legacy cookies before check
       { profileCredentials: async (reference: string) => { assert.equal(reference, 'fixture-reference'); return { cookies: 'c_user=fixture-valid; xs=fixture-valid' }; } } as never,
       { get: () => true } as never,
       { withProfile: async (_: any, callback: any) => { const result = await callback({ page, context, profileId: 'profile', slot: 0 }); events.push('close'); return result; } } as never,
+      {} as never,
     );
     const result = await service.executeBrowserTask({ taskId: id });
     assert.equal(result.ok, true);

@@ -65,7 +65,7 @@ try {
   assert.deepEqual(custom.payload.groupUrls, ['https://www.facebook.com/groups/9001/', 'https://www.facebook.com/groups/9002/', 'https://www.facebook.com/groups/1/']);
   assert.deepEqual(custom.tasks.filter(job => job.accountId === accountIds[0]).map(job => job.payload.groupUrl).sort(), ['https://www.facebook.com/groups/1/', 'https://www.facebook.com/groups/9001/']);
   assert.deepEqual(custom.tasks.filter(job => job.accountId === accountIds[1]).map(job => job.payload.groupUrl), ['https://www.facebook.com/groups/9002/']);
-  assert.ok(custom.tasks.every(job => job.action === 'POST_FACEBOOK_GROUP' && job.status === 'DRAFT' && job.approvalStatus === 'PENDING'));
+  assert.ok(custom.approvedAt); assert.ok(custom.tasks.every(job => job.action === 'POST_FACEBOOK_GROUP' && job.status === 'SCHEDULED' && job.approvalStatus === 'APPROVED'));
   const taskResponse = await fetch(`${api}/tasks/${joined.tasks[0].id}/approve`, { method: 'POST', headers }); assert.equal(taskResponse.status, 400);
   for (const campaignId of campaignIds) await call(`campaigns/${campaignId}/cancel`, {});
   assert.equal(await prisma.taskRun.count({ where: { task: { accountId: { in: accountIds } } } }), 0);

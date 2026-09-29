@@ -10,7 +10,10 @@ export interface BrowserTaskActivities {
 
 const { executeBrowserTask } = proxyActivities<BrowserTaskActivities>({
   startToCloseTimeout: '15 minutes',
-  heartbeatTimeout: '30 seconds',
+  // Restoring a persisted browser profile and launching Chrome can take over
+  // 30 seconds on a cold worker. Avoid a false Temporal retry before the
+  // browser task has even been claimed.
+  heartbeatTimeout: '2 minutes',
   retry: {
     maximumAttempts: 5,
     initialInterval: '5 seconds',

@@ -7,14 +7,17 @@ export interface FacebookPostConfirmation {
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const normalized = (value: string) => value.replace(/\s+/g, ' ').trim();
 
-export function isTaskPostRequest(body: string, groupUrl: string, text: string, actorId: string): boolean {
+export function isTaskPostRequest(body: string, groupUrl: string, text: string, actorId: string, imageCount = 0): boolean {
   try {
     const params = new URLSearchParams(body);
     if (params.get('fb_api_req_friendly_name') !== 'ComposerStoryCreateMutation') return false;
     const input = record(record(JSON.parse(params.get('variables') ?? '')).input);
+    const message = record(input.message).text;
+    const attachments = Array.isArray(input.attachments) ? input.attachments : [];
+    const photosMatch = attachments.length === imageCount && attachments.every(item => typeof record(record(item).photo).id === 'string');
     return !!actorId && record(input.audience).to_id === new URL(groupUrl).pathname.split('/')[2]
-      && input.actor_id === actorId && typeof record(input.message).text === 'string'
-      && normalized(record(input.message).text as string) === normalized(text);
+      && input.actor_id === actorId && photosMatch
+      && (typeof message === 'string' ? normalized(message) === normalized(text) : !text.trim() && imageCount > 0);
   } catch { return false; }
 }
 
@@ -55,7 +58,7 @@ export function readPostConfirmation(body: string, groupUrl: string, text: strin
     const message = record(record(record(record(node.comet_sections).content).story).message);
     if (!postUrl || typeof node.post_id !== 'string' || !/^[0-9]+$/.test(node.post_id)
       || new URL(postUrl).pathname.split('/').filter(Boolean).at(-1) !== node.post_id
-      || typeof message.text !== 'string' || normalized(message.text) !== normalized(text)) continue;
+      || (typeof message.text === 'string' ? normalized(message.text) !== normalized(text) : !!text.trim())) continue;
     return { status: 'PUBLISHED', postUrl };
   }
   return undefined;

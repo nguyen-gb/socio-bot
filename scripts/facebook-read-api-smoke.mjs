@@ -13,7 +13,7 @@ const login = await fetch(`${web}/api/auth/login`, {
 assert.equal(login.status, 200, 'Test login failed');
 const cookie = login.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
 try {
-  for (const resource of ['campaigns', 'groups']) {
+  for (const resource of ['campaigns', 'groups', 'group-collections', 'opt-in-recipients']) {
     const response = await fetch(`${web}/api/facebook/${resource}`, {
       headers: { cookie }, signal: AbortSignal.timeout(30_000),
     });
@@ -25,4 +25,4 @@ try {
 } finally {
   await fetch(`${web}/api/auth/logout`, { method: 'POST', headers: { origin: web, cookie } });
 }
-console.log('Existing campaigns/groups read only; no campaigns or Facebook actions started.');
+console.log('Existing Facebook resources read only; no campaigns or Facebook actions started.');

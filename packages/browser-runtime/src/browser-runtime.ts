@@ -13,13 +13,22 @@ export interface RuntimeProxy {
   password?: string;
 }
 
+export interface BrowserViewport {
+  width: number;
+  height: number;
+}
+
 export interface OpenProfileOptions {
   profileId: string;
   ownerId?: string;
   proxy?: RuntimeProxy;
   headless?: boolean;
+  /** Optional installed browser channel, for example `chrome` or `msedge`. */
+  channel?: string;
   locale?: string;
   timezoneId?: string;
+  /** `null` follows the native browser window size, like a normal Chrome window. */
+  viewport?: BrowserViewport | null;
   slotTimeoutMs?: number;
   recordHarPath?: string;
   executionTimeoutMs?: number;
@@ -89,6 +98,7 @@ export class BrowserRuntime {
     try {
       record = await this.processes.begin(options.profileId, options.ownerId);
       await mkdir(profilePath, { recursive: true });
+      const viewport = options.viewport ?? null;
       context = await chromium.launchPersistentContext(profilePath, {
         args: [`--socio-session-token=${record.token}`],
         // Headless Chromium hides native scrollbars by default. Remote users
@@ -96,6 +106,15 @@ export class BrowserRuntime {
         ignoreDefaultArgs: ['--hide-scrollbars'],
         timeout: 45_000,
         headless: options.headless ?? true,
+        channel: options.channel,
+        // Keep the page surface close to a regular Chrome window. Do not
+        // override user-agent or webdriver signals to evade CAPTCHA.
+        viewport,
+        ...(viewport ? { deviceScaleFactor: 1 } : {}),
+        isMobile: false,
+        hasTouch: false,
+        colorScheme: 'light',
+        reducedMotion: 'no-preference',
         locale: options.locale,
         timezoneId: options.timezoneId,
         proxy: options.proxy,

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { platformSchema } from './status';
-import { facebookGroupUrlSchema } from './facebook';
+import { facebookGroupUrlSchema, facebookPostUrlSchema } from './facebook';
+import { facebookMediaIdsSchema } from './media';
 
 const baseActionSchema = z.object({
   platform: platformSchema,
@@ -41,11 +42,31 @@ export const joinFacebookGroupActionSchema = baseActionSchema.extend({
 export const postFacebookGroupActionSchema = baseActionSchema.extend({
   platform: z.literal('FACEBOOK'),
   action: z.literal('POST_FACEBOOK_GROUP'),
-  payload: z.object({ groupUrl: facebookGroupUrlSchema, text: z.string().trim().min(1).max(20_000) }),
+  payload: z.object({ groupUrl: facebookGroupUrlSchema, text: z.string().trim().max(20_000).default(''), mediaAssetIds: facebookMediaIdsSchema })
+    .refine(payload => payload.text.length > 0 || payload.mediaAssetIds.length > 0, 'Nhập nội dung hoặc chọn ít nhất một ảnh'),
+});
+export const messageFacebookRecipientActionSchema = baseActionSchema.extend({
+  platform: z.literal('FACEBOOK'),
+  action: z.literal('MESSAGE_FACEBOOK_RECIPIENT'),
+  payload: z.object({
+    groupUrl: facebookGroupUrlSchema,
+    text: z.string().trim().max(5_000).default(''),
+    mediaAssetIds: facebookMediaIdsSchema,
+  }).refine(payload => payload.text.length > 0 || payload.mediaAssetIds.length > 0, 'Nhập nội dung hoặc chọn ít nhất một ảnh'),
+});
+export const scanFacebookPostCommentsActionSchema = baseActionSchema.extend({
+  platform: z.literal('FACEBOOK'),
+  action: z.literal('SCAN_FACEBOOK_POST_COMMENTS'),
+  payload: z.object({ postUrl: facebookPostUrlSchema }),
+});
+export const replyFacebookPostCommentsActionSchema = baseActionSchema.extend({
+  platform: z.literal('FACEBOOK'),
+  action: z.literal('REPLY_FACEBOOK_POST_COMMENTS'),
+  payload: z.object({ postUrl: facebookPostUrlSchema, text: z.string().trim().min(1).max(5_000), maxReplies: z.number().int().min(1).max(50) }),
 });
 
 export function requiresExternalApproval(action: string): boolean {
-  return ['PUBLISH_POST', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP'].includes(action);
+  return ['PUBLISH_POST', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS'].includes(action);
 }
 
 export const platformActionSchema = z.discriminatedUnion('action', [
@@ -55,6 +76,9 @@ export const platformActionSchema = z.discriminatedUnion('action', [
   syncFacebookGroupsActionSchema,
   joinFacebookGroupActionSchema,
   postFacebookGroupActionSchema,
+  messageFacebookRecipientActionSchema,
+  scanFacebookPostCommentsActionSchema,
+  replyFacebookPostCommentsActionSchema,
 ]);
 export type PlatformAction = z.infer<typeof platformActionSchema>;
 

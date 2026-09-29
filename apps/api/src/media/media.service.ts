@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { FACEBOOK_IMAGE_MAX_BYTES, FACEBOOK_IMAGE_TYPES, imageContentType } from '@socio/contracts';
 import type { ObjectStorage } from '@socio/object-storage';
 import { PrismaService } from '../database/prisma.service';
 import { OBJECT_STORAGE } from '../storage/object-storage.module';
@@ -19,6 +20,10 @@ export class MediaService {
   ) {}
 
   async create(organizationId: string, file: UploadedMedia) {
+    if (file.mimetype.startsWith('image/') && (imageContentType(file.buffer) !== file.mimetype
+      || file.buffer.length > FACEBOOK_IMAGE_MAX_BYTES)) {
+      throw new BadRequestException('Ảnh phải là JPG/PNG/WebP hợp lệ, tối đa 10 MB/ảnh.');
+    }
     const id = randomUUID();
     const extension = safeExtension(file.originalname);
     const stored = await this.objects.putBytes(
@@ -56,6 +61,17 @@ export class MediaService {
     });
     if (!asset) throw new NotFoundException('Media asset not found');
     return present(asset);
+  }
+
+  async image(organizationId: string, id: string) {
+    const asset = await this.prisma.mediaAsset.findFirst({ where: {
+      id, organizationId, status: 'READY', contentType: { in: [...FACEBOOK_IMAGE_TYPES] },
+      sizeBytes: { gt: 0, lte: FACEBOOK_IMAGE_MAX_BYTES },
+    } });
+    if (!asset) throw new NotFoundException('Image not found');
+    const bytes = await this.objects.getBytes(asset.storageUri);
+    if (imageContentType(bytes) !== asset.contentType) throw new BadRequestException('Invalid image');
+    return { bytes, contentType: asset.contentType };
   }
 }
 

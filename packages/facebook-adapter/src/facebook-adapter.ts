@@ -6,6 +6,8 @@ import {
   UnsupportedPlatformActionError,
 } from '@socio/platform-core';
 import { FacebookGroupsAutomation } from './facebook-groups';
+import { FacebookMessagesAutomation } from './facebook-messages';
+import { FacebookCommentsAutomation } from './facebook-comments';
 
 const FACEBOOK_HOME = 'https://www.facebook.com/';
 
@@ -32,7 +34,13 @@ export class FacebookAdapter implements PlatformAdapter {
       case 'JOIN_FACEBOOK_GROUP':
         return new FacebookGroupsAutomation().join(session, action.payload.groupUrl);
       case 'POST_FACEBOOK_GROUP':
-        return new FacebookGroupsAutomation().post(session, action.payload.groupUrl, action.payload.text);
+        return new FacebookGroupsAutomation().post(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds);
+      case 'MESSAGE_FACEBOOK_RECIPIENT':
+        return new FacebookMessagesAutomation().messageRandomGroupMember(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds);
+      case 'SCAN_FACEBOOK_POST_COMMENTS':
+        return new FacebookCommentsAutomation().scanPostComments(session, action.payload.postUrl);
+      case 'REPLY_FACEBOOK_POST_COMMENTS':
+        return new FacebookCommentsAutomation().replyPostComments(session, action.payload.postUrl, action.payload.text, action.payload.maxReplies);
     }
   }
 

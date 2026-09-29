@@ -73,7 +73,13 @@ export class LoginSessionActivities {
             requestedSession.profile.account.proxyBinding?.proxy,
             this.secrets,
           ),
-          headless: this.config.get('browserHeadless', { infer: true }),
+          // A user-opened profile must always have a visible browser so the
+          // remote session can be used for login and manual verification.
+          // Campaign/automation mode is derived from NODE_ENV separately.
+          headless: false,
+          channel: this.config.get('browserChannel', { infer: true }),
+          locale: this.config.get('browserLocale', { infer: true }),
+          timezoneId: this.config.get('browserTimezoneId', { infer: true }),
         });
         const loginSettings = profileLoginSettings(
           requestedSession.profile.metadata,

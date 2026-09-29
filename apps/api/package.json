@@ -8,7 +8,7 @@
     "dev": "node ../../scripts/nest-dev.mjs",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.build.json --noEmit",
-    "test": "tsx --test src/auth/auth.test.ts src/tasks/tasks.test.ts src/proxies/proxies.test.ts src/facebook/facebook.test.ts src/accounts/accounts.test.ts"
+    "test": "tsx --test src/auth/auth.test.ts src/tasks/tasks.test.ts src/proxies/proxies.test.ts src/facebook/facebook.test.ts src/accounts/accounts.test.ts src/media/media.test.ts"
   },
   "dependencies": {
     "@nestjs/common": "11.2.3",

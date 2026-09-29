@@ -9,4 +9,4 @@
 - Failure screenshots may contain sensitive page content. Restrict the object-storage volume and apply an explicit retention policy.
 - The CDP gateway accepts only normalized click/text/key commands and requires a scoped, short-lived HMAC token. Raw CDP is never exposed to the browser client.
 - Login endpoints are rate limited. Mutations are written to the organization audit log.
-- Facebook group writes require ADMIN/OWNER approval of fixed account/group targets. URL validation restricts destinations to HTTPS Facebook group pages. Approval and task state are rechecked before execution; uncertain writes are never resent automatically. Membership questions and CAPTCHA require manual action.
+- Facebook group sync/join/message writes require ADMIN/OWNER approval of fixed account/group targets; group posts are dispatched immediately from fixed account/group targets after the API's account-lock and readiness checks. URL validation restricts destinations to HTTPS Facebook group pages. Approval (where required) and task state are rechecked before execution; uncertain writes are never resent automatically. Membership questions and CAPTCHA require manual action.

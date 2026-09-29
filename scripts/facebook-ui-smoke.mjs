@@ -44,8 +44,9 @@ try {
             return [];
           });
         }
-        const targets = assigned.map(({ account, groupUrl }) => ({ id: crypto.randomUUID(), status: 'DRAFT', approvalStatus: 'PENDING', payload: { groupUrl }, account, runs: [] }));
-        body = { id: crypto.randomUUID(), name: input.name, kind: path.endsWith('join') ? 'JOIN' : 'POST', createdAt: new Date().toISOString(), payload: input, tasks: targets }; campaigns.unshift(body);
+        const startsImmediately = path.endsWith('/post');
+        const targets = assigned.map(({ account, groupUrl }) => ({ id: crypto.randomUUID(), status: startsImmediately ? 'SCHEDULED' : 'DRAFT', approvalStatus: startsImmediately ? 'APPROVED' : 'PENDING', payload: { groupUrl }, account, runs: [] }));
+        body = { id: crypto.randomUUID(), name: input.name, kind: path.endsWith('join') ? 'JOIN' : 'POST', approvedAt: startsImmediately ? new Date().toISOString() : null, createdAt: new Date().toISOString(), payload: input, tasks: targets }; campaigns.unshift(body);
       } else if (path.endsWith('/approve')) { const campaign = campaigns.find((item) => path.includes(item.id)); campaign.approvedAt = new Date().toISOString(); campaign.tasks.forEach((job) => { job.status = 'SCHEDULED'; job.approvalStatus = 'APPROVED'; }); body = campaign; }
       else if (path.endsWith('/pause')) { const campaign = campaigns.find(item => path.includes(item.id)); campaign.pausedAt = new Date().toISOString(); campaign.tasks.filter(job => ['SCHEDULED', 'QUEUED'].includes(job.status)).forEach(job => { job.status = 'PAUSED'; }); body = { paused: 3 }; }
       else if (path.endsWith('/resume')) { const campaign = campaigns.find(item => path.includes(item.id)); campaign.pausedAt = null; campaign.tasks.filter(job => job.status === 'PAUSED').forEach(job => { job.status = 'SCHEDULED'; }); body = { resumed: 3 }; }
@@ -115,7 +116,7 @@ try {
   await dialog.getByLabel('Account', { exact: true }).click();
   await page.getByText('Fixture 01', { exact: true }).last().click();
   await dialog.getByLabel('Tên chiến dịch').click();
-  await dialog.getByRole('button', { name: 'Lưu bản nháp' }).click();
+  await dialog.getByRole('button', { name: 'Đăng bài ngay' }).click();
   await dialog.waitFor({ state: 'hidden' });
   const post = mutations.find((item) => item.path.endsWith('/post')).input;
   assert.equal(post.selection, 'ALL'); assert.equal(post.maxGroupsPerAccount, 1); assert.equal(post.accountIds.length, 1);
@@ -129,7 +130,7 @@ try {
   for (const id of ['777', '888', '999']) await page.locator('.ant-select-dropdown:visible').getByText(`${id} (1 profile)`, { exact: true }).waitFor();
   assert.equal(await page.locator('.ant-select-dropdown:visible').getByText('View group', { exact: true }).count(), 0);
   await dialog.getByLabel('Tên chiến dịch').click();
-  await dialog.getByRole('button', { name: 'Lưu bản nháp' }).click();
+  await dialog.getByRole('button', { name: 'Đăng bài ngay' }).click();
   await dialog.getByText('Chọn ít nhất một nhóm đã đồng bộ', { exact: true }).waitFor();
   const groupPicker = dialog.getByLabel('Nhóm đã đồng bộ', { exact: true });
   await groupPicker.fill('A-only');
@@ -150,7 +151,7 @@ try {
   await groupPicker.fill('groups/1/');
   await page.locator('.ant-select-dropdown:visible').getByText('1 (1 profile)', { exact: true }).click();
   await dialog.getByLabel('Tên chiến dịch').click();
-  await dialog.getByRole('button', { name: 'Lưu bản nháp' }).click();
+  await dialog.getByRole('button', { name: 'Đăng bài ngay' }).click();
   await dialog.waitFor({ state: 'hidden' });
   const custom = mutations.at(-1).input;
   assert.equal(custom.selection, 'CUSTOM');

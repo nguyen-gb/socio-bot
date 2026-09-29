@@ -139,6 +139,8 @@ model Organization {
   auditLogs     AuditLog[]
   refreshTokens RefreshToken[]
   facebookGroups FacebookGroupMembership[]
+  facebookGroupCollections FacebookGroupCollection[]
+  facebookOptInRecipients FacebookOptInRecipient[]
   facebookCampaigns FacebookCampaign[]
 }
 
@@ -317,6 +319,50 @@ model FacebookGroupMembership {
 
   @@unique([accountId, groupUrl])
   @@index([organizationId, status])
+}
+
+model FacebookGroupCollection {
+  id             String                        @id @default(uuid()) @db.Uuid
+  organizationId String                        @db.Uuid
+  name           String
+  description    String?
+  createdAt      DateTime                      @default(now())
+  updatedAt      DateTime                      @updatedAt
+  organization   Organization                  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  items          FacebookGroupCollectionItem[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, updatedAt])
+}
+
+model FacebookGroupCollectionItem {
+  collectionId String                  @db.Uuid
+  groupUrl     String
+  createdAt    DateTime                @default(now())
+  collection   FacebookGroupCollection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+
+  @@id([collectionId, groupUrl])
+}
+
+model FacebookOptInRecipient {
+  id                String       @id @default(uuid()) @db.Uuid
+  organizationId    String       @db.Uuid
+  groupUrl           String
+  profileUrl         String
+  displayName        String
+  consentSource      String
+  consentNote        String?
+  consentRecordedAt  DateTime
+  revokedAt          DateTime?
+  lastMessageAttemptAt DateTime?
+  lastMessagedAt     DateTime?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  organization       Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, groupUrl, profileUrl])
+  @@index([organizationId, groupUrl, revokedAt])
+  @@index([organizationId, profileUrl])
 }
 
 model FacebookCampaign {
