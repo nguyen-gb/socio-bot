@@ -48,7 +48,7 @@ export class TasksService {
     });
     if (!account) throw new NotFoundException('Account not found');
 
-    if (input.action.action === 'POST_FACEBOOK_GROUP' || input.action.action === 'MESSAGE_FACEBOOK_RECIPIENT') {
+    if (input.action.action === 'POST_FACEBOOK_GROUP' || input.action.action === 'MESSAGE_FACEBOOK_RECIPIENT' || input.action.action === 'MESSAGE_FACEBOOK_REACTOR' || input.action.action === 'REPLY_FACEBOOK_POST_COMMENTS') {
       await validateFacebookImages(this.prisma, organizationId, input.action.payload.mediaAssetIds);
     }
 

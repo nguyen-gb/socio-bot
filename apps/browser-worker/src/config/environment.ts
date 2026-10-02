@@ -12,6 +12,8 @@ export interface WorkerEnvironment {
   secretRoot: string;
   browserSlots: number;
   browserHeadless: boolean;
+  /** Time to leave Chromium open after an action result before closing it. */
+  browserCloseDelayMs: number;
   browserChannel?: string;
   browserLocale?: string;
   browserTimezoneId?: string;
@@ -72,6 +74,10 @@ export function loadEnvironment(): WorkerEnvironment {
     // workers run headless for throughput. BROWSER_HEADLESS is intentionally
     // not an override so a production worker cannot accidentally open UI.
     browserHeadless: nodeEnv === 'production',
+    // Give Facebook's UI a short settling window after submit/confirmation
+    // and before profile teardown. Override per deployment when a slower
+    // connection needs more time (for example BROWSER_CLOSE_DELAY_MS=10000).
+    browserCloseDelayMs: positiveInteger(process.env.BROWSER_CLOSE_DELAY_MS, 5_000),
     browserChannel: optionalString(process.env.BROWSER_CHANNEL),
     browserLocale: optionalString(process.env.BROWSER_LOCALE),
     browserTimezoneId: optionalString(process.env.BROWSER_TIMEZONE_ID),
@@ -97,7 +103,9 @@ export function loadEnvironment(): WorkerEnvironment {
     temporalAddress: process.env.TEMPORAL_ADDRESS ?? 'localhost:7233',
     temporalNamespace: process.env.TEMPORAL_NAMESPACE ?? 'default',
     temporalTaskQueue:
-      process.env.TEMPORAL_TASK_QUEUE ?? 'socio-browser-tasks',
+      // Keep the local fallback aligned with docker/.env.example so a worker
+      // started from its package directory still polls the API's queue.
+      process.env.TEMPORAL_TASK_QUEUE ?? 'browser-automation',
   };
 }
 

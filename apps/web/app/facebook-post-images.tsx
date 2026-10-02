@@ -20,9 +20,9 @@ export function FacebookPostImages({ ids = [] }: { ids?: string[] }) {
 }
 
 export function FacebookImagePicker({ value = [], onChange, disabled, onUploadingChange, context = 'post' }: {
-  value?: string[]; onChange?: (ids: string[]) => void; disabled?: boolean; onUploadingChange: (uploading: boolean) => void; context?: 'post' | 'message';
+  value?: string[]; onChange?: (ids: string[]) => void; disabled?: boolean; onUploadingChange: (uploading: boolean) => void; context?: 'post' | 'message' | 'reply';
 }) {
-  const noun = context === 'message' ? 'tin nhắn' : 'bài viết';
+  const noun = context === 'message' ? 'tin nhắn' : context === 'reply' ? 'lượt rep' : 'bài viết';
   const input = useRef<HTMLInputElement>(null);
   const uploadingRef = useRef(false);
   const [uploading, setUploading] = useState(false);
@@ -66,7 +66,7 @@ export function FacebookImagePicker({ value = [], onChange, disabled, onUploadin
         onChange={event => { const files = [...(event.target.files ?? [])]; event.target.value = ''; void upload(files); }} />
     </Flex>
     {media.isError ? <Typography.Text type="danger">Không tải được thư viện. <Button type="link" onClick={() => void media.refetch()}>Thử lại</Button></Typography.Text> : null}
-    <Typography.Text type="secondary">JPG, PNG, WebP · Tối đa 10 ảnh, 10 MB/ảnh. Có thể {context === 'message' ? 'gửi ảnh kèm nội dung hoặc chỉ ảnh' : 'đăng ảnh kèm nội dung hoặc chỉ ảnh'}.</Typography.Text>
+    <Typography.Text type="secondary">JPG, PNG, WebP · Tối đa 10 ảnh, 10 MB/ảnh. Có thể {context === 'message' ? 'gửi ảnh kèm nội dung hoặc chỉ ảnh' : context === 'reply' ? 'rep ảnh kèm nội dung hoặc chỉ ảnh' : 'đăng ảnh kèm nội dung hoặc chỉ ảnh'}.</Typography.Text>
     <Image.PreviewGroup><Flex gap={12} wrap>{value.map((id, index) => <div key={id} style={{ width: 88 }}>
       <Image src={contentUrl(id)} alt={`Ảnh ${index + 1}`} width={88} height={88} style={{ objectFit: 'cover', borderRadius: 8 }} />
       <Flex justify="space-between" align="center"><Typography.Text type="secondary">Ảnh {index + 1}</Typography.Text><Button type="text" size="small" danger icon={<Icon name="close" />} aria-label={`Bỏ ảnh ${index + 1}`} disabled={disabled || uploading} onClick={() => onChange?.(value.filter(item => item !== id))} /></Flex>

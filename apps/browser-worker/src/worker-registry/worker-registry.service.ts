@@ -56,12 +56,14 @@ export class WorkerRegistryService implements OnModuleDestroy {
     );
 
     this.heartbeat = setInterval(() => {
+      // Keep the registry fresh even while the Temporal worker is idle. Do
+      // not let an intermittent database error become an unhandled rejection
+      // that silently stops future heartbeat updates.
       void this.prisma.workerNode.update({
         where: { id: this.workerId },
         data: { lastHeartbeat: new Date(), status: 'READY' },
-      });
+      }).catch(() => undefined);
     }, 15_000);
-    this.heartbeat.unref();
   }
 
   async onModuleDestroy(): Promise<void> {

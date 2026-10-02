@@ -18,8 +18,15 @@ export interface PlatformMediaFile {
 export interface PlatformSession {
   page: BrowserPage;
   profileId: string;
+  /** Optional platform identity used to avoid acting on the logged-in user's own content. */
+  accountUsername?: string;
+  accountExternalId?: string;
   beforeExternalAction?: () => Promise<void>;
   resolveMediaAssets?: (ids: string[]) => Promise<PlatformMediaFile[]>;
+  /** Reserve a random Facebook group member before the send is started. */
+  reserveMessageRecipient?: (input: { groupUrl: string; profileUrl: string; displayName?: string }) => Promise<boolean>;
+  /** Release a reservation only when Facebook definitively did not send. */
+  releaseMessageRecipient?: (input: { groupUrl: string; profileUrl: string }) => Promise<void>;
 }
 
 export interface PlatformAdapter {

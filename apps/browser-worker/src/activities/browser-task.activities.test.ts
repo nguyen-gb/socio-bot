@@ -28,6 +28,30 @@ test('random-member message does not require a pre-recorded recipient', async ()
   const service = new BrowserTaskActivities(prisma as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
   await (service as any).persistFacebookResult({ organizationId: 'org', accountId: id, action: 'MESSAGE_FACEBOOK_RECIPIENT', payload: { groupUrl: 'https://www.facebook.com/groups/123/' } }, { ok: true, data: { messageStatus: 'SENT' } });
 });
+
+test('successful random-member messages are persisted and reserved recipients are rejected', async () => {
+  let row: any;
+  const model = {
+    findUnique: async () => row,
+    create: async ({ data }: any) => { row = { id: 'recipient', ...data, reservedAt: new Date() }; return row; },
+    upsert: async ({ create, update }: any) => { row = { ...(row ?? {}), ...create, ...update, status: update.status ?? create.status }; return row; },
+    updateMany: async () => ({ count: 0 }),
+    deleteMany: async () => ({ count: 1 }),
+  };
+  const prisma = { facebookMessageRecipient: model };
+  const service = new BrowserTaskActivities(prisma as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  await (service as any).persistFacebookResult({ id, organizationId: 'org', accountId: id, action: 'MESSAGE_FACEBOOK_RECIPIENT', payload: { groupUrl: 'https://www.facebook.com/groups/123/' } }, {
+    ok: true,
+    data: { groupUrl: 'https://www.facebook.com/groups/123/', profileUrl: 'https://www.facebook.com/100028475506542', displayName: 'Đã nhắn', messageStatus: 'SENT' },
+  });
+  assert.equal(row.status, 'SENT');
+  await (service as any).persistFacebookResult({ id, organizationId: 'org', accountId: id, action: 'MESSAGE_FACEBOOK_REACTOR', payload: { postUrl: 'https://www.facebook.com/groups/123/posts/456' } }, {
+    ok: true,
+    data: { postUrl: 'https://www.facebook.com/groups/123/posts/456', profileUrl: 'https://www.facebook.com/100012345678901', displayName: 'Người react', messageStatus: 'SENT' },
+  });
+  assert.equal(row.status, 'SENT');
+  assert.equal(await (service as any).reserveMessageRecipient({ organizationId: 'org', accountId: id, taskId: 'another-task', groupUrl: 'https://www.facebook.com/groups/123/', profileUrl: 'https://www.facebook.com/100028475506542' }), false);
+});
 const task = (override: Record<string, unknown> = {}) => ({ id, accountId: id, action: 'JOIN_FACEBOOK_GROUP', platform: 'FACEBOOK', payload: { groupUrl: 'https://www.facebook.com/groups/123/' }, status: 'QUEUED', approvalStatus: 'APPROVED', attemptCount: 0, maxAttempts: 1, account: { status: 'READY', browserProfile: { id: 'profile', sessions: [] } }, ...override });
 async function scenario(row: any, attempt = 1, claim = 0, workflowId?: string) {
   const updates: any[] = []; let opened = false; let leased = false;

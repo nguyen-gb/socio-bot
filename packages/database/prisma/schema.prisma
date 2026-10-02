@@ -365,6 +365,28 @@ model FacebookOptInRecipient {
   @@index([organizationId, profileUrl])
 }
 
+// A durable, group-scoped ledger for random-member messaging.  A unique
+// recipient per group prevents a later campaign (or a concurrent task) from
+// selecting someone that has already been messaged.
+model FacebookMessageRecipient {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  accountId      String   @db.Uuid
+  groupUrl       String
+  profileUrl     String
+  displayName    String?
+  taskId         String?  @db.Uuid
+  status         String   @default("RESERVED")
+  reservedAt     DateTime @default(now())
+  sentAt         DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, groupUrl, profileUrl])
+  @@index([organizationId, groupUrl, status])
+  @@index([organizationId, profileUrl])
+}
+
 model FacebookCampaign {
   id             String       @id @default(uuid()) @db.Uuid
   organizationId String       @db.Uuid

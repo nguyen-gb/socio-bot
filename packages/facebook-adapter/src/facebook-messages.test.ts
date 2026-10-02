@@ -44,6 +44,14 @@ test('an old identical bubble never confirms a new unacknowledged send', async (
   assert.equal(await page.getByRole('row').count(), 1);
 }));
 
+test('prefers Enter to submit a Messenger message before the button fallback', async () => fixture(`<button onclick="document.querySelector('[role=dialog]').hidden=false">Message</button>
+  <div role="dialog" hidden><div role="textbox" contenteditable="true" onkeydown="if(event.key==='Enter'){event.preventDefault(); const box=this; const row=document.createElement('div'); row.setAttribute('role','row'); row.textContent=box.textContent; this.parentElement.append(row); box.textContent='';}"></div><button aria-label="Send" onclick="throw new Error('button fallback should not be used')">Send</button></div>`, async page => {
+  const result = await automation.message({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, profileUrl, 'Tin nhắn bằng Enter');
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.messageStatus, 'SENT');
+  assert.equal(await page.getByRole('row').count(), 1);
+}));
+
 test('accepts Facebook canonical username redirect for a selected numeric member ID', async () => {
   const browser = await chromium.launch({ headless: true });
   try {
@@ -158,5 +166,66 @@ test('selects a visible group member at random and only then opens the message f
     assert.equal(result.ok, true);
     assert.equal(result.data?.groupUrl, 'https://www.facebook.com/groups/fixture/');
     assert.ok(['https://www.facebook.com/100028475506542', 'https://www.facebook.com/profile.php?id=100012345678901'].includes(String(result.data?.profileUrl)));
+  } finally { await browser.close(); }
+});
+
+test('skips recipients rejected by the durable message ledger', async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addCookies([{ name: 'c_user', value: '61594169541646', domain: '.facebook.com', path: '/' }]);
+    await context.route('**/*', route => {
+      const memberPage = route.request().url().endsWith('/groups/fixture/members');
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<main role="main">${memberPage
+        ? '<a href="https://www.facebook.com/groups/1710577763336777/user/100028475506542/">Already messaged</a><a href="https://www.facebook.com/people/Member-Two/100012345678901/">New member</a>'
+        : messenger}</main>` });
+    });
+    const page = await context.newPage();
+    const result = await automation.messageRandomGroupMember({
+      page,
+      profileId: 'fixture',
+      reserveMessageRecipient: async ({ profileUrl }) => profileUrl === 'https://www.facebook.com/profile.php?id=100012345678901',
+      beforeExternalAction: async () => {},
+    }, 'https://www.facebook.com/groups/fixture/', 'Tin nhắn không trùng');
+    assert.equal(result.ok, true);
+    assert.equal(result.data?.profileUrl, 'https://www.facebook.com/profile.php?id=100012345678901');
+  } finally { await browser.close(); }
+});
+
+test('selects a visible post reactor at random and reuses the Messenger flow', async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addCookies([{ name: 'c_user', value: '61594169541646', domain: '.facebook.com', path: '/' }]);
+    await context.route('**/*', route => {
+      const postPage = route.request().url().includes('/groups/fixture/posts/456');
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: postPage
+        ? `<main role="main"><button onclick="document.querySelector('[role=dialog]').hidden=false">2 reactions</button><div role="dialog" hidden><a href="https://www.facebook.com/100028475506542">Reactor One</a><a href="https://www.facebook.com/people/Reactor-Two/100012345678901/">Reactor Two</a></div></main>`
+        : `<main role="main">${messenger}</main>` });
+    });
+    const page = await context.newPage();
+    const result = await automation.messageRandomPostReactor({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, 'https://www.facebook.com/groups/fixture/posts/456', 'Tin nhắn người react');
+    assert.equal(result.ok, true);
+    assert.equal(result.data?.postUrl, 'https://www.facebook.com/groups/fixture/posts/456');
+    assert.ok(['https://www.facebook.com/100028475506542', 'https://www.facebook.com/profile.php?id=100012345678901'].includes(String(result.data?.profileUrl)));
+  } finally { await browser.close(); }
+});
+
+test('selects a visible post commenter when the source is COMMENTERS', async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addCookies([{ name: 'c_user', value: '61594169541646', domain: '.facebook.com', path: '/' }]);
+    await context.route('**/*', route => {
+      const postPage = route.request().url().includes('/groups/fixture/posts/456');
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: postPage
+        ? `<main role="main"><button>All comments</button><article role="article"><a href="https://www.facebook.com/100028475506542">Commenter One</a><div data-ad-preview="message">A comment</div></article></main>`
+        : `<main role="main">${messenger}</main>` });
+    });
+    const page = await context.newPage();
+    const result = await automation.messageRandomPostReactor({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, 'https://www.facebook.com/groups/fixture/posts/456', 'Tin nhắn người bình luận', [], [], 'COMMENTERS');
+    assert.equal(result.ok, true);
+    assert.equal(result.data?.postUrl, 'https://www.facebook.com/groups/fixture/posts/456');
+    assert.equal(String(result.data?.profileUrl).replace(/\/$/, ''), 'https://www.facebook.com/100028475506542');
   } finally { await browser.close(); }
 });

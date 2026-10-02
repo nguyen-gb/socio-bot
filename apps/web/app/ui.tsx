@@ -1,4 +1,4 @@
-export type IconName = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'schedules' | 'media' | 'tasks' | 'open' | 'close' | 'edit' | 'delete' | 'test' | 'play' | 'pause' | 'approve' | 'reject' | 'logout' | 'plus' | 'refresh' | 'arrow' | 'search' | 'shield' | 'upload' | 'back' | 'expand' | 'collapse';
+export type IconName = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'schedules' | 'media' | 'tasks' | 'open' | 'view' | 'close' | 'edit' | 'delete' | 'test' | 'play' | 'pause' | 'approve' | 'reject' | 'logout' | 'plus' | 'refresh' | 'arrow' | 'search' | 'shield' | 'upload' | 'back' | 'expand' | 'collapse';
 const paths: Record<IconName, string[]> = {
   expand: ['M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5'],
   collapse: ['M3 8h5V3M21 8h-5V3M8 21v-5H3M16 21v-5h5'],
@@ -10,6 +10,7 @@ const paths: Record<IconName, string[]> = {
   media: ['M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z', 'm3 17 6-6 4 4 3-3 5 5M16 7h.01'],
   tasks: ['M9 5h12M9 12h12M9 19h12M3 5l1 1 2-2M3 12l1 1 2-2M3 19l1 1 2-2'],
   open: ['M14 3h7v7m-11 4L21 3', 'M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5'],
+  view: ['M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z', 'M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z'],
   close: ['M18 6 6 18M6 6l12 12'], reject: ['M18 6 6 18M6 6l12 12'],
   edit: ['M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z'],
   delete: ['M3 6h18M8 6V4h8v2m-9 0 1 15h8l1-15M10 10v7m4-7v7'],
@@ -30,4 +31,4 @@ export const STATUS_LABELS: Record<string, string> = {
   HEALTHY: 'Kết nối tốt', UNHEALTHY: 'Mất kết nối', DRAFT: 'Bản nháp', SCHEDULED: 'Đã lên lịch', QUEUED: 'Đang chờ', SUCCEEDED: 'Hoàn tất', FAILED: 'Thất bại', CANCELLED: 'Đã hủy', REQUIRES_ACTION: 'Cần thao tác',
   STARTING: 'Đang mở', AUTHENTICATED: 'Đã đăng nhập', IDLE: 'Đang chờ', CLOSING: 'Đang đóng', CLOSED: 'Đã đóng', CRASHED: 'Lỗi browser', PENDING: 'Chờ duyệt', APPROVED: 'Đã duyệt', REJECTED: 'Từ chối', NOT_REQUIRED: 'Không yêu cầu',
 };
-export const ACTION_LABELS: Record<string, string> = { HEALTH_CHECK: 'Kiểm tra phiên', GET_PROFILE: 'Kiểm tra profile', SYNC_FACEBOOK_GROUPS: 'Đồng bộ nhóm', JOIN_FACEBOOK_GROUP: 'Tham gia nhóm', POST_FACEBOOK_GROUP: 'Đăng bài nhóm', MESSAGE_FACEBOOK_RECIPIENT: 'Nhắn thành viên ngẫu nhiên', SCAN_FACEBOOK_POST_COMMENTS: 'Quét SĐT bình luận', REPLY_FACEBOOK_POST_COMMENTS: 'Rep bình luận', PUBLISH_POST: 'Bản nháp nội dung' };
+export const ACTION_LABELS: Record<string, string> = { HEALTH_CHECK: 'Kiểm tra phiên', GET_PROFILE: 'Kiểm tra profile', SYNC_FACEBOOK_GROUPS: 'Đồng bộ nhóm', JOIN_FACEBOOK_GROUP: 'Tham gia nhóm', POST_FACEBOOK_GROUP: 'Đăng bài nhóm', COMMENT_FACEBOOK_GROUP_POSTS: 'Bình luận bài viết trong nhóm', MESSAGE_FACEBOOK_RECIPIENT: 'Nhắn thành viên ngẫu nhiên', MESSAGE_FACEBOOK_REACTOR: 'Nhắn người react/bình luận bài viết', SCAN_FACEBOOK_POST_COMMENTS: 'Quét SĐT bình luận', REPLY_FACEBOOK_POST_COMMENTS: 'Rep bình luận', PUBLISH_POST: 'Bản nháp nội dung' };

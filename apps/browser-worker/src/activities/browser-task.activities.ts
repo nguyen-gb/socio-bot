@@ -1,10 +1,12 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Context } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import {
   platformActionSchema,
   normalizeFacebookGroupUrl,
+  normalizeFacebookPostUrl,
+  normalizeFacebookProfileUrl,
   requiresExternalApproval,
   type ActionResult,
   type ExecuteTaskWorkflowInput,
@@ -41,6 +43,7 @@ import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenge
 @Injectable()
 export class BrowserTaskActivities {
   private readonly adapters: PlatformAdapterRegistry;
+  private readonly logger = new Logger(BrowserTaskActivities.name);
 
   constructor(
     private readonly prisma: PrismaService,
@@ -175,7 +178,7 @@ export class BrowserTaskActivities {
     if (workflowId && current.workflowId !== workflowId) return { ok: false, data: { skipped: true, reason: 'stale_workflow' } };
     if (current.status === 'CANCELLED') return { ok: false, data: { cancelled: true } };
     if (current.status === 'PAUSED' || current.campaign?.pausedAt || current.campaign?.cancelledAt) return { ok: false, data: { paused: true } };
-    const facebookBrowserAction = ['SYNC_FACEBOOK_GROUPS', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS'].includes(action.action);
+    const facebookBrowserAction = ['SYNC_FACEBOOK_GROUPS', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action);
     if (facebookBrowserAction && current.account.status !== 'READY') {
       await this.prisma.task.update({ where: { id: task.id }, data: { status: 'REQUIRES_ACTION', lastError: 'Account không ở trạng thái READY; hãy đăng nhập hoặc xử lý xác minh trước.' } });
       return { ok: false, data: { requiresAction: true, reason: 'Account is not READY' } };
@@ -207,6 +210,13 @@ export class BrowserTaskActivities {
     let sideEffectStarted = false;
     let authenticated = false;
     let browserSessionId: string | undefined;
+    let browserCloseWaitCompleted = false;
+    const waitForBrowserClose = async () => {
+      if (browserCloseWaitCompleted) return;
+      const delayMs = this.config.get('browserCloseDelayMs', { infer: true });
+      if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+      browserCloseWaitCompleted = true;
+    };
     try {
       const browserSession = await this.prisma.browserSession.create({ data: {
         profileId: profile.id, workerId: this.registry.workerId, mode: 'AUTOMATION', status: 'STARTING',
@@ -232,6 +242,10 @@ export class BrowserTaskActivities {
             locale: this.config.get('browserLocale', { infer: true }),
             timezoneId: this.config.get('browserTimezoneId', { infer: true }),
             recordHarPath: harPath,
+            // Keep the browser alive until the action result and task run have
+            // been durably persisted. Closing inside withProfile() can abort
+            // a still-settling Facebook UI action while the task is RUNNING.
+            closeOnComplete: false,
           },
           async (session) => {
             const opened = await this.prisma.browserSession.updateMany({ where: { id: browserSession.id, status: 'STARTING' }, data: { status: 'RUNNING', processId: session.processId, lastActiveAt: new Date() } });
@@ -271,22 +285,43 @@ export class BrowserTaskActivities {
                 }
                 authenticated = !blocked;
               }
-              const actionResult = blocked ?? await adapter.execute(action, { ...session,
-                resolveMediaAssets: async ids => {
+              const actionSession = {
+                ...session,
+                accountUsername: current.account.username ?? undefined,
+                accountExternalId: current.account.externalId ?? undefined,
+                reserveMessageRecipient: ['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'].includes(action.action)
+                  ? async (recipient: { groupUrl: string; profileUrl: string; displayName?: string }) => this.reserveMessageRecipient({
+                    organizationId: current.organizationId,
+                    accountId: current.accountId,
+                    taskId: current.id,
+                    ...recipient,
+                  })
+                  : undefined,
+                releaseMessageRecipient: ['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'].includes(action.action)
+                  ? async (recipient: { groupUrl: string; profileUrl: string }) => this.releaseMessageRecipient({
+                    organizationId: current.organizationId,
+                    taskId: current.id,
+                    ...recipient,
+                  })
+                  : undefined,
+                resolveMediaAssets: async (ids: string[]) => {
                   const approvedMediaIds = 'mediaAssetIds' in action.payload ? action.payload.mediaAssetIds : [];
-                  if (!['POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT'].includes(action.action) || ids.some(id => !approvedMediaIds.includes(id))) {
+                  if (!['POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action) || ids.some((id: string) => !approvedMediaIds.includes(id))) {
                     throw new Error('Ảnh không thuộc nội dung tác vụ đã duyệt');
                   }
                   return loadTaskImages(this.prisma, this.objects, task.organizationId, ids);
-              }, beforeExternalAction: async () => {
+                },
+                beforeExternalAction: async () => {
                 session.signal?.throwIfAborted();
                 const state = await this.prisma.browserSession.findUnique({ where: { id: browserSession.id }, select: { status: true } });
                 if (state?.status !== 'RUNNING') throw new Error('Browser đã được yêu cầu đóng; dừng trước khi gửi');
                 // Persist BEFORE clicking: even a crash during the click is uncertain.
                 sideEffectStarted = true;
                 await this.prisma.taskRun.update({ where: { id: run.id }, data: { result: { sideEffectStarted: true } } });
-                session.signal?.throwIfAborted();
-              } });
+                  session.signal?.throwIfAborted();
+                },
+              };
+              const actionResult = blocked ?? await adapter.execute(action, actionSession);
               if (!actionResult.ok) {
                 retainTrace = true;
                 await this.artifacts
@@ -322,8 +357,29 @@ export class BrowserTaskActivities {
         await this.artifacts
           .captureHar(task.id, run.id, harPath)
           .catch(() => undefined);
+        // The action has returned at this point, so release Chromium before
+        // archiving the profile. Keeping the browser open while tar/lstat
+        // reads the profile lets Windows hold profile.tar.gz handles and can
+        // make the task appear stuck or fail with ENOTEMPTY/EPERM.
+        if (browserSessionId && this.runtime.closeProfile) {
+          await waitForBrowserClose();
+          await this.runtime.closeProfile(profile.id, browserSessionId).catch(() => undefined);
+        }
         Context.current().heartbeat({ stage: 'saving_profile_snapshot' });
-        await this.snapshots.capture(profile.id);
+        try {
+          await this.snapshots.capture(profile.id);
+        } catch (snapshotError) {
+          // Snapshot cleanup/antivirus races on Windows must not overwrite the
+          // actual Facebook action result. The browser session is already
+          // closed here; make the profile available for a retry and preserve
+          // the task outcome instead of turning a successful/verified action
+          // into a misleading REQUIRES_ACTION failure.
+          await this.prisma.browserProfile.update({
+            where: { id: profile.id },
+            data: { status: 'AVAILABLE' },
+          }).catch(() => undefined);
+          this.logger.warn(`Profile snapshot skipped for ${profile.id}: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`);
+        }
       }
       if (result.data?.loginRequired === true) throw new LoginRequiredError();
       await this.persistFacebookResult(task, result);
@@ -396,13 +452,21 @@ export class BrowserTaskActivities {
       throw error;
     } finally {
       clearInterval(heartbeat);
-      if (browserSessionId) await this.prisma.browserSession.update({ where: { id: browserSessionId }, data: { status: 'CLOSED', closedAt: new Date() } });
+      if (browserSessionId) {
+        // withProfile() is configured to defer closing for campaign work so
+        // persistence and confirmation finish before Chromium is torn down.
+        if (this.runtime.closeProfile) {
+          await waitForBrowserClose();
+          await this.runtime.closeProfile(profile.id, browserSessionId).catch(() => undefined);
+        }
+        await this.prisma.browserSession.update({ where: { id: browserSessionId }, data: { status: 'CLOSED', closedAt: new Date() } });
+      }
     }
     }, { waitTimeoutMs: 10 * 60_000, onWait: () => Context.current().heartbeat({ stage: 'waiting_profile', taskId: task.id }) });
   }
 
   private async persistFacebookResult(
-    task: { organizationId: string; accountId: string; action: string; payload: unknown },
+    task: { id: string; organizationId: string; accountId: string; action: string; payload: unknown },
     result: ActionResult,
   ) {
     const data = result.data ?? {};
@@ -433,6 +497,54 @@ export class BrowserTaskActivities {
     if (task.action === 'POST_FACEBOOK_GROUP' && result.ok && typeof payload.groupUrl === 'string') {
       await this.prisma.facebookGroupMembership.updateMany({ where: { accountId: task.accountId, organizationId: task.organizationId, groupUrl: normalizeFacebookGroupUrl(payload.groupUrl) }, data: { lastPostAt: new Date() } });
     }
+    if (['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'].includes(task.action) && result.ok && data.messageStatus === 'SENT' && typeof data.profileUrl === 'string') {
+      const model = (this.prisma as PrismaService & { facebookMessageRecipient?: any }).facebookMessageRecipient;
+      if (model) {
+        const groupUrl = this.normalizeMessageScopeUrl(typeof payload.groupUrl === 'string' ? payload.groupUrl : typeof payload.postUrl === 'string' ? payload.postUrl : typeof data.postUrl === 'string' ? data.postUrl : '');
+        const profileUrl = normalizeFacebookProfileUrl(data.profileUrl);
+        await model.upsert({
+          where: { organizationId_groupUrl_profileUrl: { organizationId: task.organizationId, groupUrl, profileUrl } },
+          create: { organizationId: task.organizationId, accountId: task.accountId, taskId: task.id, groupUrl, profileUrl, displayName: typeof data.displayName === 'string' ? data.displayName : null, status: 'SENT', sentAt: new Date() },
+          update: { accountId: task.accountId, taskId: task.id, displayName: typeof data.displayName === 'string' ? data.displayName : undefined, status: 'SENT', sentAt: new Date() },
+        });
+      }
+    }
+  }
+
+  private async reserveMessageRecipient(input: { organizationId: string; accountId: string; taskId: string; groupUrl: string; profileUrl: string; displayName?: string }): Promise<boolean> {
+    const model = (this.prisma as PrismaService & { facebookMessageRecipient?: any }).facebookMessageRecipient;
+    if (!model) return true;
+    const groupUrl = this.normalizeMessageScopeUrl(input.groupUrl);
+    const profileUrl = normalizeFacebookProfileUrl(input.profileUrl);
+    const existing = await model.findUnique({ where: { organizationId_groupUrl_profileUrl: { organizationId: input.organizationId, groupUrl, profileUrl } } });
+    if (existing) {
+      if (existing.taskId === input.taskId && existing.status === 'RESERVED') return true;
+      // A reservation left behind by a crashed worker is reclaimable after an
+      // hour; SENT rows are permanent and always excluded.
+      if (existing.status === 'RESERVED' && Date.now() - new Date(existing.reservedAt).getTime() > 60 * 60 * 1000) {
+        const claimed = await model.updateMany({ where: { id: existing.id, status: 'RESERVED', reservedAt: existing.reservedAt }, data: { accountId: input.accountId, taskId: input.taskId, displayName: input.displayName, reservedAt: new Date() } });
+        return claimed.count === 1;
+      }
+      return false;
+    }
+    try {
+      await model.create({ data: { organizationId: input.organizationId, accountId: input.accountId, taskId: input.taskId, groupUrl, profileUrl, displayName: input.displayName, status: 'RESERVED' } });
+      return true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return false;
+      throw error;
+    }
+  }
+
+  private async releaseMessageRecipient(input: { organizationId: string; taskId: string; groupUrl: string; profileUrl: string }): Promise<void> {
+    const model = (this.prisma as PrismaService & { facebookMessageRecipient?: any }).facebookMessageRecipient;
+    if (!model) return;
+    await model.deleteMany({ where: { organizationId: input.organizationId, taskId: input.taskId, groupUrl: this.normalizeMessageScopeUrl(input.groupUrl), profileUrl: normalizeFacebookProfileUrl(input.profileUrl), status: 'RESERVED' } });
+  }
+
+  private normalizeMessageScopeUrl(value: string): string {
+    try { return normalizeFacebookGroupUrl(value); }
+    catch { return normalizeFacebookPostUrl(value); }
   }
 }
 

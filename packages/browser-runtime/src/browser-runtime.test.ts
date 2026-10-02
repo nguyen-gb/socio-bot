@@ -58,6 +58,21 @@ test('task deadline bounds a stuck callback and recovers the slot', async () => 
   } finally { await runtime.closeAll(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('deferred close keeps the browser alive until the caller persists task results', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-deferred-close-'));
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7));
+  try {
+    const title = await runtime.withProfile({ profileId: 'fixture', headless: true, closeOnComplete: false }, async session => {
+      await session.page.goto('data:text/html,<title>deferred</title>');
+      return session.page.title();
+    });
+    assert.equal(title, 'deferred');
+    assert.equal(runtime.activeSessionCount, 1);
+    await runtime.closeProfile('fixture');
+    assert.equal(runtime.activeSessionCount, 0);
+  } finally { await runtime.closeAll(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('persistent Chromium profile survives a close and reopen', async () => {
   const root = await mkdtemp(join(tmpdir(), 'socio-browser-runtime-'));
   const profileId = '00000000-0000-4000-8000-000000000222';

@@ -32,6 +32,8 @@ export interface OpenProfileOptions {
   slotTimeoutMs?: number;
   recordHarPath?: string;
   executionTimeoutMs?: number;
+  /** Keep the session alive until the caller has persisted the task result. */
+  closeOnComplete?: boolean;
 }
 
 export interface ManagedBrowserSession extends PlatformSession {
@@ -163,7 +165,7 @@ export class BrowserRuntime {
       return await withDeadline(Promise.race([callback(session), aborted]), options.executionTimeoutMs ?? 5 * 60_000, 'Browser task timed out; browser will be terminated');
     } finally {
       if (onAbort) session.signal?.removeEventListener('abort', onAbort);
-      await session.close();
+      if (options.closeOnComplete !== false) await session.close();
     }
   }
 

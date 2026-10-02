@@ -90,7 +90,10 @@ export function normalizeFacebookProfileUrl(input: string): string {
   const match = /^\/([a-zA-Z0-9._-]+)\/?$/.exec(url.pathname);
   const reserved = new Set(['groups', 'pages', 'events', 'marketplace', 'watch', 'messages', 'login', 'checkpoint']);
   if (!match || reserved.has(match[1]!.toLowerCase())) throw new Error('Link phải trỏ đến một profile Facebook');
-  return `https://www.facebook.com/${match[1]}/`;
+  // Numeric profile routes are also emitted by group member/comment links.
+  // Keep them slashless so the same account cannot be stored twice when one
+  // campaign discovers it as a reactor and another as a commenter.
+  return `https://www.facebook.com/${match[1]}${/^\d+$/.test(match[1]!) ? '' : '/'}`;
 }
 
 export const facebookProfileUrlSchema = z.string().max(2048).transform((value, context) => {
@@ -122,19 +125,71 @@ export const messageFacebookRecipientsSchema = campaignBase.extend({
 });
 export type MessageFacebookRecipientsInput = z.infer<typeof messageFacebookRecipientsSchema>;
 
+export const facebookPostRecipientSourceSchema = z.enum(['REACTORS', 'COMMENTERS', 'REACTORS_AND_COMMENTERS']);
+export type FacebookPostRecipientSource = z.infer<typeof facebookPostRecipientSourceSchema>;
+
+export const messageFacebookReactorsSchema = campaignBase.extend({
+  // `postUrl` remains supported for older clients. New clients can submit a
+  // list through `postUrls`, with one task set generated per post.
+  postUrl: facebookPostUrlSchema.optional(),
+  postUrls: z.array(facebookPostUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]).optional(),
+  text: z.string().trim().max(5_000).default(''),
+  mediaAssetIds: facebookMediaIdsSchema,
+  recipientSource: facebookPostRecipientSourceSchema.default('REACTORS'),
+  maxRecipientsPerPost: z.number().int().min(1).max(50),
+  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+}).superRefine((input, context) => {
+  if (!input.postUrl && !input.postUrls?.length) context.addIssue({ code: 'custom', message: 'Nhập ít nhất một URL bài viết Facebook', path: ['postUrls'] });
+  if (!input.text.length && !input.mediaAssetIds.length) context.addIssue({ code: 'custom', message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'] });
+});
+export type MessageFacebookReactorsInput = z.infer<typeof messageFacebookReactorsSchema>;
+
 export const scanFacebookPostCommentsSchema = campaignBase.extend({
-  postUrl: facebookPostUrlSchema,
+  // `postUrl` is kept for backwards compatibility with existing clients.
+  // New campaigns may scan several posts in one campaign via `postUrls`.
+  postUrl: facebookPostUrlSchema.optional(),
+  postUrls: z.array(facebookPostUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]).optional(),
   intervalSeconds: z.number().int().min(30).max(3600).default(60),
+}).superRefine((input, context) => {
+  if (!input.postUrl && !input.postUrls?.length) {
+    context.addIssue({ code: 'custom', message: 'Nhập ít nhất một URL bài viết Facebook', path: ['postUrls'] });
+  }
 });
 export type ScanFacebookPostCommentsInput = z.infer<typeof scanFacebookPostCommentsSchema>;
 
 export const replyFacebookPostCommentsSchema = campaignBase.extend({
   postUrl: facebookPostUrlSchema,
-  text: z.string().trim().min(1).max(5_000),
+  text: z.string().trim().max(5_000).default(''),
+  mediaAssetIds: facebookMediaIdsSchema,
   maxReplies: z.number().int().min(1).max(50),
   intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+}).refine(input => input.text.length > 0 || input.mediaAssetIds.length > 0, {
+  message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'],
 });
 export type ReplyFacebookPostCommentsInput = z.infer<typeof replyFacebookPostCommentsSchema>;
+
+/**
+ * Comment on recent posts found in one or more synchronized Facebook groups.
+ * The filters are frozen into the campaign so a later run cannot silently
+ * target a different set of posts.
+ */
+export const commentFacebookGroupPostsSchema = campaignBase.extend({
+  groupUrls: z.array(facebookGroupUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]),
+  text: z.string().trim().max(5_000).default(''),
+  mediaAssetIds: facebookMediaIdsSchema,
+  daysRecent: z.number().int().min(1).max(365).default(7),
+  minReactions: z.number().int().min(0).max(10_000_000).default(0),
+  maxReactions: z.number().int().min(0).max(10_000_000).optional(),
+  minComments: z.number().int().min(0).max(10_000_000).default(0),
+  maxComments: z.number().int().min(0).max(10_000_000).optional(),
+  maxPosts: z.number().int().min(1).max(50).default(10),
+  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+}).superRefine((input, context) => {
+  if (!input.text.length && !input.mediaAssetIds.length) context.addIssue({ code: 'custom', message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'] });
+  if (input.maxReactions != null && input.maxReactions < input.minReactions) context.addIssue({ code: 'custom', message: 'Số tim tối đa phải lớn hơn hoặc bằng số tim tối thiểu', path: ['maxReactions'] });
+  if (input.maxComments != null && input.maxComments < input.minComments) context.addIssue({ code: 'custom', message: 'Số bình luận tối đa phải lớn hơn hoặc bằng số bình luận tối thiểu', path: ['maxComments'] });
+});
+export type CommentFacebookGroupPostsInput = z.infer<typeof commentFacebookGroupPostsSchema>;
 
 export const postFacebookGroupsSchema = campaignBase.extend({
   text: z.string().trim().max(20_000).default(''),

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { platformSchema } from './status';
-import { facebookGroupUrlSchema, facebookPostUrlSchema } from './facebook';
+import { facebookGroupUrlSchema, facebookPostRecipientSourceSchema, facebookPostUrlSchema } from './facebook';
 import { facebookMediaIdsSchema } from './media';
 
 const baseActionSchema = z.object({
@@ -52,6 +52,18 @@ export const messageFacebookRecipientActionSchema = baseActionSchema.extend({
     groupUrl: facebookGroupUrlSchema,
     text: z.string().trim().max(5_000).default(''),
     mediaAssetIds: facebookMediaIdsSchema,
+    excludeProfileUrls: z.array(z.string().max(2048)).max(500).default([]),
+  }).refine(payload => payload.text.length > 0 || payload.mediaAssetIds.length > 0, 'Nhập nội dung hoặc chọn ít nhất một ảnh'),
+});
+export const messageFacebookReactorActionSchema = baseActionSchema.extend({
+  platform: z.literal('FACEBOOK'),
+  action: z.literal('MESSAGE_FACEBOOK_REACTOR'),
+  payload: z.object({
+    postUrl: facebookPostUrlSchema,
+    recipientSource: facebookPostRecipientSourceSchema.default('REACTORS'),
+    text: z.string().trim().max(5_000).default(''),
+    mediaAssetIds: facebookMediaIdsSchema,
+    excludeProfileUrls: z.array(z.string().max(2048)).max(500).default([]),
   }).refine(payload => payload.text.length > 0 || payload.mediaAssetIds.length > 0, 'Nhập nội dung hoặc chọn ít nhất một ảnh'),
 });
 export const scanFacebookPostCommentsActionSchema = baseActionSchema.extend({
@@ -62,11 +74,34 @@ export const scanFacebookPostCommentsActionSchema = baseActionSchema.extend({
 export const replyFacebookPostCommentsActionSchema = baseActionSchema.extend({
   platform: z.literal('FACEBOOK'),
   action: z.literal('REPLY_FACEBOOK_POST_COMMENTS'),
-  payload: z.object({ postUrl: facebookPostUrlSchema, text: z.string().trim().min(1).max(5_000), maxReplies: z.number().int().min(1).max(50) }),
+  payload: z.object({
+    postUrl: facebookPostUrlSchema,
+    text: z.string().trim().max(5_000).default(''),
+    mediaAssetIds: facebookMediaIdsSchema,
+    maxReplies: z.number().int().min(1).max(50),
+  }).refine(
+    payload => payload.text.length > 0 || payload.mediaAssetIds.length > 0,
+    'Nhập nội dung hoặc chọn ít nhất một ảnh',
+  ),
+});
+export const commentFacebookGroupPostsActionSchema = baseActionSchema.extend({
+  platform: z.literal('FACEBOOK'),
+  action: z.literal('COMMENT_FACEBOOK_GROUP_POSTS'),
+  payload: z.object({
+    groupUrl: facebookGroupUrlSchema,
+    text: z.string().trim().max(5_000).default(''),
+    mediaAssetIds: facebookMediaIdsSchema,
+    daysRecent: z.number().int().min(1).max(365).default(7),
+    minReactions: z.number().int().min(0).max(10_000_000).default(0),
+    maxReactions: z.number().int().min(0).max(10_000_000).optional(),
+    minComments: z.number().int().min(0).max(10_000_000).default(0),
+    maxComments: z.number().int().min(0).max(10_000_000).optional(),
+    maxPosts: z.number().int().min(1).max(50).default(10),
+  }),
 });
 
 export function requiresExternalApproval(action: string): boolean {
-  return ['PUBLISH_POST', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS'].includes(action);
+  return ['PUBLISH_POST', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action);
 }
 
 export const platformActionSchema = z.discriminatedUnion('action', [
@@ -77,8 +112,10 @@ export const platformActionSchema = z.discriminatedUnion('action', [
   joinFacebookGroupActionSchema,
   postFacebookGroupActionSchema,
   messageFacebookRecipientActionSchema,
+  messageFacebookReactorActionSchema,
   scanFacebookPostCommentsActionSchema,
   replyFacebookPostCommentsActionSchema,
+  commentFacebookGroupPostsActionSchema,
 ]);
 export type PlatformAction = z.infer<typeof platformActionSchema>;
 

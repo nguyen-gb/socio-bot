@@ -45,6 +45,18 @@ test('random Facebook group-member messages require approval', () => {
   assert.equal(requiresExternalApproval('MESSAGE_FACEBOOK_RECIPIENT'), true);
 });
 
+test('random Facebook post-reactor messages require approval', () => {
+  const result = createTaskSchema.safeParse({
+    idempotencyKey: 'reactor-message-task-0001',
+    action: {
+      platform: 'FACEBOOK', accountId, action: 'MESSAGE_FACEBOOK_REACTOR',
+      payload: { postUrl: 'https://facebook.com/groups/123/posts/456', recipientSource: 'COMMENTERS', text: 'Tin nhắn người bình luận' },
+    },
+  });
+  assert.equal(result.success, true);
+  assert.equal(requiresExternalApproval('MESSAGE_FACEBOOK_REACTOR'), true);
+});
+
 test('Facebook post comment scans are valid actions and require approval', () => {
   const result = createTaskSchema.safeParse({
     idempotencyKey: 'scan-comments-task-0001',

@@ -50,6 +50,8 @@ function setup(ids = ['a', 'b']) {
     facebookCampaign: { findUnique: async () => null, findFirst: async () => campaign, create: createCampaign, findUniqueOrThrow: async () => campaign },
     facebookGroupCollection: { findMany: async () => [] },
     facebookOptInRecipient: { findMany: async () => [] },
+    facebookMessageRecipient: { upsert: async () => ({}) },
+    taskRun: { findMany: async () => [] },
     task: { findMany: async () => [], count: async () => 0, updateMany: async () => ({ count: 1 }) },
   };
   prisma.$transaction = async (callback: (tx: any) => unknown) => callback({
@@ -236,6 +238,42 @@ test('message target distribution splits ten attempts five-five between two join
   assert.equal(targets.filter(target => target.accountId === 'b').length, 5);
 });
 
+test('reactor message campaign splits the configured total evenly across profiles', async () => {
+  const context = setup(['a', 'b']);
+  const campaign = await context.service.messageReactors('org', {
+    name: 'Nhắn người react', idempotencyKey: 'message-reactors-key', accountIds: [],
+    postUrl: 'https://facebook.com/groups/123/posts/456', recipientSource: 'COMMENTERS', text: 'Cảm ơn bạn đã bình luận', mediaAssetIds: [], maxRecipientsPerPost: 10, intervalSeconds: 120,
+  });
+  const tasks = context.data().tasks.create;
+  assert.equal(campaign.kind, 'MESSAGE_REACTORS');
+  assert.equal(tasks.length, 10);
+  assert.deepEqual(tasks.filter((task: any) => task.accountId === 'a').length, 5);
+  assert.deepEqual(tasks.filter((task: any) => task.accountId === 'b').length, 5);
+  assert.ok(tasks.every((task: any) => task.payload.postUrl === 'https://www.facebook.com/groups/123/posts/456'));
+  assert.deepEqual(context.data().payload.maxRecipientsPerPost, 10);
+  assert.equal(context.data().payload.recipientSource, 'COMMENTERS');
+  assert.ok(tasks.every((task: any) => task.payload.recipientSource === 'COMMENTERS'));
+  assert.ok(tasks.every((task: any) => task.action === 'MESSAGE_FACEBOOK_REACTOR' && task.status === 'DRAFT' && task.approvalStatus === 'PENDING' && task.maxAttempts === 1));
+});
+
+test('reactor message campaign creates an evenly split task set for every post URL', async () => {
+  const context = setup(['a', 'b']);
+  await context.service.messageReactors('org', {
+    name: 'Nhắn nhiều bài', idempotencyKey: 'message-reactors-list-key', accountIds: [],
+    postUrls: ['https://facebook.com/groups/123/posts/456', 'https://facebook.com/groups/123/posts/789'], recipientSource: 'REACTORS_AND_COMMENTERS', text: 'Cảm ơn bạn', mediaAssetIds: [], maxRecipientsPerPost: 10, intervalSeconds: 120,
+  });
+  const tasks = context.data().tasks.create;
+  assert.equal(tasks.length, 20);
+  assert.deepEqual(context.data().payload.postUrls, ['https://www.facebook.com/groups/123/posts/456', 'https://www.facebook.com/groups/123/posts/789']);
+  for (const postUrl of context.data().payload.postUrls) {
+    const postTasks = tasks.filter((task: any) => task.payload.postUrl === postUrl);
+    assert.equal(postTasks.length, 10);
+    assert.equal(postTasks.filter((task: any) => task.accountId === 'a').length, 5);
+    assert.equal(postTasks.filter((task: any) => task.accountId === 'b').length, 5);
+    assert.ok(postTasks.every((task: any) => task.payload.recipientSource === 'REACTORS_AND_COMMENTERS'));
+  }
+});
+
 test('message campaign uses every joined group when no group is selected', async () => {
   const context = setup(['a']);
   await context.service.message('org', {
@@ -261,17 +299,66 @@ test('comment scan campaign creates one approval task per selected READY profile
   assert.ok(tasks.every((task: any) => task.action === 'SCAN_FACEBOOK_POST_COMMENTS' && task.payload.postUrl === 'https://www.facebook.com/groups/123/posts/456' && task.status === 'DRAFT' && task.approvalStatus === 'PENDING' && task.maxAttempts === 1));
 });
 
+test('comment scan campaign creates one task per profile and post URL and keeps the URL list', async () => {
+  const context = setup(['a', 'b']);
+  await context.service.scanComments('org', {
+    name: 'Quét nhiều bài', idempotencyKey: 'scan-comments-many', accountIds: [],
+    postUrls: [
+      'https://www.facebook.com/groups/123/posts/456',
+      'https://www.facebook.com/groups/123/posts/789',
+    ], intervalSeconds: 60,
+  });
+  const tasks = context.data().tasks.create;
+  assert.deepEqual(context.data().payload.postUrls, [
+    'https://www.facebook.com/groups/123/posts/456',
+    'https://www.facebook.com/groups/123/posts/789',
+  ]);
+  assert.equal(tasks.length, 4);
+  assert.deepEqual(tasks.map((task: any) => [task.accountId, task.payload.postUrl]), [
+    ['a', 'https://www.facebook.com/groups/123/posts/456'],
+    ['a', 'https://www.facebook.com/groups/123/posts/789'],
+    ['b', 'https://www.facebook.com/groups/123/posts/456'],
+    ['b', 'https://www.facebook.com/groups/123/posts/789'],
+  ]);
+});
+
 test('comment reply campaign splits the configured total evenly across profiles', async () => {
   const context = setup(['a', 'b']);
+  const mediaAssetIds = ['00000000-0000-4000-8000-000000000002'];
+  context.prisma.mediaAsset = { count: async (input: any) => {
+    assert.deepEqual(input.where.id.in, mediaAssetIds);
+    assert.equal(input.where.organizationId, 'org');
+    assert.equal(input.where.status, 'READY');
+    return mediaAssetIds.length;
+  } };
   const campaign = await context.service.replyComments('org', {
     name: 'Rep bình luận', idempotencyKey: 'reply-comments-key', accountIds: [],
-    postUrl: 'https://www.facebook.com/groups/123/posts/456', text: 'Cảm ơn bạn', maxReplies: 10, intervalSeconds: 120,
+    postUrl: 'https://www.facebook.com/groups/123/posts/456', text: 'Cảm ơn bạn', mediaAssetIds, maxReplies: 10, intervalSeconds: 120,
   });
   const tasks = context.data().tasks.create;
   assert.equal(campaign.kind, 'REPLY_COMMENTS');
   assert.deepEqual(tasks.map((task: any) => task.payload.maxReplies), [5, 5]);
+  assert.deepEqual(context.data().payload.mediaAssetIds, mediaAssetIds);
+  assert.ok(tasks.every((task: any) => task.payload.mediaAssetIds[0] === mediaAssetIds[0]));
   assert.ok(tasks.every((task: any) => task.action === 'REPLY_FACEBOOK_POST_COMMENTS' && task.status === 'DRAFT' && task.approvalStatus === 'PENDING' && task.maxAttempts === 1));
   assert.deepEqual([...distributeReplyCounts(['a', 'b', 'c'], 5).entries()], [['a', 2], ['b', 2], ['c', 1]]);
+});
+
+test('group comment campaign snapshots filters and creates one task per joined profile/group', async () => {
+  const context = setup(['a', 'b']);
+  const groupUrl = 'https://www.facebook.com/groups/123/';
+  const campaign = await context.service.commentGroupPosts('org', {
+    name: 'Cmt bài mới', idempotencyKey: 'comment-group-posts-key', accountIds: [], groupUrls: [groupUrl],
+    text: 'Bình luận thử nghiệm', mediaAssetIds: [], daysRecent: 3, minReactions: 2, maxReactions: 100,
+    minComments: 1, maxComments: 20, maxPosts: 5, intervalSeconds: 120,
+  });
+  const tasks = context.data().tasks.create;
+  assert.equal(campaign.kind, 'COMMENT_GROUP_POSTS');
+  assert.equal(tasks.length, 2);
+  assert.deepEqual(tasks.map((task: any) => task.accountId), ['a', 'b']);
+  assert.ok(tasks.every((task: any) => task.action === 'COMMENT_FACEBOOK_GROUP_POSTS' && task.payload.groupUrl === groupUrl && task.payload.daysRecent === 3 && task.payload.minReactions === 2 && task.payload.maxReactions === 100 && task.payload.minComments === 1 && task.payload.maxComments === 20 && task.payload.maxPosts === 5 && task.status === 'DRAFT' && task.approvalStatus === 'PENDING'));
+  assert.deepEqual(context.data().payload.groupUrls, [groupUrl]);
+  assert.equal(context.data().payload.maxPosts, 5);
 });
 
 test('opt-in recipient records are workspace scoped and revocation is retained', async () => {

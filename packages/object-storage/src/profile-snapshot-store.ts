@@ -51,7 +51,7 @@ export class ProfileSnapshotStore {
         checksum,
       };
     } finally {
-      await rm(workspace, { recursive: true, force: true });
+      await removeWorkspace(workspace);
     }
   }
 
@@ -79,7 +79,7 @@ export class ProfileSnapshotStore {
       await mkdir(profilePath, { recursive: true });
       await tar.x({ cwd: profilePath, file: archivePath, strict: true });
     } finally {
-      await rm(workspace, { recursive: true, force: true });
+      await removeWorkspace(workspace);
     }
   }
 }
@@ -129,4 +129,19 @@ function requiredFragment(uri: URL, key: string): string {
   const value = new URLSearchParams(uri.hash.slice(1)).get(key);
   if (!value) throw new Error(`Snapshot URI is missing ${key}`);
   return value;
+}
+
+async function removeWorkspace(workspace: string): Promise<void> {
+  try {
+    // Chromium can release a profile/archive handle a moment after the
+    // snapshot finishes. Windows reports that short race as ENOTEMPTY; retry
+    // cleanup before treating it as a real snapshot failure.
+    await rm(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+  } catch (error) {
+    // The archive/object is already durable at this point. Do not turn a
+    // best-effort temporary-directory cleanup race into a failed Facebook
+    // action; a later run can remove the leftover workspace.
+    if ((error as NodeJS.ErrnoException).code === 'ENOTEMPTY') return;
+    throw error;
+  }
 }

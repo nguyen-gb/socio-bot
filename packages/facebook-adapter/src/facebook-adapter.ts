@@ -36,11 +36,22 @@ export class FacebookAdapter implements PlatformAdapter {
       case 'POST_FACEBOOK_GROUP':
         return new FacebookGroupsAutomation().post(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds);
       case 'MESSAGE_FACEBOOK_RECIPIENT':
-        return new FacebookMessagesAutomation().messageRandomGroupMember(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds);
+        return new FacebookMessagesAutomation().messageRandomGroupMember(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds, action.payload.excludeProfileUrls);
+      case 'MESSAGE_FACEBOOK_REACTOR':
+        return new FacebookMessagesAutomation().messageRandomPostReactor(session, action.payload.postUrl, action.payload.text, action.payload.mediaAssetIds, action.payload.excludeProfileUrls, action.payload.recipientSource);
       case 'SCAN_FACEBOOK_POST_COMMENTS':
         return new FacebookCommentsAutomation().scanPostComments(session, action.payload.postUrl);
       case 'REPLY_FACEBOOK_POST_COMMENTS':
-        return new FacebookCommentsAutomation().replyPostComments(session, action.payload.postUrl, action.payload.text, action.payload.maxReplies);
+        return new FacebookCommentsAutomation().replyPostComments(session, action.payload.postUrl, action.payload.text, action.payload.maxReplies, action.payload.mediaAssetIds);
+      case 'COMMENT_FACEBOOK_GROUP_POSTS':
+        return new FacebookCommentsAutomation().commentGroupPosts(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds, {
+          daysRecent: action.payload.daysRecent,
+          minReactions: action.payload.minReactions,
+          maxReactions: action.payload.maxReactions,
+          minComments: action.payload.minComments,
+          maxComments: action.payload.maxComments,
+          maxPosts: action.payload.maxPosts,
+        });
     }
   }
 

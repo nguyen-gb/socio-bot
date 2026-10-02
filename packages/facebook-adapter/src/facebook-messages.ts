@@ -1,4 +1,4 @@
-import { normalizeFacebookGroupUrl, normalizeFacebookProfileUrl, type ActionResult } from '@socio/contracts';
+import { normalizeFacebookGroupUrl, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, type ActionResult, type FacebookPostRecipientSource } from '@socio/contracts';
 import { type PlatformSession } from '@socio/platform-core';
 import type { Locator, Page } from 'playwright';
 import { attachFacebookImages } from './facebook-images';
@@ -8,24 +8,36 @@ const SEND = /^(Send|Gửi)$/i;
 const MESSAGE_PHOTO = /^(Photo\/?video|Photos\/?videos|Add photos\/?videos|Add photos|Photo|Photos|Attach a photo|Attach photo|Ảnh\/?video|Thêm ảnh\/?video|Thêm ảnh|Đính kèm ảnh(?: hoặc video)?)$/i;
 const MINIMIZED_CHAT = /^(Open chat with|Open conversation with|Mở chat với|Mở cuộc trò chuyện với|Mở cửa sổ chat với)/i;
 const CLOSE_CHAT = /^(Close chat|Close conversation|Close this chat|Đóng chat|Đóng đoạn chat|Đóng cuộc trò chuyện|Đóng cửa sổ chat|Đóng cửa sổ trò chuyện)$/i;
+const ALL_POST_COMMENTS = /^(?:All comments|Tất cả bình luận|Tất cả các bình luận)(?:\s*(?:\(.+\)|\d+))?$/i;
 const BLOCKED = /You can(?:not|'t|’t) send messages|This person is unavailable|Couldn(?:not|'t|’t) send|Bạn không thể gửi tin nhắn|Người này hiện không khả dụng|Không thể gửi/i;
 const normalizeText = (value: string) => value.replace(/\s+/g, ' ').trim();
 
 export class FacebookMessagesAutomation {
   constructor(private readonly timing: { mainTimeoutMs?: number; controlTimeoutMs?: number; confirmationTimeoutMs?: number } = {}) {}
 
-  async messageRandomGroupMember(session: PlatformSession, inputGroupUrl: string, text: string, mediaAssetIds: string[] = []): Promise<ActionResult> {
+  async messageRandomGroupMember(session: PlatformSession, inputGroupUrl: string, text: string, mediaAssetIds: string[] = [], excludedProfileUrls: string[] = []): Promise<ActionResult> {
     const page = automationPage(session);
     const groupUrl = normalizeFacebookGroupUrl(inputGroupUrl);
     try { await page.goto(`${groupUrl.replace(/\/$/, '')}/members`, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 }); }
     catch { return manual('Không tải được danh sách thành viên nhóm; chưa gửi tin nhắn.', { groupUrl }); }
     const interrupted = await guard(page);
     if (interrupted) return interrupted;
-    const members = await this.randomVisibleGroupMembers(page);
+    const excluded = new Set(excludedProfileUrls.map(value => {
+      try { return normalizeFacebookProfileUrl(value); } catch { return value; }
+    }));
+    const members = await this.randomVisibleGroupMembers(page, excluded);
     if (!members.length) return manual('Không tìm thấy thành viên có profile công khai trong nhóm; chưa gửi tin nhắn.', { groupUrl });
     let last: ActionResult | undefined;
     for (const member of members) {
-      const result = await this.message(session, member.profileUrl, text, mediaAssetIds);
+      const reserved = await session.reserveMessageRecipient?.({ groupUrl, profileUrl: member.profileUrl, displayName: member.displayName });
+      if (reserved === false) continue;
+      let result: ActionResult;
+      try { result = await this.message(session, member.profileUrl, text, mediaAssetIds); }
+      catch (error) {
+        // A thrown error may happen after the durable before-send marker. Keep
+        // the reservation so a retry cannot accidentally send twice.
+        throw error;
+      }
       const data = { ...result.data, groupUrl, profileUrl: member.profileUrl, displayName: member.displayName };
       last = { ...result, data };
       // A profile may be public but have no usable Messenger composer (for
@@ -33,8 +45,40 @@ export class FacebookMessagesAutomation {
       // continue through the randomized list. Once a send may have started,
       // stop immediately so a retry cannot duplicate the message.
       if (result.ok || result.data?.messageStatus === 'UNKNOWN' || result.data?.sideEffectStarted === true) return last;
+      await session.releaseMessageRecipient?.({ groupUrl, profileUrl: member.profileUrl });
     }
     return last ?? manual('Không tìm thấy thành viên có profile công khai trong nhóm; chưa gửi tin nhắn.', { groupUrl });
+  }
+
+  async messageRandomPostReactor(session: PlatformSession, inputPostUrl: string, text: string, mediaAssetIds: string[] = [], excludedProfileUrls: string[] = [], recipientSource: FacebookPostRecipientSource = 'REACTORS'): Promise<ActionResult> {
+    const page = automationPage(session);
+    const postUrl = normalizeFacebookPostUrl(inputPostUrl);
+    try { await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 }); }
+    catch { return manual('Không tải được bài viết; chưa gửi tin nhắn.', { postUrl }); }
+    const interrupted = await guard(page);
+    if (interrupted) return interrupted;
+    const excluded = new Set(excludedProfileUrls.map(value => {
+      try { return normalizeFacebookProfileUrl(value); } catch { return value; }
+    }));
+    const reactors = recipientSource === 'COMMENTERS' ? [] : await this.randomVisiblePostReactors(page, excluded);
+    const commenters = recipientSource === 'REACTORS' ? [] : await this.randomVisiblePostCommenters(page, excluded);
+    const recipients = [...new Map([...reactors, ...commenters].map(recipient => [recipient.profileUrl, recipient])).values()];
+    for (let index = recipients.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [recipients[index], recipients[swap]] = [recipients[swap]!, recipients[index]!];
+    }
+    if (!recipients.length) return manual(recipientSource === 'COMMENTERS' ? 'Không tìm thấy tài khoản đã bình luận công khai trong bài viết; chưa gửi tin nhắn.' : 'Không tìm thấy tài khoản đã react hoặc bình luận công khai trong bài viết; chưa gửi tin nhắn.', { postUrl });
+    let last: ActionResult | undefined;
+    for (const reactor of recipients) {
+      const reserved = await session.reserveMessageRecipient?.({ groupUrl: postUrl, profileUrl: reactor.profileUrl, displayName: reactor.displayName });
+      if (reserved === false) continue;
+      const result = await this.message(session, reactor.profileUrl, text, mediaAssetIds);
+      const data = { ...result.data, postUrl, groupUrl: postUrl, profileUrl: reactor.profileUrl, displayName: reactor.displayName };
+      last = { ...result, data };
+      if (result.ok || result.data?.messageStatus === 'UNKNOWN' || result.data?.sideEffectStarted === true) return last;
+      await session.releaseMessageRecipient?.({ groupUrl: postUrl, profileUrl: reactor.profileUrl });
+    }
+    return last ?? manual('Không tìm thấy tài khoản đủ điều kiện trong bài viết; chưa gửi tin nhắn.', { postUrl });
   }
 
   async message(session: PlatformSession, inputProfileUrl: string, text: string, mediaAssetIds: string[] = []): Promise<ActionResult> {
@@ -117,7 +161,20 @@ export class FacebookMessagesAutomation {
       if (!session.resolveMediaAssets) throw new Error('Worker chưa hỗ trợ tải ảnh; chưa gửi tin nhắn.');
       const images = await session.resolveMediaAssets(mediaAssetIds);
       if (images.length !== mediaAssetIds.length) throw new Error('Không tải đủ ảnh của tin nhắn; chưa gửi.');
-      await attachFacebookImages(page, messageSurface, images, this.timing.controlTimeoutMs ?? 60_000, send);
+      // Keep the upload picker scoped to the nearest Messenger composer.  The
+      // broader message surface also contains the profile/post shell (and,
+      // on saved sessions, unrelated Facebook file inputs), so passing it as
+      // the picker scope can resolve no photo control or select the wrong
+      // composer.  Use the surface only for upload/preview observation.
+      await attachFacebookImages(
+        page,
+        composer,
+        images,
+        this.timing.controlTimeoutMs ?? 60_000,
+        send,
+        messageSurface,
+        messageSurface,
+      );
     }
     await send.waitFor({ state: 'visible', timeout: composerTimeoutMs }).catch(() => undefined);
     if (!(await send.isVisible()) || !(await send.isEnabled())) return manual('Nút Gửi chưa sẵn sàng; chưa gửi tin nhắn.', { profileUrl });
@@ -127,42 +184,53 @@ export class FacebookMessagesAutomation {
     await session.beforeExternalAction?.();
     if (!isExpectedProfile(page, profileUrl) || !(await textbox.isVisible()) || !(await send.isVisible()) || !(await send.isEnabled())
       || normalizeText(await textboxText(textbox)) !== normalizeText(text)) return manual('Khung nhắn hoặc nội dung đã thay đổi; chưa gửi.', { profileUrl });
-    let sent = false;
-    try {
-      await send.click({ timeout: 15_000 });
-      sent = true;
-    } catch {
+    const waitForSent = async (): Promise<boolean> => {
+      const deadline = Date.now() + (this.timing.confirmationTimeoutMs ?? 15_000);
+      do {
+        const afterSend = await guard(page);
+        if (afterSend) return false;
+        if (await surface.getByText(BLOCKED).filter({ visible: true }).first().isVisible()) return false;
+        const bubble = text ? messageRows.filter({ hasText: text, visible: true }) : messageRows;
+        const currentLogText = await readMessageLogText(messageLog);
+        const currentLogTextCount = text ? occurrences(normalizeText(currentLogText), normalizeText(text)) : 0;
+        const logChanged = text
+          ? currentLogTextCount > previousLogTextCount
+          : normalizeText(currentLogText) !== normalizeText(previousLogText);
+        if ((await bubble.count() > previousMessages || await messageRows.count() > previousRowCount || logChanged) && normalizeText(await textboxText(textbox)) === '') return true;
+        await page.waitForTimeout(250);
+      } while (Date.now() < deadline);
+      return false;
+    };
+    // Facebook's Messenger composer is designed around Enter-to-send. Use it
+    // first; only click the scoped send control when Enter left the text in
+    // the editor and no new message was confirmed.
+    try { await textbox.press('Enter'); } catch { /* use the button fallback */ }
+    let sent = await waitForSent();
+    if (!sent && normalizeText(await textboxText(textbox)) !== '') {
+      const interruptedAfterEnter = await guard(page);
+      if (interruptedAfterEnter) return interruptedAfterEnter;
+      if (await surface.getByText(BLOCKED).filter({ visible: true }).first().isVisible()) return manual('Facebook từ chối gửi tin nhắn. Không tự thử lại.', { profileUrl, messageStatus: 'UNKNOWN' });
       try {
-        await send.click({ force: true, timeout: 3_000 });
+        await send.click({ timeout: 15_000 });
         sent = true;
       } catch {
-        sent = await send.evaluate(element => {
-          (element as HTMLElement).click();
-          return true;
-        }).catch(() => false);
+        try {
+          await send.click({ force: true, timeout: 3_000 });
+          sent = true;
+        } catch {
+          sent = await send.evaluate(element => {
+            (element as HTMLElement).click();
+            return true;
+          }).catch(() => false);
+        }
       }
+      if (sent) sent = await waitForSent();
     }
-    if (!sent) return manual('Đã bắt đầu thao tác gửi nhưng chưa rõ kết quả. Kiểm tra hội thoại trước khi thử lại.', { profileUrl, messageStatus: 'UNKNOWN' });
-    const deadline = Date.now() + (this.timing.confirmationTimeoutMs ?? 15_000);
-    do {
-      const afterSend = await guard(page);
-      if (afterSend) return afterSend;
-      if (await surface.getByText(BLOCKED).filter({ visible: true }).first().isVisible()) return manual('Facebook từ chối gửi tin nhắn. Không tự thử lại.', { profileUrl, messageStatus: 'UNKNOWN' });
-      const bubble = text ? messageRows.filter({ hasText: text, visible: true }) : messageRows;
-      const currentLogText = await readMessageLogText(messageLog);
-      const currentLogTextCount = text ? occurrences(normalizeText(currentLogText), normalizeText(text)) : 0;
-      const logChanged = text
-        ? currentLogTextCount > previousLogTextCount
-        : normalizeText(currentLogText) !== normalizeText(previousLogText);
-      if ((await bubble.count() > previousMessages || await messageRows.count() > previousRowCount || logChanged) && normalizeText(await textboxText(textbox)) === '') {
-        return { ok: true, data: { profileUrl, messageStatus: 'SENT' } };
-      }
-      await page.waitForTimeout(250);
-    } while (Date.now() < deadline);
-    return manual('Đã gửi thao tác nhưng chưa xác nhận được tin nhắn. Kiểm tra hội thoại trước khi chạy lại.', { profileUrl, messageStatus: 'UNKNOWN' });
+    if (!sent) return manual('Đã gửi thao tác nhưng chưa xác nhận được tin nhắn. Kiểm tra hội thoại trước khi chạy lại.', { profileUrl, messageStatus: 'UNKNOWN' });
+    return { ok: true, data: { profileUrl, messageStatus: 'SENT' } };
   }
 
-  private async randomVisibleGroupMembers(page: Page): Promise<Array<{ profileUrl: string; displayName?: string }>> {
+  private async randomVisibleGroupMembers(page: Page, excluded?: Set<string>): Promise<Array<{ profileUrl: string; displayName?: string }>> {
     const timeout = this.timing.controlTimeoutMs ?? 20_000;
     const main = page.getByRole('main').first();
     await main.waitFor({ state: 'visible', timeout }).catch(() => undefined);
@@ -186,7 +254,7 @@ export class FacebookMessagesAutomation {
         unique.set(profileUrl, { profileUrl, ...(candidate.name ? { displayName: candidate.name.slice(0, 120) } : {}) });
       } catch { /* Navigation and group links are not member profiles. */ }
     }
-    const members = [...unique.values()];
+    const members = [...unique.values()].filter(member => !excluded?.has(member.profileUrl));
     // Fisher-Yates keeps selection random while allowing the flow to skip a
     // member whose Messenger surface is unavailable and try another member.
     for (let index = members.length - 1; index > 0; index -= 1) {
@@ -194,6 +262,124 @@ export class FacebookMessagesAutomation {
       [members[index], members[swap]] = [members[swap]!, members[index]!];
     }
     return members;
+  }
+
+  private async randomVisiblePostReactors(page: Page, excluded?: Set<string>): Promise<Array<{ profileUrl: string; displayName?: string }>> {
+    const timeout = this.timing.controlTimeoutMs ?? 20_000;
+    const main = page.getByRole('main').first();
+    await main.waitFor({ state: 'visible', timeout }).catch(() => undefined);
+    if (!(await main.isVisible())) return [];
+    const reactionPattern = /(?:reaction|reactions|cảm xúc|người đã bày tỏ|lượt bày tỏ|like|likes|thích)/i;
+    // Comet has shipped the reaction counter as a semantic button, a text
+    // link, and (in older layouts) a direct /ufi/reaction/profile/browser/
+    // link. Try each shape separately so a duplicated locator cannot trigger
+    // Playwright strict-mode failures.
+    let trigger = main.locator('a[href*="/ufi/reaction/profile/browser/"]').filter({ visible: true }).first();
+    if (!(await trigger.isVisible().catch(() => false))) trigger = main.getByRole('button', { name: reactionPattern }).filter({ visible: true }).first();
+    if (!(await trigger.isVisible().catch(() => false))) trigger = main.locator('[role="button"], a[role="link"], button').filter({ hasText: reactionPattern }).filter({ visible: true }).first();
+    if (!(await trigger.count().catch(() => 0)) || !(await trigger.isVisible().catch(() => false))) return [];
+    await trigger.click({ timeout }).catch(async () => { await trigger.click({ force: true, timeout: 3_000 }).catch(() => undefined); });
+    await page.waitForTimeout(700);
+    const dialog = page.getByRole('dialog').filter({ visible: true }).last();
+    const scope = (await dialog.isVisible().catch(() => false)) ? dialog : page.locator('body');
+    const currentUserId = await facebookUserId(page);
+    const candidates = await scope.locator('a[href*="/user/"], a[href*="profile.php"], a[href^="https://www.facebook.com/"]').evaluateAll((anchors) => anchors.map(anchor => ({
+      href: (anchor as HTMLAnchorElement).href,
+      name: (anchor.textContent ?? '').replace(/\s+/g, ' ').trim(),
+    }))).catch(() => [] as Array<{ href: string; name: string }>);
+    const unique = new Map<string, { profileUrl: string; displayName?: string }>();
+    for (const candidate of candidates) {
+      try {
+        const profileUrl = normalizeFacebookProfileUrl(candidate.href);
+        if (currentUserId && profileId(profileUrl) === currentUserId) continue;
+        unique.set(profileUrl, { profileUrl, ...(candidate.name ? { displayName: candidate.name.slice(0, 120) } : {}) });
+      } catch { /* Reaction dialog also contains navigation links. */ }
+    }
+    const reactors = [...unique.values()].filter(reactor => !excluded?.has(reactor.profileUrl));
+    for (let index = reactors.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [reactors[index], reactors[swap]] = [reactors[swap]!, reactors[index]!];
+    }
+    return reactors;
+  }
+
+  private async randomVisiblePostCommenters(page: Page, excluded?: Set<string>): Promise<Array<{ profileUrl: string; displayName?: string }>> {
+    let scope = await resolvePostCommentScope(page);
+    if (!scope) return [];
+    await selectAllComments(page, scope);
+    // “All comments” can open a dedicated comments dialog. Resolve again so
+    // the harvest is performed inside that dialog rather than the background
+    // post shell.
+    scope = await resolvePostCommentScope(page) ?? scope;
+    for (let index = 0; index < 8; index += 1) {
+      const morePattern = /(?:view more comments?|view previous comments?|see more comments?|xem thêm|xem các bình luận trước)/i;
+      let more = scope.getByRole('button', { name: morePattern }).filter({ visible: true }).last();
+      if (!(await more.isVisible().catch(() => false))) more = scope.getByRole('link', { name: morePattern }).filter({ visible: true }).last();
+      if (await more.isVisible().catch(() => false)) await more.click({ timeout: 3_000 }).catch(() => undefined);
+      await page.evaluate(() => {
+        for (const element of Array.from(document.querySelectorAll<HTMLElement>('*'))) {
+          if (element.scrollHeight > element.clientHeight + 8 && /(auto|scroll|overlay)/i.test(getComputedStyle(element).overflowY)) element.scrollTop = Math.min(element.scrollHeight, element.scrollTop + Math.max(500, Math.floor(element.clientHeight * 0.8)));
+        }
+      }).catch(() => undefined);
+      await page.waitForTimeout(300);
+    }
+    const currentUserId = await facebookUserId(page);
+    const comments = scope.locator('[role="article"], [data-commentid], [data-testid="comment"], [data-testid*="comment"], [data-testid*="Comment"], [data-ad-preview="message"], [data-ad-comet-preview="message"]').filter({ visible: true });
+    const candidates = await comments.evaluateAll((elements) => elements.filter(element => !(element.getAttribute('role') === 'article' && element.querySelector('[role="article"]'))).map(element => {
+      // Prefer Facebook's explicit comment-author routes. A comment surface
+      // can also contain links to the post, group, or reaction controls, so a
+      // broad first-anchor lookup may accidentally message the post author.
+      const link = element.querySelector<HTMLAnchorElement>('a[href*="/user/"], a[href*="/people/"], a[href*="/profile.php"]')
+        ?? element.querySelector<HTMLAnchorElement>('a[href^="https://www.facebook.com/"]');
+      return link ? { href: link.href, name: (link.textContent ?? '').replace(/\s+/g, ' ').trim() } : undefined;
+    }).filter((value): value is { href: string; name: string } => Boolean(value))).catch(() => [] as Array<{ href: string; name: string }>);
+    // Some older UFI layouts expose only the group-member author anchor and
+    // do not mark the surrounding comment node. Keep that explicit route as a
+    // safe fallback instead of broadening to every profile link in the post.
+    if (!candidates.length) {
+      const authorLinks = await scope.locator('a[href*="/groups/"][href*="/user/"]').filter({ visible: true }).evaluateAll((anchors) => anchors.map(anchor => ({
+        href: (anchor as HTMLAnchorElement).href,
+        name: (anchor.textContent ?? '').replace(/\s+/g, ' ').trim(),
+      }))).catch(() => [] as Array<{ href: string; name: string }>);
+      candidates.push(...authorLinks);
+    }
+    const unique = new Map<string, { profileUrl: string; displayName?: string }>();
+    for (const candidate of candidates) {
+      try {
+        const profileUrl = normalizeFacebookProfileUrl(candidate.href);
+        if (currentUserId && profileId(profileUrl) === currentUserId) continue;
+        if (!excluded?.has(profileUrl)) unique.set(profileUrl, { profileUrl, ...(candidate.name ? { displayName: candidate.name.slice(0, 120) } : {}) });
+      } catch { /* Comment surfaces also contain post/group links. */ }
+    }
+    const commenters = [...unique.values()];
+    for (let index = commenters.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [commenters[index], commenters[swap]] = [commenters[swap]!, commenters[index]!];
+    }
+    return commenters;
+  }
+}
+
+async function resolvePostCommentScope(page: Page): Promise<Locator | undefined> {
+  const dialogs = page.getByRole('dialog').filter({ visible: true });
+  for (let index = await dialogs.count() - 1; index >= 0; index -= 1) {
+    const dialog = dialogs.nth(index);
+    const label = (await dialog.getAttribute('aria-label').catch(() => null) ?? '').toLocaleLowerCase();
+    if (/messenger|message|tin nhắn|chat|conversation|cuộc trò chuyện/.test(label)) continue;
+    const comments = dialog.locator('[role="article"], [data-commentid], [data-testid="comment"], [data-ad-preview="message"], [data-ad-comet-preview="message"]').filter({ visible: true });
+    if (await comments.count().catch(() => 0)) return dialog;
+  }
+  const main = page.getByRole('main').first();
+  return await main.isVisible().catch(() => false) ? main : undefined;
+}
+
+async function selectAllComments(page: Page, scope: Locator): Promise<void> {
+  let control = scope.getByRole('button', { name: ALL_POST_COMMENTS }).filter({ visible: true }).first();
+  if (!(await control.isVisible().catch(() => false))) control = scope.getByRole('link', { name: ALL_POST_COMMENTS }).filter({ visible: true }).first();
+  if (!(await control.isVisible().catch(() => false))) control = page.getByText(ALL_POST_COMMENTS).filter({ visible: true }).first();
+  if (await control.isVisible().catch(() => false)) {
+    await control.click({ timeout: 5_000 }).catch(async () => { await control.click({ force: true, timeout: 2_000 }).catch(() => undefined); });
+    await page.waitForTimeout(500);
   }
 }
 

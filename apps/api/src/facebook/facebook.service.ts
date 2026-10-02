@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema, type FacebookGroupCollectionInput, type FacebookOptInRecipientInput, type JoinFacebookGroupsInput, type MessageFacebookRecipientsInput, type PostFacebookGroupsInput, type ReplyFacebookPostCommentsInput, type RetryFacebookCampaignInput, type ScanFacebookPostCommentsInput, type SyncFacebookGroupsInput } from '@socio/contracts';
+import { commentFacebookGroupPostsSchema, messageFacebookReactorsSchema, normalizeFacebookGroupUrl, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema, type CommentFacebookGroupPostsInput, type FacebookGroupCollectionInput, type FacebookOptInRecipientInput, type JoinFacebookGroupsInput, type MessageFacebookRecipientsInput, type MessageFacebookReactorsInput, type PostFacebookGroupsInput, type ReplyFacebookPostCommentsInput, type RetryFacebookCampaignInput, type ScanFacebookPostCommentsInput, type SyncFacebookGroupsInput } from '@socio/contracts';
 import { Prisma, type TaskStatus } from '@socio/database';
 import { PrismaService } from '../database/prisma.service';
 import { TasksService } from '../tasks/tasks.service';
@@ -252,9 +252,24 @@ export class FacebookService {
       select: { accountId: true, groupUrl: true }, orderBy: [{ groupUrl: 'asc' }, { accountId: 'asc' }],
     });
     const groupUrls = selectedGroupUrls.length ? selectedGroupUrls : [...new Set(memberships.map(membership => membership.groupUrl))];
+    // Import successful recipients from older message campaigns into the
+    // durable ledger before allocating this campaign. This keeps the new
+    // no-duplicate rule effective even for messages sent before the ledger
+    // table was introduced.
+    await this.backfillMessageLedger(organizationId, groupUrls);
     const targets = distributeMessageTargets(groupUrls, memberships, input.maxRecipientsPerGroup);
     if (!targets.length) throw new BadRequestException('Các profile được chọn chưa tham gia nhóm nào đã chọn. Hãy đồng bộ nhóm trước.');
     return this.createMessageCampaign(organizationId, { ...input, groupUrls }, targets);
+  }
+
+  async messageReactors(organizationId: string, input: MessageFacebookReactorsInput) {
+    input = messageFacebookReactorsSchema.parse(input);
+    const existing = await this.existing(organizationId, input.idempotencyKey);
+    if (existing) return existing;
+    await validateFacebookImages(this.prisma, organizationId, input.mediaAssetIds);
+    const accounts = await this.selectedAccounts(organizationId, input.accountIds);
+    if (!accounts.length) throw new BadRequestException('Không có account Facebook READY được chọn.');
+    return this.createMessageReactorsCampaign(organizationId, input, accounts.map(account => account.id));
   }
 
   async scanComments(organizationId: string, input: ScanFacebookPostCommentsInput) {
@@ -269,8 +284,26 @@ export class FacebookService {
     input = replyFacebookPostCommentsSchema.parse(input);
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
+    await validateFacebookImages(this.prisma, organizationId, input.mediaAssetIds);
     const accounts = await this.selectedAccounts(organizationId, input.accountIds);
     return this.createReplyCommentsCampaign(organizationId, input, accounts.map(account => account.id));
+  }
+
+  async commentGroupPosts(organizationId: string, input: CommentFacebookGroupPostsInput) {
+    input = commentFacebookGroupPostsSchema.parse(input);
+    const existing = await this.existing(organizationId, input.idempotencyKey);
+    if (existing) return existing;
+    await validateFacebookImages(this.prisma, organizationId, input.mediaAssetIds);
+    const accounts = await this.selectedAccounts(organizationId, input.accountIds);
+    const memberships = await this.prisma.facebookGroupMembership.findMany({
+      where: { organizationId, accountId: { in: accounts.map(account => account.id) }, status: 'JOINED', groupUrl: { in: input.groupUrls } },
+      select: { accountId: true, groupUrl: true }, orderBy: [{ groupUrl: 'asc' }, { accountId: 'asc' }],
+    });
+    const available = new Set(memberships.map(membership => membership.groupUrl));
+    if (input.groupUrls.some(groupUrl => !available.has(groupUrl))) throw new BadRequestException('Một số nhóm được chọn chưa được profile tham gia hoặc chưa đồng bộ.');
+    const targets = memberships.map(membership => ({ accountId: membership.accountId, groupUrl: membership.groupUrl }));
+    if (!targets.length) throw new BadRequestException('Các profile được chọn chưa tham gia nhóm nào đã chọn. Hãy đồng bộ nhóm trước.');
+    return this.createCommentGroupPostsCampaign(organizationId, input, targets);
   }
 
   async approve(organizationId: string, id: string, userId?: string) {
@@ -561,20 +594,81 @@ export class FacebookService {
     }
   }
 
+  private async createMessageReactorsCampaign(organizationId: string, input: MessageFacebookReactorsInput, accountIds: string[]) {
+    const postUrls = [...new Set([...(input.postUrls ?? []), ...(input.postUrl ? [input.postUrl] : [])])];
+    if (!postUrls.length) throw new BadRequestException('Nhập ít nhất một URL bài viết Facebook');
+    const allocations = distributeReplyCounts(accountIds, input.maxRecipientsPerPost);
+    const taskAccounts = accountIds.flatMap(accountId => Array.from({ length: allocations.get(accountId) ?? 0 }, () => accountId));
+    if (postUrls.length * taskAccounts.length > 500) throw new BadRequestException('Một chiến dịch tối đa 500 lượt nhắn. Hãy giảm số bài viết hoặc số người mỗi bài.');
+    try {
+      return await this.prisma.facebookCampaign.create({
+        data: {
+          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'MESSAGE_REACTORS',
+          payload: { postUrl: postUrls[0], postUrls, recipientSource: input.recipientSource, text: input.text, mediaAssetIds: input.mediaAssetIds, maxRecipientsPerPost: input.maxRecipientsPerPost, intervalSeconds: input.intervalSeconds },
+          tasks: { create: postUrls.flatMap(postUrl => taskAccounts.map(accountId => {
+            const id = randomUUID();
+            return {
+              id, organizationId, accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
+              platform: 'FACEBOOK', action: 'MESSAGE_FACEBOOK_REACTOR', payload: { postUrl, recipientSource: input.recipientSource, text: input.text, mediaAssetIds: input.mediaAssetIds },
+              maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
+            };
+          })) },
+        }, include: campaignInclude,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const existing = await this.existing(organizationId, input.idempotencyKey);
+        if (existing) return existing;
+      }
+      throw error;
+    }
+  }
+
+  private async backfillMessageLedger(organizationId: string, groupUrls: string[]): Promise<void> {
+    const allowedGroups = new Set(groupUrls);
+    const runs = await this.prisma.taskRun.findMany({
+      where: { status: 'SUCCEEDED', task: { organizationId, action: { in: ['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'] } } },
+      select: { taskId: true, result: true, task: { select: { accountId: true, payload: true } } },
+    });
+    for (const run of runs) {
+      const result = run.result as Record<string, unknown> | null;
+      const payload = run.task.payload as Record<string, unknown>;
+      if (result?.messageStatus !== 'SENT' || typeof result.profileUrl !== 'string') continue;
+      const rawGroupUrl = typeof result.groupUrl === 'string' ? result.groupUrl : typeof result.postUrl === 'string' ? result.postUrl : typeof payload.groupUrl === 'string' ? payload.groupUrl : payload.postUrl;
+      if (typeof rawGroupUrl !== 'string') continue;
+      const groupUrl = normalizeMessageScopeUrl(rawGroupUrl);
+      if (!allowedGroups.has(groupUrl)) continue;
+      const profileUrl = normalizeFacebookProfileUrl(result.profileUrl);
+      await this.prisma.facebookMessageRecipient.upsert({
+        where: { organizationId_groupUrl_profileUrl: { organizationId, groupUrl, profileUrl } },
+        create: { organizationId, accountId: run.task.accountId, taskId: run.taskId, groupUrl, profileUrl, displayName: typeof result.displayName === 'string' ? result.displayName : null, status: 'SENT', sentAt: new Date() },
+        update: { status: 'SENT', accountId: run.task.accountId, taskId: run.taskId, displayName: typeof result.displayName === 'string' ? result.displayName : undefined, sentAt: new Date() },
+      });
+    }
+  }
+
   private async createScanCommentsCampaign(organizationId: string, input: ScanFacebookPostCommentsInput, accountIds: string[]) {
+    const postUrls = [...new Set([...(input.postUrls ?? []), ...(input.postUrl ? [input.postUrl] : [])])];
+    if (!postUrls.length) throw new BadRequestException('Nhập ít nhất một URL bài viết Facebook');
+    // Keep the campaign bounded even when all READY profiles are selected.
+    if (postUrls.length * accountIds.length > 500) {
+      throw new BadRequestException('Một chiến dịch tối đa 500 cặp account/bài viết. Hãy giảm số bài viết hoặc số profile.');
+    }
     try {
       return await this.prisma.facebookCampaign.create({
         data: {
           organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'SCAN_COMMENTS',
-          payload: { postUrl: input.postUrl, intervalSeconds: input.intervalSeconds },
-          tasks: { create: accountIds.map(accountId => {
+          // Store both forms so old clients can still display the first URL,
+          // while the full list remains available after the campaign finishes.
+          payload: { postUrl: postUrls[0], postUrls, intervalSeconds: input.intervalSeconds },
+          tasks: { create: accountIds.flatMap(accountId => postUrls.map(postUrl => {
             const id = randomUUID();
             return {
               id, organizationId, accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
-              platform: 'FACEBOOK', action: 'SCAN_FACEBOOK_POST_COMMENTS', payload: { postUrl: input.postUrl },
+              platform: 'FACEBOOK', action: 'SCAN_FACEBOOK_POST_COMMENTS', payload: { postUrl },
               maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
             };
-          }) },
+          })) },
         }, include: campaignInclude,
       });
     } catch (error) {
@@ -593,12 +687,48 @@ export class FacebookService {
       return await this.prisma.facebookCampaign.create({
         data: {
           organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'REPLY_COMMENTS',
-          payload: { postUrl: input.postUrl, text: input.text, maxReplies: input.maxReplies, intervalSeconds: input.intervalSeconds },
+          payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies, intervalSeconds: input.intervalSeconds },
           tasks: { create: taskAccounts.map(accountId => {
             const id = randomUUID();
             return {
               id, organizationId, accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
-              platform: 'FACEBOOK', action: 'REPLY_FACEBOOK_POST_COMMENTS', payload: { postUrl: input.postUrl, text: input.text, maxReplies: allocations.get(accountId) },
+              platform: 'FACEBOOK', action: 'REPLY_FACEBOOK_POST_COMMENTS', payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: allocations.get(accountId) },
+              maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
+            };
+          }) },
+        }, include: campaignInclude,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const existing = await this.existing(organizationId, input.idempotencyKey);
+        if (existing) return existing;
+      }
+      throw error;
+    }
+  }
+
+  private async createCommentGroupPostsCampaign(organizationId: string, input: CommentFacebookGroupPostsInput, targets: Array<{ accountId: string; groupUrl: string }>) {
+    if (targets.length > 500) throw new BadRequestException('Một chiến dịch tối đa 500 cặp profile/nhóm.');
+    try {
+      return await this.prisma.facebookCampaign.create({
+        data: {
+          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'COMMENT_GROUP_POSTS',
+          payload: {
+            groupUrls: input.groupUrls, text: input.text, mediaAssetIds: input.mediaAssetIds,
+            daysRecent: input.daysRecent, minReactions: input.minReactions, maxReactions: input.maxReactions,
+            minComments: input.minComments, maxComments: input.maxComments, maxPosts: input.maxPosts,
+            intervalSeconds: input.intervalSeconds,
+          },
+          tasks: { create: targets.map(target => {
+            const id = randomUUID();
+            return {
+              id, organizationId, accountId: target.accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
+              platform: 'FACEBOOK', action: 'COMMENT_FACEBOOK_GROUP_POSTS',
+              payload: {
+                groupUrl: target.groupUrl, text: input.text, mediaAssetIds: input.mediaAssetIds,
+                daysRecent: input.daysRecent, minReactions: input.minReactions, maxReactions: input.maxReactions,
+                minComments: input.minComments, maxComments: input.maxComments, maxPosts: input.maxPosts,
+              },
               maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
             };
           }) },
@@ -637,4 +767,9 @@ export function distributeReplyCounts(accountIds: string[], maxReplies: number):
     counts.set(accountId, (counts.get(accountId) ?? 0) + 1);
   }
   return counts;
+}
+
+function normalizeMessageScopeUrl(value: string): string {
+  try { return normalizeFacebookGroupUrl(value); }
+  catch { return normalizeFacebookPostUrl(value); }
 }

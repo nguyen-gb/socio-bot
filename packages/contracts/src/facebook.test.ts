@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { facebookGroupCollectionSchema, facebookOptInRecipientSchema, messageFacebookRecipientsSchema, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, postFacebookGroupsSchema, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema } from './facebook';
+import { commentFacebookGroupPostsSchema, facebookGroupCollectionSchema, facebookOptInRecipientSchema, messageFacebookRecipientsSchema, messageFacebookReactorsSchema, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, postFacebookGroupsSchema, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema } from './facebook';
 import { postFacebookGroupActionSchema } from './actions';
 
 const base = { name: 'Post fixture', idempotencyKey: 'fixture-key', text: 'Fixture never published', maxGroupsPerAccount: 5 };
@@ -66,6 +66,7 @@ test('opt-in recipients require consent evidence and canonical Facebook profile 
   assert.equal(normalizeFacebookProfileUrl('https://facebook.com/profile.php?id=123&ref=x'), 'https://www.facebook.com/profile.php?id=123');
   assert.equal(normalizeFacebookProfileUrl('https://www.facebook.com/people/Nguyen-Van-A/100012345678901/'), 'https://www.facebook.com/profile.php?id=100012345678901');
   assert.equal(normalizeFacebookProfileUrl('https://www.facebook.com/groups/1710577763336777/user/100028475506542/'), 'https://www.facebook.com/100028475506542');
+  assert.equal(normalizeFacebookProfileUrl('https://www.facebook.com/100028475506542/'), 'https://www.facebook.com/100028475506542');
   const input = { groupUrl: 'https://facebook.com/groups/123/', profileUrl: 'https://facebook.com/consented.user/', displayName: 'Người đã đồng ý', consentSource: 'Form đăng ký', consentRecordedAt: '2026-09-26T00:00:00.000Z' };
   assert.equal(facebookOptInRecipientSchema.safeParse(input).success, true);
   assert.equal(facebookOptInRecipientSchema.safeParse({ ...input, consentSource: '' }).success, false);
@@ -82,12 +83,28 @@ test('message campaign bounds random-member attempts per group and pacing', () =
   assert.equal(messageFacebookRecipientsSchema.safeParse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 10, intervalSeconds: 30 }).success, false);
 });
 
+test('reactor message campaigns accept one post and split the total by profile', () => {
+  const parsed = messageFacebookReactorsSchema.parse({ ...base, text: 'Tin nhắn người react', postUrl: 'https://facebook.com/groups/123/posts/456', maxRecipientsPerPost: 10 });
+  assert.equal(parsed.postUrl, 'https://www.facebook.com/groups/123/posts/456');
+  assert.equal(parsed.intervalSeconds, 120);
+  assert.equal(parsed.recipientSource, 'REACTORS');
+  assert.equal(messageFacebookReactorsSchema.parse({ ...base, text: 'Tin nhắn người bình luận', postUrl: 'https://facebook.com/groups/123/posts/456', recipientSource: 'COMMENTERS', maxRecipientsPerPost: 10 }).recipientSource, 'COMMENTERS');
+  assert.deepEqual(messageFacebookReactorsSchema.parse({ ...base, text: 'Tin nhắn nhiều bài', postUrls: ['https://facebook.com/groups/123/posts/456', 'https://facebook.com/groups/123/posts/789'], maxRecipientsPerPost: 10 }).postUrls, ['https://www.facebook.com/groups/123/posts/456', 'https://www.facebook.com/groups/123/posts/789']);
+  assert.equal(messageFacebookReactorsSchema.safeParse({ ...base, text: 'Thiếu URL', maxRecipientsPerPost: 10 }).success, false);
+  assert.equal(messageFacebookReactorsSchema.safeParse({ ...base, text: 'Tin nhắn', postUrl: 'https://facebook.com/groups/123/', maxRecipientsPerPost: 10 }).success, false);
+});
+
 test('comment scanning accepts canonical Facebook post URLs and rejects group or external URLs', () => {
   assert.equal(normalizeFacebookPostUrl('https://m.facebook.com/groups/123/permalink/456/?ref=share'), 'https://www.facebook.com/groups/123/permalink/456?ref=share');
   assert.equal(normalizeFacebookPostUrl('https://www.facebook.com/story.php?story_fbid=456&id=123'), 'https://www.facebook.com/story.php?story_fbid=456&id=123');
   const parsed = scanFacebookPostCommentsSchema.parse({ name: 'Quét bình luận', idempotencyKey: 'scan-comments-0001', postUrl: 'https://facebook.com/groups/123/posts/456' });
   assert.equal(parsed.postUrl, 'https://www.facebook.com/groups/123/posts/456');
   assert.equal(parsed.intervalSeconds, 60);
+  const many = scanFacebookPostCommentsSchema.parse({ name: 'Quét nhiều bài', idempotencyKey: 'scan-comments-many', postUrls: [
+    'https://facebook.com/groups/123/posts/456', 'https://m.facebook.com/groups/123/permalink/789/?ref=share', 'https://facebook.com/groups/123/posts/456',
+  ] });
+  assert.deepEqual(many.postUrls, ['https://www.facebook.com/groups/123/posts/456', 'https://www.facebook.com/groups/123/permalink/789?ref=share']);
+  assert.equal(scanFacebookPostCommentsSchema.safeParse({ name: 'Quét bình luận', idempotencyKey: 'scan-comments-empty' }).success, false);
   for (const postUrl of ['https://www.facebook.com/groups/123/', 'https://evil.test/posts/456', 'http://facebook.com/groups/123/posts/456', 'https://facebook.com/story.php?story_fbid=abc']) {
     assert.equal(scanFacebookPostCommentsSchema.safeParse({ name: 'Quét bình luận', idempotencyKey: 'scan-comments-0002', postUrl }).success, false);
   }
@@ -101,4 +118,18 @@ test('comment replies require text, a bounded reply count and a Facebook post UR
   assert.equal(replyFacebookPostCommentsSchema.safeParse({ name: 'Rep bình luận', idempotencyKey: 'reply-comments-0003', postUrl: 'https://facebook.com/groups/123/posts/456', text: 'Rep', maxReplies: 0 }).success, false);
   assert.equal(replyFacebookPostCommentsSchema.safeParse({ name: 'Rep bình luận', idempotencyKey: 'reply-comments-0004', postUrl: 'https://facebook.com/groups/123/posts/456', text: 'Rep', maxReplies: 51 }).success, false);
   assert.equal(replyFacebookPostCommentsSchema.safeParse({ name: 'Rep bình luận', idempotencyKey: 'reply-comments-0005', postUrl: 'https://facebook.com/groups/123/', text: 'Rep', maxReplies: 1 }).success, false);
+});
+
+test('group comment campaigns validate filters and normalize selected groups', () => {
+  const parsed = commentFacebookGroupPostsSchema.parse({
+    name: 'Cmt bài nhóm', idempotencyKey: 'comment-group-posts-0001', accountIds: [],
+    groupUrls: ['https://facebook.com/groups/123/', 'https://www.facebook.com/groups/123/'],
+    text: 'Bình luận', daysRecent: 7, minReactions: 2, maxReactions: 20,
+    minComments: 1, maxComments: 10, maxPosts: 5,
+  });
+  assert.deepEqual(parsed.groupUrls, ['https://www.facebook.com/groups/123/']);
+  assert.equal(parsed.maxPosts, 5);
+  assert.equal(commentFacebookGroupPostsSchema.safeParse({ ...parsed, maxReactions: 1, minReactions: 2 }).success, false);
+  assert.equal(commentFacebookGroupPostsSchema.safeParse({ ...parsed, maxComments: 0, minComments: 1 }).success, false);
+  assert.equal(commentFacebookGroupPostsSchema.safeParse({ ...parsed, text: '', mediaAssetIds: [] }).success, false);
 });

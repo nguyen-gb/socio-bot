@@ -85,7 +85,11 @@ export function loadEnvironment(): ApiEnvironment {
     temporalAddress: process.env.TEMPORAL_ADDRESS ?? 'localhost:7233',
     temporalNamespace: process.env.TEMPORAL_NAMESPACE ?? 'default',
     temporalTaskQueue:
-      process.env.TEMPORAL_TASK_QUEUE ?? 'socio-browser-tasks',
+      // Keep the local fallback aligned with docker/.env.example. This is
+      // important when `pnpm --filter ... start` runs from a package folder
+      // and dotenv does not discover the workspace-root .env file: API and
+      // browser workers must still submit and poll the same queue.
+      process.env.TEMPORAL_TASK_QUEUE ?? 'browser-automation',
     allowPrivateProxyHosts: booleanValue(
       process.env.ALLOW_PRIVATE_PROXY_HOSTS,
       false,

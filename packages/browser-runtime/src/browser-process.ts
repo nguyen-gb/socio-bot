@@ -8,11 +8,25 @@ const execute = promisify(execFile);
 export interface BrowserProcessRecord { token: string; pid?: number; started?: string; profileId: string; ownerId?: string }
 interface ProcessIdentity { pid: number; parent: number; started: string; command: string }
 
+/**
+ * Some managed Windows environments deny child-process inspection entirely
+ * (Node receives EPERM when it tries to start PowerShell).  Browser sessions
+ * can still be owned and closed through Playwright in that case; keep the
+ * distinction explicit so we do not mistake an inspection failure for a
+ * browser collision.
+ */
+class ProcessInspectionUnavailable extends Error {}
+
 async function processes(): Promise<ProcessIdentity[]> {
   if (process.platform === 'win32') {
-    const { stdout } = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      "@(Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='headless_shell.exe' OR Name='chrome-headless-shell.exe' OR Name='chromium.exe'\" -ErrorAction Stop | ForEach-Object { @{pid=[int]$_.ProcessId;parent=[int]$_.ParentProcessId;started=$_.CreationDate.ToUniversalTime().ToString('O');command=$_.CommandLine} }) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
-    return JSON.parse(stdout || '[]') as ProcessIdentity[];
+    try {
+      const { stdout } = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        "@(Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='headless_shell.exe' OR Name='chrome-headless-shell.exe' OR Name='chromium.exe'\" -ErrorAction Stop | ForEach-Object { @{pid=[int]$_.ProcessId;parent=[int]$_.ParentProcessId;started=$_.CreationDate.ToUniversalTime().ToString('O');command=$_.CommandLine} }) | ConvertTo-Json -Compress"], { windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
+      return JSON.parse(stdout || '[]') as ProcessIdentity[];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') throw new ProcessInspectionUnavailable('Windows process inspection is unavailable');
+      throw error;
+    }
   }
   if (process.platform !== 'linux') throw new Error('Browser process recovery supports Windows and Linux');
   const rows = await Promise.all((await readdir('/proc')).filter(id => /^\d+$/.test(id)).map(async id => {
@@ -41,13 +55,34 @@ export class BrowserProcessRegistry {
     return record;
   }
   async identify(record: BrowserProcessRecord): Promise<void> {
-    const match = (await processes()).find(p => p.command?.includes(`--socio-session-token=${record.token}`) && !p.command.includes('--type='));
+    let rows: ProcessIdentity[];
+    try { rows = await processes(); }
+    catch (error) {
+      if (error instanceof ProcessInspectionUnavailable) {
+        await this.save(record);
+        return;
+      }
+      throw error;
+    }
+    const match = rows.find(p => p.command?.includes(`--socio-session-token=${record.token}`) && !p.command.includes('--type='));
     if (!match) throw new Error('Cannot identify the managed Chromium process');
     record.pid = match.pid; record.started = match.started;
     await this.save(record);
   }
   async terminate(record: BrowserProcessRecord): Promise<void> {
-    const all = await processes();
+    let all: ProcessIdentity[];
+    try { all = await processes(); }
+    catch (error) {
+      if (error instanceof ProcessInspectionUnavailable) {
+        // A record without a verified PID was created before browser launch
+        // (or after a failed launch).  It is safe to clear that stale marker;
+        // a live process with a PID still fails closed for manual recovery.
+        if (record.pid) throw error;
+        await this.forget(record);
+        return;
+      }
+      throw error;
+    }
     const root = all.find(p => p.command?.includes(`--socio-session-token=${record.token}`) && !p.command.includes('--type='));
     if (root) {
       if (record.pid && (root.pid !== record.pid || root.started !== record.started)) throw new Error('Browser process identity changed; refusing termination');
