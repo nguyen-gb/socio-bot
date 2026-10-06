@@ -73,10 +73,11 @@ export class LoginSessionActivities {
             requestedSession.profile.account.proxyBinding?.proxy,
             this.secrets,
           ),
-          // A user-opened profile must always have a visible browser so the
-          // remote session can be used for login and manual verification.
-          // Campaign/automation mode is derived from NODE_ENV separately.
-          headless: false,
+          // The web view is rendered from the remote CDP screencast, so a
+          // server does not need a real desktop/X server for manual login.
+          // Keep development headed for local debugging, while production
+          // uses the same headless policy as campaign execution.
+          headless: this.config.get('browserHeadless', { infer: true }),
           channel: this.config.get('browserChannel', { infer: true }),
           locale: this.config.get('browserLocale', { infer: true }),
           timezoneId: this.config.get('browserTimezoneId', { infer: true }),

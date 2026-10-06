@@ -138,7 +138,7 @@ test('interactive login revalidates READY and preserves it when platform tabs ar
       );
       const result = await service.runInteractiveLoginSession({ sessionId: 'session' });
       assert.equal(result.status, 'CLOSED');
-      assert.equal(openedOptions?.headless, false, 'Interactive profile sessions must always be visible');
+      assert.equal(openedOptions?.headless, true, 'Production interactive sessions use headless Chromium and stream frames to the web view');
       assert.deepEqual(statuses, loggedIn ? [] : ['LOGIN_REQUIRED']);
       assert.equal(captured, true);
       assert.equal(fixture.events.includes('close'), true);
