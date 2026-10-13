@@ -9,7 +9,14 @@ const secret = 'remote-browser-fixture-secret-32-characters';
 const sessionId = '00000000-0000-4000-8000-000000000199';
 const config = (port: number) => ({ get: (key: string) => ({ remoteSessionPort: port, remoteSessionSecret: secret, redisUrl: 'redis://127.0.0.1:6379', remoteSessionRedisRelay: true })[key] });
 async function main() {
-  const browser = await chromium.launch({ headless: true, ignoreDefaultArgs: ['--hide-scrollbars'] });
+  const browser = await chromium.launch({
+    headless: true,
+    // Keep the Chromium sandbox enabled in fixtures too; this prevents the
+    // smoke browser from teaching us to rely on the unsupported --no-sandbox
+    // mode used by older local launchers.
+    chromiumSandbox: true,
+    ignoreDefaultArgs: ['--hide-scrollbars'],
+  });
   const owner = new RemoteSessionGateway(config(39136) as never), relay = new RemoteSessionGateway(config(39137) as never);
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });

@@ -289,6 +289,8 @@ model Task {
   approvedByUserId String?       @db.Uuid
   approvedAt     DateTime?
   rejectedAt     DateTime?
+  pausedAt       DateTime?
+  cancelledAt    DateTime?
   lastError      String?
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt

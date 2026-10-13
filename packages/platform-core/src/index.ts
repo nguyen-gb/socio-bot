@@ -9,6 +9,38 @@ export interface BrowserPage {
   };
 }
 
+/**
+ * Navigate to a platform entry page and recover from Chromium's special
+ * error for an HTTP error response without a renderable body. Some platforms
+ * return that response for their generic landing route while their login
+ * route is still usable.
+ */
+export async function gotoPlatformPage(
+  page: BrowserPage,
+  url: string,
+  fallbackUrl?: string,
+): Promise<unknown> {
+  try {
+    return await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 45_000,
+    });
+  } catch (error) {
+    if (!fallbackUrl || fallbackUrl === url || !isHttpResponseCodeFailure(error)) {
+      throw error;
+    }
+    return page.goto(fallbackUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 45_000,
+    });
+  }
+}
+
+function isHttpResponseCodeFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(message);
+}
+
 export interface PlatformMediaFile {
   name: string;
   mimeType: string;

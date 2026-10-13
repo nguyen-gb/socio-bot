@@ -1,0 +1,3 @@
+ALTER TABLE "Task"
+  ADD COLUMN "pausedAt" TIMESTAMP(3),
+  ADD COLUMN "cancelledAt" TIMESTAMP(3);

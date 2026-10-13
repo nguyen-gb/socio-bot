@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import type { PlatformSession } from '@socio/platform-core';
@@ -34,6 +34,10 @@ export interface OpenProfileOptions {
   executionTimeoutMs?: number;
   /** Keep the session alive until the caller has persisted the task result. */
   closeOnComplete?: boolean;
+  /** Use a clean, non-persistent user-data directory and remove it on close. */
+  ephemeral?: boolean;
+  /** Send the standard Do Not Track preference without changing browser identity. */
+  privacyMode?: boolean;
 }
 
 export interface ManagedBrowserSession extends PlatformSession {
@@ -47,6 +51,8 @@ export interface ManagedBrowserSession extends PlatformSession {
 
 interface ActiveSession {
   context: BrowserContext;
+  profilePath: string;
+  ephemeral: boolean;
   lease: SlotLease;
   promise: Promise<ManagedBrowserSession>;
   closing?: Promise<void>;
@@ -101,14 +107,25 @@ export class BrowserRuntime {
       record = await this.processes.begin(options.profileId, options.ownerId);
       await mkdir(profilePath, { recursive: true });
       const viewport = options.viewport ?? null;
+      const headless = options.headless ?? true;
       context = await chromium.launchPersistentContext(profilePath, {
-        args: [`--socio-session-token=${record.token}`],
+        args: [
+          `--socio-session-token=${record.token}`,
+          // With viewport:null, this gives headed local runs the same initial
+          // window behavior as a manually opened Chrome window. It is not
+          // used in headless/container runs.
+          ...(!headless ? ['--start-maximized'] : []),
+        ],
         // Headless Chromium hides native scrollbars by default. Remote users
         // need visible, draggable thumbs just like in a normal browser.
         ignoreDefaultArgs: ['--hide-scrollbars'],
         timeout: 45_000,
-        headless: options.headless ?? true,
+        headless,
         channel: options.channel,
+        // Playwright otherwise adds --no-sandbox by default. Keep the real
+        // Chromium sandbox enabled so headed Chrome does not show the
+        // unsupported command-line flag warning and retains normal isolation.
+        chromiumSandbox: true,
         // Keep the page surface close to a regular Chrome window. Do not
         // override user-agent or webdriver signals to evade CAPTCHA.
         viewport,
@@ -119,6 +136,10 @@ export class BrowserRuntime {
         reducedMotion: 'no-preference',
         locale: options.locale,
         timezoneId: options.timezoneId,
+        // Do not inject a DNT header. Chrome does not send it by default, and
+        // forcing a privacy header makes the anonymous search profile less
+        // like an ordinary user-created Chrome profile without reliably
+        // preventing tracking.
         proxy: options.proxy,
         recordHar: options.recordHarPath
           ? { path: options.recordHarPath, content: 'omit', mode: 'minimal' }
@@ -127,17 +148,31 @@ export class BrowserRuntime {
       await this.processes.identify(record);
       context.setDefaultTimeout(15_000);
       context.setDefaultNavigationTimeout(45_000);
-      await withDeadline(this.cookies.restore(profilePath, options.profileId, context), 10_000, 'Cookie restore timed out');
+      if (!options.ephemeral) {
+        await withDeadline(this.cookies.restore(profilePath, options.profileId, context), 10_000, 'Cookie restore timed out');
+      }
     } catch (error) {
       try {
         if (record) await this.processes.terminate(record);
-      } finally { lease.release(); }
+      } finally {
+        lease.release();
+        if (options.ephemeral) await this.removeEphemeralProfile(profilePath);
+      }
       throw error;
     }
 
     const abort = new AbortController();
     const promise = this.createManagedSession(options.profileId, context, lease, record, abort);
-    const active = { context, lease, promise, record, abort, persistenceAbort: new AbortController() };
+    const active = {
+      context,
+      profilePath,
+      ephemeral: options.ephemeral === true,
+      lease,
+      promise,
+      record,
+      abort,
+      persistenceAbort: new AbortController(),
+    };
     this.sessions.set(options.profileId, active);
     context.once('close', () => {
       abort.abort(new Error('Browser was closed'));
@@ -183,8 +218,11 @@ export class BrowserRuntime {
       active.closing = (async () => {
         try {
           await withDeadline((async () => {
-            await this.cookies.save(resolve(this.profileRoot, profileId), profileId, active.context, active.persistenceAbort.signal);
+            if (!active.ephemeral) {
+              await this.cookies.save(active.profilePath, profileId, active.context, active.persistenceAbort.signal);
+            }
             await active.context.close();
+            if (active.ephemeral) await this.removeEphemeralProfile(active.profilePath);
           })(), this.closeTimeoutMs, 'Browser close timed out');
           await this.processes.forget(active.record);
           this.release(profileId, active);
@@ -209,6 +247,7 @@ export class BrowserRuntime {
       active.abort.abort(new Error('Browser was force closed'));
       active.persistenceAbort.abort(new Error('Browser cookie save cancelled'));
       await this.processes.terminate(active.record);
+      if (active.ephemeral) await this.removeEphemeralProfile(active.profilePath);
       this.release(profileId, active);
     })();
     try { await active.forcing; }
@@ -247,5 +286,9 @@ export class BrowserRuntime {
     if (!active || active !== expected) return;
     this.sessions.delete(profileId);
     active.lease.release();
+  }
+
+  private async removeEphemeralProfile(profilePath: string): Promise<void> {
+    await rm(profilePath, { recursive: true, force: true });
   }
 }

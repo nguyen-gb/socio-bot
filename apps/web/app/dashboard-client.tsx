@@ -32,12 +32,13 @@ import {
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
 import FacebookWorkspace from './facebook-workspace';
+import TikTokWorkspace from './tiktok-workspace';
 import { Icon, STATUS_LABELS, ACTION_LABELS } from './ui';
 import { useToast, useToastError, useToastNotice } from './toast';
 import { ContextNote as Alert } from './context-note';
 
 type Role = 'OWNER' | 'ADMIN' | 'OPERATOR' | 'VIEWER';
-type DashboardView = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'schedules' | 'media' | 'tasks';
+type DashboardView = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'tiktok' | 'schedules' | 'media' | 'tasks';
 
 const NAV_ITEMS: Array<{
   key: DashboardView;
@@ -48,6 +49,7 @@ const NAV_ITEMS: Array<{
   { key: 'accounts', label: 'Profiles', description: 'Tài khoản & trình duyệt' },
   { key: 'proxies', label: 'Proxy', description: 'Kết nối & phân bổ' },
   { key: 'facebook', label: 'Facebook', description: 'Nhóm & chiến dịch' },
+  { key: 'tiktok', label: 'TikTok', description: 'Search & hành động có duyệt' },
   { key: 'schedules', label: 'Lịch chạy', description: 'Tự động hóa định kỳ' },
   { key: 'media', label: 'Nội dung', description: 'Thư viện ảnh & video' },
   { key: 'tasks', label: 'Tác vụ', description: 'Theo dõi thực thi' },
@@ -655,7 +657,9 @@ export default function DashboardClient() {
 
 
         {activeView === 'facebook' ? <div id="facebook" className="dashboard-row"><FacebookWorkspace accounts={accountRows} canOperate={canOperate} canAdmin={canAdmin} onNavigateProfiles={() => navigate('accounts')} /></div> : null}
+        {activeView === 'tiktok' ? <div id="tiktok" className="dashboard-row"><TikTokWorkspace accounts={accountRows} canOperate={canOperate} canAdmin={canAdmin} onNavigateProfiles={() => navigate('accounts')} /></div> : null}
         {activeView === 'overview' ? <div className="overview-welcome"><div><span className="welcome-kicker">VẬN HÀNH ĐƠN GIẢN HƠN</span><h3>Mọi tài khoản. Một không gian.</h3><p>Quản lý profile, kết nối và chiến dịch từ một nơi — rõ ràng ở từng bước.</p><Button onClick={() => navigate('facebook')} icon={<Icon name="arrow" />}>Đến chiến dịch Facebook</Button></div><div className="welcome-summary"><span className="welcome-orbit"><Icon name="accounts" size={34} /></span><strong>{accountRows.filter(x => x.status === 'READY').length}<small>profile sẵn sàng</small></strong></div></div> : null}
+        {activeView === 'overview' ? <>
         <Row gutter={[14, 14]} className="stats-grid">
           <Col xs={12} xl={6}><Card className="metric-card"><span className="metric-icon"><Icon name="accounts" /></span><Statistic title="Tổng profiles" value={accountRows.length} /><small>{accountRows.filter((x) => x.status === 'READY').length} sẵn sàng</small></Card></Col>
           <Col xs={12} xl={6}><Card className="metric-card"><span className="metric-icon"><Icon name="open" /></span><Statistic title="Browser đang mở" value={activeSessions.length} /><small>Cập nhật mỗi 3 giây</small></Card></Col>
@@ -710,8 +714,9 @@ export default function DashboardClient() {
             </Card>
           </Col>
         </Row>
+        </> : null}
 
-        <Card
+        {activeView === 'accounts' ? <Card
           id="accounts"
           className="dashboard-row resource-card"
           title={<SectionTitle title="Danh sách profiles" description={`${accountRows.length} profile · mỗi profile có dữ liệu trình duyệt riêng`} />}
@@ -787,9 +792,9 @@ export default function DashboardClient() {
               },
             ]}
           />
-        </Card>
+        </Card> : null}
 
-        <Card
+        {activeView === 'proxies' ? <Card
           id="proxies"
           className="dashboard-row resource-card"
           title={<SectionTitle title="Hạ tầng proxy" description={`${(proxies.data ?? []).length} proxy · có thể phân bổ cho nhiều profile`} />}
@@ -844,9 +849,9 @@ export default function DashboardClient() {
               },
             ]}
           />
-        </Card>
+        </Card> : null}
 
-        <Card id="schedules" className="dashboard-row resource-card" title={<SectionTitle title="Lịch chạy" description="Kiểm tra phiên và profile theo lịch định kỳ." />} extra={<Button type="primary" icon={<Icon name="plus" />} disabled={!canOperate} onClick={() => { setError(undefined); setScheduleModalOpen(true); }}>Tạo lịch</Button>}>
+        {activeView === 'schedules' ? <Card id="schedules" className="dashboard-row resource-card" title={<SectionTitle title="Lịch chạy" description="Kiểm tra phiên và profile theo lịch định kỳ." />} extra={<Button type="primary" icon={<Icon name="plus" />} disabled={!canOperate} onClick={() => { setError(undefined); setScheduleModalOpen(true); }}>Tạo lịch</Button>}>
           <Modal title="Tạo lịch tự động" open={scheduleModalOpen} onCancel={() => { if (!busy) setScheduleModalOpen(false); }} width={720} footer={null}>
           <div className="form-row">
             <div className="compact-field"><span>Tên lịch</span><Input aria-label="Tên lịch" value={scheduleName} placeholder="Ví dụ: Kiểm tra mỗi giờ" onChange={(event) => setScheduleName(event.target.value)} /></div>
@@ -869,9 +874,9 @@ export default function DashboardClient() {
             { title: 'Lần kế tiếp', render: (_: unknown, item: ScheduleItem) => item.nextRunAt ? new Date(item.nextRunAt).toLocaleString('vi-VN') : '-' },
             { title: 'Thao tác', width: 120, render: (_: unknown, item: ScheduleItem) => <Space><ActionButton label={item.enabled ? 'Tắt lịch' : 'Bật lịch'} icon={item.enabled ? 'pause' : 'play'} disabled={!canOperate} onClick={() => void perform(`toggle-${item.id}`, () => mutate(`/api/control-action/schedules/${item.id}/${item.enabled ? 'disable' : 'enable'}`), ['schedules'])} /><ActionButton label="Chạy ngay" icon="play" disabled={!canOperate} onClick={() => void perform(`trigger-${item.id}`, () => mutate(`/api/control-action/schedules/${item.id}/trigger`), ['tasks'])} /><ActionButton label="Xóa lịch" icon="delete" danger disabled={!canAdmin} onClick={() => modal.confirm({ title: `Xóa lịch “${item.name}”?`, content: 'Lịch sẽ không chạy lại sau khi bị xóa.', okText: 'Xóa lịch', cancelText: 'Giữ lại', okButtonProps: { danger: true }, onOk: async () => { const result = await perform(`delete-${item.id}`, () => mutate(`/api/control-action/schedules/${item.id}`, 'DELETE'), ['schedules']); if (result === undefined) throw new Error('Không thể xóa lịch'); } })} /></Space> },
           ]} />
-        </Card>
+        </Card> : null}
 
-        <Card id="media" className="dashboard-row resource-card" title={<SectionTitle title="Thư viện nội dung" description="Quản lý media và chuyển đến khu vực soạn chiến dịch." />}>
+        {activeView === 'media' ? <Card id="media" className="dashboard-row resource-card" title={<SectionTitle title="Thư viện nội dung" description="Quản lý media và chuyển đến khu vực soạn chiến dịch." />}>
           <Row gutter={[18, 18]} className="composer-grid">
             <Col xs={24} xl={16}>
               <div className="composer-panel">
@@ -891,9 +896,9 @@ export default function DashboardClient() {
               </div>
             </Col>
           </Row>
-        </Card>
+        </Card> : null}
 
-        <Card id="tasks" className="dashboard-row resource-card" title={<SectionTitle title="Tác vụ gần đây" description="Theo dõi thực thi và các tác vụ cần xử lý." />} extra={<Select aria-label="Lọc trạng thái tác vụ" className="status-filter" value={taskStatus} onChange={setTaskStatus} options={['ALL', 'DRAFT', 'PAUSED', 'SCHEDULED', 'QUEUED', 'RUNNING', 'REQUIRES_ACTION', 'SUCCEEDED', 'FAILED', 'CANCELLED'].map((value) => ({ value, label: value === 'ALL' ? 'Tất cả trạng thái' : STATUS_LABELS[value] }))} />}>
+        {activeView === 'tasks' ? <Card id="tasks" className="dashboard-row resource-card" title={<SectionTitle title="Tác vụ gần đây" description="Theo dõi thực thi và các tác vụ cần xử lý." />} extra={<Select aria-label="Lọc trạng thái tác vụ" className="status-filter" value={taskStatus} onChange={setTaskStatus} options={['ALL', 'DRAFT', 'PAUSED', 'SCHEDULED', 'QUEUED', 'RUNNING', 'REQUIRES_ACTION', 'SUCCEEDED', 'FAILED', 'CANCELLED'].map((value) => ({ value, label: value === 'ALL' ? 'Tất cả trạng thái' : STATUS_LABELS[value] }))} />}>
           <Table rowKey="id" loading={tasks.isLoading} dataSource={filteredTasks} pagination={{ pageSize: 10, hideOnSinglePage: true }} size="middle" scroll={{ x: 800 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có tác vụ phù hợp" /> }} columns={[
             { title: 'Tài khoản', render: (_: unknown, item: TaskItem) => item.account.username ?? item.account.id },
             { title: 'Tác vụ', dataIndex: 'action', render: (value: string) => ACTION_LABELS[value] ?? value },
@@ -902,7 +907,7 @@ export default function DashboardClient() {
             { title: 'Ngày tạo', render: (_: unknown, item: TaskItem) => new Date(item.createdAt).toLocaleString('vi-VN') },
             { title: 'Chi tiết', render: (_: unknown, item: TaskItem) => <Space orientation="vertical" size={2}>{item.action === 'SYNC_FACEBOOK_GROUPS' && typeof item.runs?.[0]?.result?.groupCount === 'number' ? <Typography.Text>Đã đồng bộ {item.runs[0].result.groupCount} nhóm{item.runs[0].result.complete === false ? ' · Chưa đọc hết danh sách' : ''}</Typography.Text> : null}<Typography.Text type="secondary">{item.lastError ?? (item.action === 'SYNC_FACEBOOK_GROUPS' && item.runs?.[0]?.result?.complete ? 'Đã quét hết danh sách nhóm Facebook tải được.' : '—')}</Typography.Text>{!item.campaignId && item.approvalStatus === 'PENDING' ? <Space><ActionButton label="Duyệt" icon="approve" disabled={!canAdmin} onClick={() => void perform(`approve-${item.id}`, () => mutate(`/api/tasks/${item.id}/approve`), ['tasks'])} /><ActionButton label="Từ chối" icon="reject" danger disabled={!canAdmin} onClick={() => void perform(`reject-${item.id}`, () => mutate(`/api/tasks/${item.id}/reject`), ['tasks'])} /></Space> : null}</Space> },
           ]} />
-        </Card>
+        </Card> : null}
       </Layout.Content>
       </Layout>
 

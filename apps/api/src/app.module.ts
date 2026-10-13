@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
@@ -25,6 +26,14 @@ import { FacebookModule } from './facebook/facebook.module';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      // The recursive pnpm dev command starts this app with apps/api as its
+      // working directory. Explicitly include the workspace-root .env so
+      // Prisma and the API receive the same DATABASE_URL as the worker.
+      envFilePath: [
+        resolve(process.cwd(), '.env'),
+        resolve(process.cwd(), '../../.env'),
+        resolve(__dirname, '../../../.env'),
+      ],
       load: [loadEnvironment],
       cache: true,
     }),

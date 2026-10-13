@@ -55,4 +55,50 @@ export class TasksController {
   ) {
     return this.tasks.reject(organizationId, id, principal.userId);
   }
+
+  @Post(':id/retry')
+  @MinimumRole('OPERATOR')
+  retry(
+    @OrganizationId() organizationId: string,
+    @Param('id') id: string,
+  ) {
+    return this.tasks.retry(organizationId, id);
+  }
+
+  @Post(':id/retry-action')
+  @MinimumRole('ADMIN')
+  retryAction(
+    @OrganizationId() organizationId: string,
+    @Param('id') id: string,
+    @CurrentPrincipal() principal: AuthPrincipal,
+  ) {
+    return this.tasks.retryAction(organizationId, id, principal.userId);
+  }
+
+  @Post(':id/cancel')
+  @MinimumRole('ADMIN')
+  cancel(
+    @OrganizationId() organizationId: string,
+    @Param('id') id: string,
+  ) {
+    return this.tasks.cancel(organizationId, id);
+  }
+
+  @Post(':id/pause')
+  @MinimumRole('ADMIN')
+  pause(
+    @OrganizationId() organizationId: string,
+    @Param('id') id: string,
+  ) {
+    return this.tasks.pause(organizationId, id);
+  }
+
+  @Post(':id/resume')
+  @MinimumRole('ADMIN')
+  resume(
+    @OrganizationId() organizationId: string,
+    @Param('id') id: string,
+  ) {
+    return this.tasks.resume(organizationId, id);
+  }
 }

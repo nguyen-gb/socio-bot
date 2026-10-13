@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { App, Button, Card, Checkbox, Empty, Flex, Form, Input, InputNumber, Modal, Select, Space, Table, Tabs, Tag, Tooltip, Typography } from 'antd';
 
@@ -116,6 +116,9 @@ export default function FacebookWorkspace({ accounts, canOperate, canAdmin, onNa
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([]);
   const [verifiedUnsent, setVerifiedUnsent] = useState(false);
   const [controlBusy, setControlBusy] = useState<string>();
+  const [form] = Form.useForm<Values>();
+  const submitIntent = useRef<'DRAFT' | 'RUN'>('DRAFT');
+  const { modal } = App.useApp();
   const groups = useQuery({ queryKey: ['facebook-groups'], queryFn: () => request<Group[]>('groups'), refetchInterval: 10000 });
   const collections = useQuery({ queryKey: ['facebook-group-collections'], queryFn: () => request<GroupCollection[]>('group-collections') });
   const campaigns = useQuery({ queryKey: ['facebook-campaigns'], queryFn: () => request<Campaign[]>('campaigns'), refetchInterval: 5000 });
@@ -125,11 +128,13 @@ export default function FacebookWorkspace({ accounts, canOperate, canAdmin, onNa
   const open = (next: typeof mode) => { setKey(crypto.randomUUID()); setError(undefined); setMode(next); };
   const submit = async (values: Values) => {
     if (busy || uploadingImages) return;
+    const runImmediately = mode !== 'post' && submitIntent.current === 'RUN';
+    submitIntent.current = 'DRAFT';
     setBusy(true); setError(undefined);
     try {
       const { groupUrls, selectedGroupUrls, messageGroupUrls, postUrls, syncScope, ...fields } = values;
       const endpoint = mode === 'scan-comments' ? 'posts/scan-comments' : mode === 'reply-comments' ? 'posts/reply-comments' : mode === 'message-reactors' ? 'posts/message-reactors' : mode === 'comment-group' ? 'groups/comment-posts' : `groups/${mode}`;
-      const result = await request<{ count?: number }>(endpoint, {
+      const result = await request<{ count?: number; id?: string }>(endpoint, {
         ...fields, idempotencyKey: key,
         ...(mode === 'sync' ? { scope: syncScope ?? 'ALL', accountIds: syncScope === 'SELECTED' ? values.accountIds : [] } : {}),
         ...(mode === 'join' ? { groupUrls: [...new Set((groupUrls ?? '').split(/\r?\n/).map((url) => url.trim()).filter(Boolean))] } : {}),
@@ -138,8 +143,12 @@ export default function FacebookWorkspace({ accounts, canOperate, canAdmin, onNa
         ...(mode === 'message' ? { groupUrls: messageGroupUrls ?? [] } : {}),
         ...(mode === 'scan-comments' || mode === 'message-reactors' ? { postUrls: [...new Set((postUrls ?? '').split(/[\r\n,]+/).map((url) => url.trim()).filter(Boolean))] } : {}),
       });
+      if (runImmediately) {
+        if (!result.id) throw new Error('Campaign đã tạo nhưng chưa nhận được mã để duyệt. Hãy mở danh sách campaign và chạy lại.');
+        await request(`campaigns/${result.id}/approve`, {});
+      }
       setTab('campaigns'); setMode(null); await refresh();
-       void message.success(mode === 'post' ? 'Đã lên lịch đăng bài ngay.' : mode === 'sync' ? 'Đã lưu bản nháp đồng bộ. Duyệt chiến dịch để bắt đầu quét nhóm.' : mode === 'scan-comments' ? 'Đã lưu bản nháp quét bình luận. Duyệt để bắt đầu.' : mode === 'reply-comments' ? 'Đã lưu bản nháp rep bình luận. Duyệt để bắt đầu.' : mode === 'message-reactors' ? 'Đã lưu bản nháp nhắn người react/bình luận. Duyệt để bắt đầu.' : mode === 'comment-group' ? 'Đã lưu bản nháp bình luận bài viết. Duyệt để bắt đầu.' : 'Đã lưu bản nháp. Duyệt danh sách đích trước khi chạy.');
+       void message.success(mode === 'post' ? 'Đã lên lịch đăng bài ngay.' : runImmediately ? 'Đã tạo, duyệt và xếp hàng campaign để chạy.' : mode === 'sync' ? 'Đã lưu bản nháp đồng bộ. Duyệt campaign để bắt đầu quét nhóm.' : mode === 'scan-comments' ? 'Đã lưu bản nháp quét bình luận. Duyệt để bắt đầu.' : mode === 'reply-comments' ? 'Đã lưu bản nháp rep bình luận. Duyệt để bắt đầu.' : mode === 'message-reactors' ? 'Đã lưu bản nháp nhắn người react/bình luận. Duyệt để bắt đầu.' : mode === 'comment-group' ? 'Đã lưu bản nháp bình luận bài viết. Duyệt để bắt đầu.' : 'Đã lưu bản nháp. Duyệt campaign để bắt đầu chạy.');
     } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); }
     finally { setBusy(false); }
   };
@@ -185,7 +194,13 @@ export default function FacebookWorkspace({ accounts, canOperate, canAdmin, onNa
     catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); }
     finally { setBusy(false); }
   };
-  const { modal } = App.useApp();
+  const runNow = () => modal.confirm({
+    title: 'Tạo và chạy campaign ngay?',
+    content: 'Campaign sẽ được duyệt ngay sau khi tạo và xếp vào hàng đợi của từng profile. Thao tác thật sẽ thực hiện khi đến lượt; campaign khác đang chạy vẫn được giữ nguyên thứ tự.',
+    okText: 'Tạo & chạy',
+    cancelText: 'Quay lại',
+    onOk: () => { submitIntent.current = 'RUN'; form.submit(); },
+  });
   const retryKind = (job: Job) => job.retrySafety ?? (job.attemptCount === 0 || job.runs[0]?.result?.sideEffectStarted === false ? 'SAFE' : 'VERIFY');
   const isReady = (job: Job) => accounts.some(account => account.id === job.account.id && account.status === 'READY');
   const openRetry = (campaign: Campaign) => {
@@ -259,7 +274,7 @@ export default function FacebookWorkspace({ accounts, canOperate, canAdmin, onNa
       <div><span className="summary-icon"><Icon name="tasks" /></span><span><strong>{campaigns.data?.length ?? 0}</strong><small>Chiến dịch</small></span></div>
     </div>
     <div className="facebook-actions">
-      <div><strong>Bắt đầu chiến dịch mới</strong><p>Chọn profile, chuẩn bị nội dung; bài đăng chạy ngay, các thao tác khác cần duyệt.</p></div>
+      <div><strong>Bắt đầu chiến dịch mới</strong><p>Chọn profile, chuẩn bị nội dung; bạn có thể lưu nháp hoặc tạo & chạy ngay sau bước xác nhận.</p></div>
        <Space wrap><Button icon={<Icon name="plus" />} disabled={!canOperate || !ready.length} onClick={() => open('join')}>Tham gia nhóm</Button><Button icon={<Icon name="refresh" />} disabled={!canOperate || !ready.length} onClick={() => open('sync')}>Đồng bộ nhóm</Button><Button type="primary" icon={<Icon name="edit" />} disabled={!canOperate || !ready.length} onClick={() => open('post')}>Soạn bài nhóm</Button><Button icon={<Icon name="edit" />} disabled={!canOperate || !ready.length} onClick={() => open('comment-group')}>Cmt bài viết trong nhóm</Button><Button icon={<Icon name="edit" />} disabled={!canOperate || !ready.length} onClick={() => open('reply-comments')}>Rep bình luận</Button><Button icon={<Icon name="edit" />} disabled={!canOperate || !ready.length || !collectionGroupOptions.length} onClick={() => open('message')}>Nhắn thành viên ngẫu nhiên</Button><Button icon={<Icon name="edit" />} disabled={!canOperate || !ready.length} onClick={() => open('message-reactors')}>Nhắn người react/bình luận</Button><Button icon={<Icon name="search" />} disabled={!canOperate || !ready.length} onClick={() => open('scan-comments')}>Quét SĐT bình luận</Button></Space>
     </div>
     {!ready.length ? <Alert type="info" showIcon title="Cần ít nhất một profile Facebook sẵn sàng" description="Mở browser trong Profiles để đăng nhập, kiểm tra phiên rồi đóng browser trước khi chạy chiến dịch." action={<Button onClick={onNavigateProfiles}>Mở Profiles</Button>} /> : null}
@@ -279,14 +294,14 @@ export default function FacebookWorkspace({ accounts, canOperate, canAdmin, onNa
         { title: 'Cập nhật', render: (_, collection) => new Date(collection.updatedAt).toLocaleString('vi-VN') },
         { title: 'Thao tác', width: 112, render: (_, collection) => <Space size={6}><Tooltip title="Sửa tập hợp"><Button aria-label={`Sửa ${collection.name}`} icon={<Icon name="edit" />} disabled={!canOperate} onClick={() => openCollection(collection)} /></Tooltip><Tooltip title={canAdmin ? 'Xóa tập hợp' : 'Cần quyền quản trị để xóa'}><Button aria-label={`Xóa ${collection.name}`} icon={<Icon name="delete" />} danger disabled={!canAdmin} onClick={() => deleteCollection(collection)} /></Tooltip></Space> },
       ]} />
-    </Card> : <Card className="resource-card" title={<div className="section-title"><strong>Chiến dịch của bạn</strong><small>Đăng bài chạy ngay; các thao tác khác cần được duyệt trước khi thực thi</small></div>} extra={<Space className="card-toolbar"><Input.Search aria-label="Tìm chiến dịch" placeholder="Tìm chiến dịch..." allowClear value={campaignSearch} onChange={event => setCampaignSearch(event.target.value)} /><Tooltip title="Làm mới chiến dịch"><Button aria-label="Làm mới chiến dịch" icon={<Icon name="refresh" />} onClick={() => void refresh()} /></Tooltip></Space>}>
+    </Card> : <Card className="resource-card" title={<div className="section-title"><strong>Chiến dịch của bạn</strong><small>Campaign có thể lưu nháp hoặc được duyệt và xếp hàng chạy ngay</small></div>} extra={<Space className="card-toolbar"><Input.Search aria-label="Tìm chiến dịch" placeholder="Tìm chiến dịch..." allowClear value={campaignSearch} onChange={event => setCampaignSearch(event.target.value)} /><Tooltip title="Làm mới chiến dịch"><Button aria-label="Làm mới chiến dịch" icon={<Icon name="refresh" />} onClick={() => void refresh()} /></Tooltip></Space>}>
        <Table<Campaign> rowKey="id" loading={campaigns.isLoading} dataSource={(campaigns.data ?? []).filter(campaign => campaign.name.toLowerCase().includes(campaignSearch.toLowerCase().trim())).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())} pagination={{ pageSize: 10, hideOnSinglePage: true }} scroll={{ x: 760 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có chiến dịch. Tham gia nhóm hoặc soạn bài để tạo bản nháp đầu tiên." /> }} expandable={{ expandedRowRender: campaign => <>{campaign.tasks.some(job => job.status === 'REQUIRES_ACTION') ? <Alert type="warning" showIcon title="Một số profile cần thao tác" description="Đây là kết quả lần chạy trước, không phải trạng thái đăng nhập hiện tại. Khi profile sẵn sàng và browser đã đóng, chọn Chạy lại để xử lý các nhóm chưa hoàn thành." action={<Button onClick={onNavigateProfiles}>Mở Profiles</Button>} style={{ marginBottom: 16 }} /> : null}{campaign.payload.postUrls?.length ? <Typography.Paragraph>Danh sách bài viết ({campaign.payload.postUrls.length}): {campaign.payload.postUrls.map((url, index) => <span key={url}>{index ? ' · ' : ''}<a href={url} target="_blank" rel="noreferrer">{url}</a></span>)}</Typography.Paragraph> : campaign.payload.postUrl ? <Typography.Paragraph>URL bài viết: <a href={campaign.payload.postUrl} target="_blank" rel="noreferrer">{campaign.payload.postUrl}</a></Typography.Paragraph> : null}{campaign.payload.text ? <Typography.Paragraph style={{ whiteSpace: 'pre-wrap' }}>{campaign.payload.text}</Typography.Paragraph> : null}<FacebookPostImages ids={campaign.payload.mediaAssetIds} />{summaryTable(campaign)}{jobsTable(campaign.tasks)}</> }} columns={[
         { title: 'Chiến dịch', render: (_, campaign) => <div className="campaign-name"><strong>{campaign.name}</strong><small>{new Set(campaign.tasks.map(job => job.account.id)).size} profile · {new Date(campaign.createdAt).toLocaleDateString('vi-VN')}</small></div> },
           { title: 'Loại', render: (_, campaign) => campaign.kind === 'SYNC' ? 'Đồng bộ nhóm' : campaign.kind === 'JOIN' ? 'Tham gia nhóm' : campaign.kind === 'MESSAGE' ? 'Nhắn thành viên ngẫu nhiên' : campaign.kind === 'MESSAGE_REACTORS' ? 'Nhắn người react/bình luận' : campaign.kind === 'SCAN_COMMENTS' ? 'Quét SĐT bình luận' : campaign.kind === 'REPLY_COMMENTS' ? 'Rep bình luận' : campaign.kind === 'COMMENT_GROUP_POSTS' ? 'Cmt bài viết trong nhóm' : 'Đăng bài nhóm' },
         { title: 'Tiến độ', render: (_, campaign) => <div className="campaign-progress"><span>{campaign.tasks.filter(job => job.status === 'SUCCEEDED').length}/{campaign.tasks.length}</span><div className="progress-track"><i style={{ width: `${campaign.tasks.length ? campaign.tasks.filter(job => job.status === 'SUCCEEDED').length / campaign.tasks.length * 100 : 0}%` }} /></div></div> },
         { title: 'Trạng thái', render: (_, campaign) => status(campaignStatus(campaign)) },
-         { title: 'Thao tác', width: 150, render: (_, campaign) => <Space wrap size={6}>
-           {!campaign.approvedAt && !campaign.cancelledAt && campaign.tasks.some(job => job.approvalStatus === 'PENDING') ? <Tooltip title="Duyệt campaign"><Button aria-label={`Duyệt ${campaign.name}`} icon={<Icon name="approve" />} disabled={!canAdmin} onClick={() => { setReview(campaign); setError(undefined); }} /></Tooltip> : null}
+         { title: 'Thao tác', width: 190, render: (_, campaign) => <Space wrap size={6}>
+           {!campaign.approvedAt && !campaign.cancelledAt && campaign.tasks.some(job => job.approvalStatus === 'PENDING') ? <Button type="primary" size="small" aria-label={`Chạy ngay ${campaign.name}`} icon={<Icon name="play" />} disabled={!canAdmin} onClick={() => { setReview(campaign); setError(undefined); }}>Chạy ngay</Button> : null}
            {campaign.approvedAt && !campaign.cancelledAt && !campaign.pausedAt && campaign.tasks.some(job => ['RUNNING', 'SCHEDULED', 'QUEUED'].includes(job.status)) ? <Tooltip title="Dừng tác vụ kế tiếp; chờ tác vụ đang chạy kết thúc an toàn"><Button icon={<Icon name="pause" />} aria-label={`Dừng ${campaign.name}`} disabled={!canAdmin || !!controlBusy} loading={controlBusy === campaign.id} onClick={() => void runControl(campaign, 'pause')} /></Tooltip> : null}
            {campaign.pausedAt && !campaign.cancelledAt ? <Tooltip title={campaign.tasks.some(job => job.status === 'RUNNING') ? 'Chờ tác vụ đang chạy kết thúc' : 'Tiếp tục các tác vụ đang tạm dừng'}><Button icon={<Icon name="play" />} aria-label={`Tiếp tục ${campaign.name}`} disabled={!canAdmin || !!controlBusy || campaign.tasks.some(job => job.status === 'RUNNING')} loading={controlBusy === campaign.id} onClick={() => void runControl(campaign, 'resume')} /></Tooltip> : null}
            {campaignStatus(campaign) === 'REQUIRES_ACTION' ? <Tooltip title="Chạy lại task chưa hoàn thành"><Button icon={<Icon name="refresh" />} aria-label={`Chạy lại ${campaign.name}`} disabled={!!controlBusy || !canAdmin} onClick={() => openRetry(campaign)} /></Tooltip> : null}
@@ -295,8 +310,8 @@ export default function FacebookWorkspace({ accounts, canOperate, canAdmin, onNa
          </Space> },
       ]} />
     </Card>}
-     <Modal title={mode === 'sync' ? 'Đồng bộ nhóm đã tham gia' : mode === 'join' ? 'Tham gia danh sách nhóm' : mode === 'message' ? 'Nhắn thành viên ngẫu nhiên' : mode === 'message-reactors' ? 'Nhắn người react/bình luận bài viết' : mode === 'scan-comments' ? 'Quét số điện thoại trong bình luận' : mode === 'reply-comments' ? 'Rep bình luận trong bài viết' : mode === 'comment-group' ? 'Cmt vào bài viết trong nhóm' : 'Đăng bài vào nhóm'} open={mode !== null} onCancel={() => { if (!busy && !uploadingImages) setMode(null); }} destroyOnHidden width={640} confirmLoading={busy} okText={mode === 'post' ? 'Đăng bài ngay' : 'Lưu bản nháp'} cancelText="Đóng" cancelButtonProps={{ disabled: busy || uploadingImages }} okButtonProps={{ form: 'facebook-form', htmlType: 'submit', disabled: uploadingImages }}>
-        <Form<Values> id="facebook-form" key={key} layout="vertical" preserve={false} disabled={busy} initialValues={{ accountIds: [], syncScope: 'ALL', mediaAssetIds: [], recipientSource: 'REACTORS', intervalSeconds: mode === 'message' || mode === 'message-reactors' || mode === 'comment-group' ? 120 : 60, selection: 'ALL', maxGroupsPerAccount: 5, maxRecipientsPerGroup: 10, maxRecipientsPerPost: 10, daysRecent: 7, minReactions: 0, minComments: 0, maxPosts: 10 }} onFinish={(values) => void submit(values)}>
+    <Modal title={mode === 'sync' ? 'Đồng bộ nhóm đã tham gia' : mode === 'join' ? 'Tham gia danh sách nhóm' : mode === 'message' ? 'Nhắn thành viên ngẫu nhiên' : mode === 'message-reactors' ? 'Nhắn người react/bình luận bài viết' : mode === 'scan-comments' ? 'Quét số điện thoại trong bình luận' : mode === 'reply-comments' ? 'Rep bình luận trong bài viết' : mode === 'comment-group' ? 'Cmt vào bài viết trong nhóm' : 'Đăng bài vào nhóm'} open={mode !== null} onCancel={() => { if (!busy && !uploadingImages) setMode(null); }} destroyOnHidden width={640} confirmLoading={busy} cancelButtonProps={{ disabled: busy || uploadingImages }} footer={mode === 'post' ? <Space><Button onClick={() => setMode(null)} disabled={busy || uploadingImages}>Đóng</Button><Button type="primary" htmlType="submit" form="facebook-form" disabled={uploadingImages}>Đăng bài ngay</Button></Space> : <Space><Button onClick={() => setMode(null)} disabled={busy || uploadingImages}>Đóng</Button><Button htmlType="submit" form="facebook-form" disabled={busy || uploadingImages} onClick={() => { submitIntent.current = 'DRAFT'; }}>Lưu bản nháp</Button><Button type="primary" disabled={!canAdmin || busy || uploadingImages} onClick={runNow}>Tạo & chạy ngay</Button></Space>}>
+        <Form<Values> id="facebook-form" form={form} key={key} layout="vertical" preserve={false} disabled={busy} initialValues={{ accountIds: [], syncScope: 'ALL', mediaAssetIds: [], recipientSource: 'REACTORS', intervalSeconds: mode === 'message' || mode === 'message-reactors' || mode === 'comment-group' ? 120 : 60, selection: 'ALL', maxGroupsPerAccount: 5, maxRecipientsPerGroup: 10, maxRecipientsPerPost: 10, daysRecent: 7, minReactions: 0, minComments: 0, maxPosts: 10 }} onFinish={(values) => void submit(values)}>
         {mode !== 'sync' ? <Form.Item name="name" label="Tên chiến dịch" rules={[{ required: true, whitespace: true }, { max: 120 }]}><Input placeholder="Ví dụ: Bài giới thiệu tháng 9" /></Form.Item> : null}
         {mode === 'sync' ? <>
           <Typography.Paragraph type="secondary">Quét danh sách nhóm đã tham gia trực tiếp trên Facebook của từng profile, bao gồm nhóm tham gia thủ công và nhóm ngoài chiến dịch. Profile cần sẵn sàng, browser đã đóng và proxy hoạt động.</Typography.Paragraph>

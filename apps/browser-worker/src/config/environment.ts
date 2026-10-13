@@ -17,6 +17,9 @@ export interface WorkerEnvironment {
   browserChannel?: string;
   browserLocale?: string;
   browserTimezoneId?: string;
+  /** Search provider used by TikTok product tests; live is the production-safe default. */
+  tiktokSearchMode: 'live' | 'fixture';
+  tiktokSearchFixtureScenario: 'success' | 'empty' | 'challenge';
   redisUrl: string;
   profileLeaseTtlMs: number;
   remoteSessionPort: number;
@@ -56,6 +59,19 @@ export function loadEnvironment(): WorkerEnvironment {
   if (objectStorageDriver !== 'local' && objectStorageDriver !== 's3') {
     throw new Error('OBJECT_STORAGE_DRIVER must be local or s3');
   }
+  const tiktokSearchMode = enumValue(
+    process.env.TIKTOK_SEARCH_MODE,
+    ['live', 'fixture'] as const,
+    'live',
+  );
+  const tiktokSearchFixtureScenario = enumValue(
+    process.env.TIKTOK_SEARCH_FIXTURE_SCENARIO,
+    ['success', 'empty', 'challenge'] as const,
+    'success',
+  );
+  if (nodeEnv === 'production' && tiktokSearchMode === 'fixture') {
+    throw new Error('TIKTOK_SEARCH_MODE=fixture is only allowed outside production');
+  }
 
   return {
     nodeEnv,
@@ -69,11 +85,13 @@ export function loadEnvironment(): WorkerEnvironment {
     profileEncryptionKey,
     secretRoot: process.env.SECRET_ROOT ?? './secrets',
     browserSlots: positiveInteger(process.env.BROWSER_MAX_SLOTS, 4),
-    // Keep the execution mode deterministic by deployment environment:
-    // development workers stay visible for debugging, while production
-    // workers run headless for throughput. BROWSER_HEADLESS is intentionally
-    // not an override so a production worker cannot accidentally open UI.
-    browserHeadless: nodeEnv === 'production',
+    // Keep the execution mode deterministic by deployment environment while
+    // allowing an explicit deployment override when a local worker should use
+    // the same headed Chrome surface as a manually opened browser.
+    browserHeadless: booleanValue(
+      process.env.BROWSER_HEADLESS,
+      nodeEnv === 'production',
+    ),
     // Give Facebook's UI a short settling window after submit/confirmation
     // and before profile teardown. Override per deployment when a slower
     // connection needs more time (for example BROWSER_CLOSE_DELAY_MS=10000).
@@ -81,6 +99,8 @@ export function loadEnvironment(): WorkerEnvironment {
     browserChannel: optionalString(process.env.BROWSER_CHANNEL),
     browserLocale: optionalString(process.env.BROWSER_LOCALE),
     browserTimezoneId: optionalString(process.env.BROWSER_TIMEZONE_ID),
+    tiktokSearchMode,
+    tiktokSearchFixtureScenario,
     redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
     profileLeaseTtlMs: positiveInteger(
       process.env.PROFILE_LEASE_TTL_MS,
@@ -128,4 +148,16 @@ function booleanValue(value: string | undefined, fallback: boolean): boolean {
 function optionalString(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized || undefined;
+}
+
+function enumValue<const T extends readonly string[]>(
+  value: string | undefined,
+  allowed: T,
+  fallback: T[number],
+): T[number] {
+  const resolved = value ?? fallback;
+  if (!allowed.includes(resolved)) {
+    throw new Error(`Expected one of ${allowed.join(', ')}, received ${resolved}`);
+  }
+  return resolved as T[number];
 }

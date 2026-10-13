@@ -37,6 +37,7 @@ export class ProxyCheckActivities {
     try {
       browser = await chromium.launch({
         headless: true,
+        chromiumSandbox: true,
         proxy: {
           server: `${proxy.protocol.toLowerCase()}://${proxy.host}:${proxy.port.toString()}`,
           username: credentials?.username,

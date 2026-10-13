@@ -80,3 +80,57 @@ test('Facebook post comment replies are valid actions and require approval', () 
   assert.equal(result.success, true);
   assert.equal(requiresExternalApproval('REPLY_FACEBOOK_POST_COMMENTS'), true);
 });
+
+test('TikTok search is read-only and bounded', () => {
+  const result = createTaskSchema.safeParse({
+    idempotencyKey: 'tiktok-search-0001',
+    action: {
+      platform: 'TIKTOK', accountId, action: 'SEARCH_TIKTOK_VIDEOS',
+      payload: { query: 'du lịch', maxVideos: 25 },
+    },
+  });
+  assert.equal(result.success, true);
+  assert.equal(requiresExternalApproval('SEARCH_TIKTOK_VIDEOS'), false);
+});
+
+test('TikTok comment, reply and like actions require approval', () => {
+  const comment = createTaskSchema.safeParse({
+    idempotencyKey: 'tiktok-comment-0001',
+    action: {
+      platform: 'TIKTOK', accountId, action: 'COMMENT_TIKTOK_VIDEOS',
+      payload: { videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'], text: 'Xin chào' },
+    },
+  });
+  const reply = createTaskSchema.safeParse({
+    idempotencyKey: 'tiktok-reply-0001',
+    action: {
+      platform: 'TIKTOK', accountId, action: 'REPLY_TIKTOK_COMMENTS',
+      payload: { videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'], text: 'Cảm ơn bạn' },
+    },
+  });
+  const like = createTaskSchema.safeParse({
+    idempotencyKey: 'tiktok-like-0001',
+    action: {
+      platform: 'TIKTOK', accountId, action: 'LIKE_TIKTOK_COMMENTS',
+      payload: { videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'] },
+    },
+  });
+  assert.equal(comment.success, true);
+  assert.equal(reply.success, true);
+  assert.equal(like.success, true);
+  assert.equal(requiresExternalApproval('COMMENT_TIKTOK_VIDEOS'), true);
+  assert.equal(requiresExternalApproval('REPLY_TIKTOK_COMMENTS'), true);
+  assert.equal(requiresExternalApproval('LIKE_TIKTOK_COMMENTS'), true);
+});
+
+test('TikTok follower messaging accepts a bounded username campaign and requires approval', () => {
+  const result = createTaskSchema.safeParse({
+    idempotencyKey: 'tiktok-follower-dm-0001',
+    action: {
+      platform: 'TIKTOK', accountId, action: 'MESSAGE_TIKTOK_FOLLOWERS',
+      payload: { name: 'IB follower', username: '@kenh_cua_toi', text: 'Xin chào', maxFollowers: 10, mediaAssetIds: [] },
+    },
+  });
+  assert.equal(result.success, true);
+  assert.equal(requiresExternalApproval('MESSAGE_TIKTOK_FOLLOWERS'), true);
+});

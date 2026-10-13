@@ -94,6 +94,43 @@ test('invalid cookie input falls back to password, or remains open for manual lo
   assert.equal(manual.events.includes('close'), false);
 });
 
+test('TikTok login falls back to the login route when the entry route is rejected without a body', async () => {
+  const targets: string[] = [];
+  let currentUrl = 'about:blank';
+  const locator = () => ({
+    first: () => locator(),
+    isVisible: async () => false,
+  });
+  const session = {
+    profileId: 'profile',
+    slot: 0,
+    context: {
+      cookies: async () => [],
+      addCookies: async () => {},
+    },
+    page: {
+      url: () => currentUrl,
+      locator,
+      goto: async (target: string) => {
+        targets.push(target);
+        if (target === 'https://www.tiktok.com/') {
+          throw new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://www.tiktok.com/');
+        }
+        currentUrl = target;
+      },
+      waitForTimeout: async () => {},
+    },
+  };
+
+  await initializePlatformSession(session as never, 'TIKTOK');
+
+  assert.deepEqual(targets, [
+    'https://www.tiktok.com/',
+    'https://www.tiktok.com/login',
+  ]);
+  assert.equal(currentUrl, 'https://www.tiktok.com/login');
+});
+
 test('CAPTCHA does not trigger password submission or claim READY', async () => {
   const fixture = sessionFixture([{ name: 'c_user', value: 'valid' }], 'challenge');
   await initializePlatformSession(fixture.session, 'FACEBOOK', { login: 'fixture', password: 'fixture-only' });

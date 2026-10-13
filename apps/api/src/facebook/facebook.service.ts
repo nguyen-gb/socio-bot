@@ -309,22 +309,32 @@ export class FacebookService {
   async approve(organizationId: string, id: string, userId?: string) {
     const campaign = await this.prisma.facebookCampaign.findFirst({ where: { id, organizationId }, include: { tasks: true } });
     if (!campaign) throw new NotFoundException('Campaign not found');
-    const active = await this.prisma.task.count({ where: { organizationId, accountId: { in: campaign.tasks.map((task) => task.accountId) }, status: { in: ['QUEUED', 'SCHEDULED', 'RUNNING'] } } });
-    if (active) throw new ConflictException('Account đang có tác vụ chờ/chạy. Chờ hoàn tất hoặc hủy chiến dịch cũ trước khi duyệt.');
-    await this.selectedAccounts(organizationId, [...new Set(campaign.tasks.map((task) => task.accountId))]);
+    await this.selectedAccounts(organizationId, [...new Set(campaign.tasks.map((task) => task.accountId))], this.prisma, true);
     const pending = campaign.tasks.filter((task) => task.approvalStatus === 'PENDING');
     if (!pending.length || campaign.approvedAt) throw new ConflictException('Chiến dịch không còn chờ duyệt');
     const intervalSeconds = Number((campaign.payload as Record<string, unknown>).intervalSeconds ?? 60);
     const now = Date.now();
-    const sequence = new Map<string, number>();
-    const dispatches = pending.map((task) => {
-      const index = sequence.get(task.accountId) ?? 0;
-      sequence.set(task.accountId, index + 1);
-      return { task, scheduledAt: new Date(now + index * intervalSeconds * 1000) };
-    });
+    let dispatches: Array<{ task: (typeof pending)[number]; scheduledAt: Date }> = [];
     await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`facebook/campaign/${id}`}))`;
-      await this.ensureDispatchable(tx, organizationId, pending.map(task => task.accountId));
+      await this.ensureQueueable(tx, organizationId, pending.map(task => task.accountId));
+      const accountIds = [...new Set(pending.map(task => task.accountId))];
+      const queueTail = new Map<string, Date>();
+      const activeTasks = await tx.task.findMany({
+        where: { organizationId, accountId: { in: accountIds }, status: { in: ['QUEUED', 'SCHEDULED', 'RUNNING'] } },
+        select: { accountId: true, scheduledAt: true },
+      });
+      for (const task of activeTasks) {
+        const scheduledAt = task.scheduledAt ?? new Date(now);
+        if (!queueTail.has(task.accountId) || scheduledAt.getTime() > queueTail.get(task.accountId)!.getTime()) queueTail.set(task.accountId, scheduledAt);
+      }
+      const nextByAccount = new Map(queueTail);
+      dispatches = pending.map((task) => {
+        const previous = nextByAccount.get(task.accountId);
+        const scheduledAt = previous ? new Date(Math.max(now, previous.getTime() + intervalSeconds * 1000)) : new Date(now);
+        nextByAccount.set(task.accountId, scheduledAt);
+        return { task, scheduledAt };
+      });
       const claimed = await tx.facebookCampaign.updateMany({ where: { id, organizationId, approvedAt: null, cancelledAt: null, pausedAt: null }, data: { approvedAt: new Date(now) } });
       if (claimed.count !== 1) throw new ConflictException('Chiến dịch đã được duyệt');
       for (const { task, scheduledAt } of dispatches) {
@@ -411,12 +421,17 @@ export class FacebookService {
   }
 
   private async ensureDispatchable(tx: Prisma.TransactionClient, organizationId: string, accountIds: string[]) {
+    await this.ensureQueueable(tx, organizationId, accountIds);
+    const ids = [...new Set(accountIds)].sort();
+    const active = await tx.task.count({ where: { organizationId, accountId: { in: ids }, status: { in: ['QUEUED', 'SCHEDULED', 'RUNNING'] } } });
+    if (active) throw new ConflictException('Profile còn tác vụ đang chạy/chờ. Chờ hoàn tất hoặc dừng chiến dịch khác trước.');
+  }
+
+  private async ensureQueueable(tx: Prisma.TransactionClient, organizationId: string, accountIds: string[]) {
     const ids = [...new Set(accountIds)].sort();
     if (!ids.length) return;
     for (const id of ids) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`facebook/account/${id}`}))`;
-    const active = await tx.task.count({ where: { organizationId, accountId: { in: ids }, status: { in: ['QUEUED', 'SCHEDULED', 'RUNNING'] } } });
-    if (active) throw new ConflictException('Profile còn tác vụ đang chạy/chờ. Chờ hoàn tất hoặc dừng chiến dịch khác trước.');
-    await this.selectedAccounts(organizationId, ids, tx);
+    await this.selectedAccounts(organizationId, ids, tx, true);
   }
 
   private async requeue(tx: Prisma.TransactionClient, campaign: { id: string; organizationId: string; payload: unknown }, tasks: Array<{ id: string; accountId: string; status: TaskStatus; workflowId: string | null; attemptCount: number }>) {
@@ -463,18 +478,19 @@ export class FacebookService {
     }
   }
 
-  private async selectedAccounts(organizationId: string, accountIds: string[], database: Pick<PrismaService, 'platformAccount'> = this.prisma) {
+  private async selectedAccounts(organizationId: string, accountIds: string[], database: Pick<PrismaService, 'platformAccount'> = this.prisma, allowActiveAutomation = false) {
     const ids = [...new Set(accountIds)];
     const accounts = await database.platformAccount.findMany({
-      where: { organizationId, platform: 'FACEBOOK', status: 'READY', ...(ids.length ? { id: { in: ids } } : {}) },
-      include: { browserProfile: { include: { sessions: { where: { status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } }, take: 1 } } }, proxyBinding: { include: { proxy: true } } },
+      where: { organizationId, platform: 'FACEBOOK', status: allowActiveAutomation ? { in: ['READY', 'RUNNING'] } : 'READY', ...(ids.length ? { id: { in: ids } } : {}) },
+      include: { browserProfile: { include: { sessions: { where: { status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } }, select: { mode: true }, take: 1 } } }, proxyBinding: { include: { proxy: true } } },
       orderBy: { createdAt: 'asc' },
     });
     if (!accounts.length) throw new BadRequestException('Không có account Facebook READY');
     if (ids.length && accounts.length !== ids.length) throw new BadRequestException('Các account được chọn phải thuộc workspace, là Facebook và ở trạng thái READY');
     if (accounts.length > 100) throw new BadRequestException('Chọn tối đa 100 account cho một chiến dịch');
     for (const account of accounts) {
-      if (!account.browserProfile || account.browserProfile.sessions.length) throw new ConflictException(`Đóng browser của ${account.username ?? account.id} trước khi chạy`);
+      const blockingSession = account.browserProfile?.sessions.find(session => !allowActiveAutomation || session.mode !== 'AUTOMATION');
+      if (!account.browserProfile || blockingSession) throw new ConflictException(`Đóng browser của ${account.username ?? account.id} trước khi chạy`);
       if (account.proxyBinding && account.proxyBinding.proxy.status !== 'HEALTHY') throw new ConflictException(`Kiểm tra lại proxy của ${account.username ?? account.id} trước khi chạy`);
     }
     return accounts;

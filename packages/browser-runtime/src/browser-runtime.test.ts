@@ -73,6 +73,26 @@ test('deferred close keeps the browser alive until the caller persists task resu
   } finally { await runtime.closeAll(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('ephemeral browser contexts never restore or persist profile cookies', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-ephemeral-browser-'));
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7));
+  const profileId = 'ephemeral-search';
+  try {
+    const first = await runtime.openProfile({ profileId, ephemeral: true, headless: true });
+    await first.context.addCookies([{ name: 'session-auth', value: 'must-not-persist', url: 'https://www.tiktok.com/' }]);
+    await first.close();
+    await assert.rejects(stat(join(root, profileId)), /ENOENT/);
+
+    const second = await runtime.openProfile({ profileId, ephemeral: true, headless: true });
+    assert.equal((await second.context.cookies('https://www.tiktok.com/')).some(cookie => cookie.name === 'session-auth'), false);
+    await second.close();
+    await assert.rejects(stat(join(root, profileId)), /ENOENT/);
+  } finally {
+    await runtime.closeAll();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('persistent Chromium profile survives a close and reopen', async () => {
   const root = await mkdtemp(join(tmpdir(), 'socio-browser-runtime-'));
   const profileId = '00000000-0000-4000-8000-000000000222';

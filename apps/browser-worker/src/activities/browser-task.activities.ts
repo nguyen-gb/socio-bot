@@ -25,6 +25,9 @@ import {
 import {
   InstagramAdapter,
   TikTokAdapter,
+  createTikTokFixtureSearchProvider,
+  TikTokSearchAutomationError,
+  TikTokVerificationRequiredError,
   XAdapter,
 } from '@socio/web-platform-adapters';
 import type { WorkerEnvironment } from '../config/environment';
@@ -39,6 +42,8 @@ import type { ObjectStorage } from '@socio/object-storage';
 import { OBJECT_STORAGE } from '../storage/object-storage.providers';
 import { loadTaskImages } from '../storage/task-images';
 import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, profileLoginSettings } from './platform-login';
+
+const sharedTikTokSearchProfileId = 'search-tiktok-anonymous';
 
 @Injectable()
 export class BrowserTaskActivities {
@@ -57,11 +62,29 @@ export class BrowserTaskActivities {
     @Inject(OBJECT_STORAGE) private readonly objects: ObjectStorage,
   ) {
     const facebook = new FacebookAdapter();
+    // A few lightweight unit fixtures construct this activity with a partial
+    // dependency graph. Keep the production ConfigService path typed while
+    // defaulting those fixtures to live mode.
+    const configGet = (this.config as unknown as {
+      get?: (key: string, options?: { infer?: boolean }) => unknown;
+    }).get;
+    const tiktokSearchMode = configGet?.call(this.config, 'tiktokSearchMode', { infer: true }) === 'fixture'
+      ? 'fixture'
+      : 'live';
+    const tiktokSearchFixtureScenario = configGet?.call(this.config, 'tiktokSearchFixtureScenario', { infer: true });
     this.adapters = new PlatformAdapterRegistry([
       facebook,
       new InstagramAdapter(),
       new XAdapter(),
-      new TikTokAdapter(),
+      new TikTokAdapter({
+        searchProvider: tiktokSearchMode === 'fixture'
+          ? createTikTokFixtureSearchProvider(
+            tiktokSearchFixtureScenario === 'empty' || tiktokSearchFixtureScenario === 'challenge'
+              ? tiktokSearchFixtureScenario
+              : 'success',
+          )
+          : undefined,
+      }),
     ]);
   }
 
@@ -121,9 +144,9 @@ export class BrowserTaskActivities {
     const workflowId = input.workflowId ?? Context.current().info.workflowExecution?.workflowId;
     if (workflowId && task.workflowId !== workflowId) return { ok: false, data: { skipped: true, reason: 'stale_workflow' } };
     const profile = task.account.browserProfile;
-    if (task.status === 'CANCELLED') return { ok: false, data: { cancelled: true } };
+    if (task.status === 'CANCELLED' || task.cancelledAt) return { ok: false, data: { cancelled: true } };
     if (task.status === 'SUCCEEDED') return { ok: true, data: { alreadyCompleted: true } };
-    if (task.status === 'PAUSED' || task.status !== 'RUNNING' && (task.campaign?.pausedAt || task.campaign?.cancelledAt)) return { ok: false, data: { paused: true } };
+    if (task.status === 'PAUSED' || task.pausedAt || task.status !== 'RUNNING' && (task.campaign?.pausedAt || task.campaign?.cancelledAt)) return { ok: false, data: { paused: true } };
     const externalAction = requiresExternalApproval(task.action);
     if (externalAction && task.approvalStatus !== 'APPROVED') {
       return { ok: false, data: { requiresAction: true, reason: 'External action has not been approved' } };
@@ -173,24 +196,37 @@ export class BrowserTaskActivities {
       );
     }
 
-    return this.leases.withLease(profile.id, async () => {
+    const tiktokSearchAction = action.action === 'SEARCH_TIKTOK_VIDEOS';
+    // Search uses its own anonymous browser data, separate from the account's
+    // logged-in profile, but that data is intentionally stable across tasks.
+    // Lease the derived profile itself so two campaigns cannot open the same
+    // persistent Chromium directory concurrently.
+    const searchRuntimeProfileId = sharedTikTokSearchProfileId;
+    const profileLeaseId = tiktokSearchAction ? searchRuntimeProfileId : profile.id;
+    return this.leases.withLease(profileLeaseId, async () => {
     const current = await this.prisma.task.findUniqueOrThrow({ where: { id: task.id }, include: { campaign: true, account: { include: { proxyBinding: { include: { proxy: true } }, browserProfile: { include: { sessions: { where: { status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } }, take: 1 } } } } } } });
     if (workflowId && current.workflowId !== workflowId) return { ok: false, data: { skipped: true, reason: 'stale_workflow' } };
-    if (current.status === 'CANCELLED') return { ok: false, data: { cancelled: true } };
-    if (current.status === 'PAUSED' || current.campaign?.pausedAt || current.campaign?.cancelledAt) return { ok: false, data: { paused: true } };
+    if (current.status === 'CANCELLED' || current.cancelledAt) return { ok: false, data: { cancelled: true } };
+    if (current.status === 'PAUSED' || current.pausedAt || current.campaign?.pausedAt || current.campaign?.cancelledAt) return { ok: false, data: { paused: true } };
     const facebookBrowserAction = ['SYNC_FACEBOOK_GROUPS', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action);
-    if (facebookBrowserAction && current.account.status !== 'READY') {
+    const tiktokBrowserAction = ['SEARCH_TIKTOK_VIDEOS', 'AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action);
+    const authenticatedBrowserAction = facebookBrowserAction || (tiktokBrowserAction && !tiktokSearchAction);
+    if (authenticatedBrowserAction && current.account.status !== 'READY') {
       await this.prisma.task.update({ where: { id: task.id }, data: { status: 'REQUIRES_ACTION', lastError: 'Account không ở trạng thái READY; hãy đăng nhập hoặc xử lý xác minh trước.' } });
       return { ok: false, data: { requiresAction: true, reason: 'Account is not READY' } };
     }
-    if (facebookBrowserAction && (current.account.browserProfile?.sessions.length || current.account.proxyBinding && current.account.proxyBinding.proxy.status !== 'HEALTHY')) {
-      const reason = 'Browser đang mở hoặc proxy chưa HEALTHY. Đóng browser và kiểm tra proxy trước khi chạy.';
+    const hasActiveProfileSession = Boolean(current.account.browserProfile?.sessions.length);
+    const hasUnhealthyProxy = current.account.proxyBinding?.proxy.status !== 'HEALTHY' && Boolean(current.account.proxyBinding);
+    if ((authenticatedBrowserAction && (hasActiveProfileSession || hasUnhealthyProxy)) || (tiktokSearchAction && hasUnhealthyProxy)) {
+      const reason = tiktokSearchAction
+        ? 'Proxy chưa HEALTHY. Hãy kiểm tra proxy trước khi chạy Search.'
+        : 'Browser đang mở hoặc proxy chưa HEALTHY. Đóng browser và kiểm tra proxy trước khi chạy.';
       await this.prisma.task.update({ where: { id: task.id }, data: { status: 'REQUIRES_ACTION', lastError: reason } });
       return { ok: false, data: { requiresAction: true, reason } };
     }
     const run = await this.prisma.$transaction(async (tx) => {
       const claim = await tx.task.updateMany({
-        where: { id: task.id, ...(task.workflowId ? { workflowId: task.workflowId } : {}), status: { in: externalAction ? ['QUEUED', 'SCHEDULED'] : ['QUEUED', 'SCHEDULED', 'FAILED', 'RUNNING'] }, ...(externalAction ? { approvalStatus: 'APPROVED', attemptCount: 0 } : {}) },
+        where: { id: task.id, ...(task.workflowId ? { workflowId: task.workflowId } : {}), status: { in: externalAction ? ['QUEUED', 'SCHEDULED'] : ['QUEUED', 'SCHEDULED', 'FAILED', 'RUNNING'] }, pausedAt: null, cancelledAt: null, ...(externalAction ? { approvalStatus: 'APPROVED', attemptCount: 0 } : {}) },
         data: { status: 'RUNNING', attemptCount: { increment: 1 } },
       });
       if (claim.count !== 1) return null;
@@ -198,10 +234,12 @@ export class BrowserTaskActivities {
         where: { id: task.accountId },
         data: { status: 'RUNNING' },
       });
-      await tx.browserProfile.update({
-        where: { id: profile.id },
-        data: { status: 'LEASED' },
-      });
+      if (!tiktokSearchAction) {
+        await tx.browserProfile.update({
+          where: { id: profile.id },
+          data: { status: 'LEASED' },
+        });
+      }
       return tx.taskRun.create({ data: { taskId: task.id, workerId: this.registry.workerId, status: 'RUNNING', result: { sideEffectStarted: false } } });
     });
     if (!run) return { ok: false, data: { cancelled: true, reason: 'Task state changed before execution' } };
@@ -210,6 +248,7 @@ export class BrowserTaskActivities {
     let sideEffectStarted = false;
     let authenticated = false;
     let browserSessionId: string | undefined;
+    let runtimeProfileId = profile.id;
     let browserCloseWaitCompleted = false;
     const waitForBrowserClose = async () => {
       if (browserCloseWaitCompleted) return;
@@ -223,15 +262,18 @@ export class BrowserTaskActivities {
         expiresAt: new Date(Date.now() + 6 * 60_000),
       } });
       browserSessionId = browserSession.id;
-      Context.current().heartbeat({ stage: 'restoring_profile_snapshot' });
-      await this.snapshots.restore(current.account.browserProfile ?? profile);
+      if (!tiktokSearchAction) {
+        Context.current().heartbeat({ stage: 'restoring_profile_snapshot' });
+        await this.snapshots.restore(current.account.browserProfile ?? profile);
+      }
       Context.current().heartbeat({ stage: 'opening_browser' });
       let result: ActionResult;
       const harPath = await this.artifacts.temporaryPath('.har');
       try {
+        runtimeProfileId = tiktokSearchAction ? searchRuntimeProfileId : profile.id;
         result = await this.runtime.withProfile(
           {
-            profileId: profile.id,
+            profileId: runtimeProfileId,
             ownerId: browserSession.id,
             proxy: await toRuntimeProxy(
               current.account.proxyBinding?.proxy,
@@ -246,6 +288,10 @@ export class BrowserTaskActivities {
             // been durably persisted. Closing inside withProfile() can abort
             // a still-settling Facebook UI action while the task is RUNNING.
             closeOnComplete: false,
+            // Search runs in a dedicated anonymous profile. Keep the browser
+            // identity and request headers native; privacyMode must not add
+            // synthetic headers that differ from ordinary Chrome.
+            privacyMode: tiktokSearchAction,
           },
           async (session) => {
             const opened = await this.prisma.browserSession.updateMany({ where: { id: browserSession.id, status: 'STARTING' }, data: { status: 'RUNNING', processId: session.processId, lastActiveAt: new Date() } });
@@ -285,6 +331,18 @@ export class BrowserTaskActivities {
                 }
                 authenticated = !blocked;
               }
+              if (action.platform === 'TIKTOK' && tiktokBrowserAction && !tiktokSearchAction) {
+                const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
+                const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
+                await initializePlatformSession(session, 'TIKTOK', credentials);
+                if (await isPlatformChallenged(session)) {
+                  blocked = { ok: false, data: { requiresAction: true, accountChallenged: true, reason: 'TikTok yêu cầu xác minh/CAPTCHA. Hãy thao tác thủ công.' } };
+                }
+                if (!blocked && !(await isPlatformAuthenticated(session, 'TIKTOK'))) {
+                  throw new LoginRequiredError('Không xác nhận được phiên đăng nhập TikTok. Hãy mở browser để đăng nhập hoặc kiểm tra cookie.');
+                }
+                authenticated = !blocked;
+              }
               const actionSession = {
                 ...session,
                 accountUsername: current.account.username ?? undefined,
@@ -306,7 +364,7 @@ export class BrowserTaskActivities {
                   : undefined,
                 resolveMediaAssets: async (ids: string[]) => {
                   const approvedMediaIds = 'mediaAssetIds' in action.payload ? action.payload.mediaAssetIds : [];
-                  if (!['POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action) || ids.some((id: string) => !approvedMediaIds.includes(id))) {
+                  if (!['POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS', 'AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action) || ids.some((id: string) => !approvedMediaIds.includes(id))) {
                     throw new Error('Ảnh không thuộc nội dung tác vụ đã duyệt');
                   }
                   return loadTaskImages(this.prisma, this.objects, task.organizationId, ids);
@@ -363,73 +421,98 @@ export class BrowserTaskActivities {
         // make the task appear stuck or fail with ENOTEMPTY/EPERM.
         if (browserSessionId && this.runtime.closeProfile) {
           await waitForBrowserClose();
-          await this.runtime.closeProfile(profile.id, browserSessionId).catch(() => undefined);
+          await this.runtime.closeProfile(runtimeProfileId, browserSessionId).catch(() => undefined);
         }
-        Context.current().heartbeat({ stage: 'saving_profile_snapshot' });
-        try {
-          await this.snapshots.capture(profile.id);
-        } catch (snapshotError) {
-          // Snapshot cleanup/antivirus races on Windows must not overwrite the
-          // actual Facebook action result. The browser session is already
-          // closed here; make the profile available for a retry and preserve
-          // the task outcome instead of turning a successful/verified action
-          // into a misleading REQUIRES_ACTION failure.
-          await this.prisma.browserProfile.update({
-            where: { id: profile.id },
-            data: { status: 'AVAILABLE' },
-          }).catch(() => undefined);
-          this.logger.warn(`Profile snapshot skipped for ${profile.id}: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`);
+        if (!tiktokSearchAction) {
+          Context.current().heartbeat({ stage: 'saving_profile_snapshot' });
+          try {
+            await this.snapshots.capture(profile.id);
+          } catch (snapshotError) {
+            // Snapshot cleanup/antivirus races on Windows must not overwrite the
+            // actual Facebook action result. The browser session is already
+            // closed here; make the profile available for a retry and preserve
+            // the task outcome instead of turning a successful/verified action
+            // into a misleading REQUIRES_ACTION failure.
+            await this.prisma.browserProfile.update({
+              where: { id: profile.id },
+              data: { status: 'AVAILABLE' },
+            }).catch(() => undefined);
+            this.logger.warn(`Profile snapshot skipped for ${profile.id}: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`);
+          }
         }
       }
-      if (result.data?.loginRequired === true) throw new LoginRequiredError();
+      if (!tiktokSearchAction && result.data?.loginRequired === true) throw new LoginRequiredError();
       await this.persistFacebookResult(task, result);
       const requiresAction = result.data?.requiresAction === true;
+      const control = await this.prisma.task.findUnique({ where: { id: task.id }, select: { status: true, pausedAt: true, cancelledAt: true } });
+      const cancellationRequested = control?.status === 'CANCELLED' || Boolean(control?.cancelledAt);
+      const pauseRequested = !cancellationRequested && (control?.status === 'PAUSED' || Boolean(control?.pausedAt));
+      // A running adapter finishes its current atomic action safely. Queued
+      // work is paused before claim; a successful in-flight action is kept
+      // completed exactly once to avoid duplicating side effects on resume.
+      const finalTaskStatus = cancellationRequested
+        ? 'CANCELLED'
+        : pauseRequested && !result.ok && !requiresAction
+          ? 'PAUSED'
+          : requiresAction
+            ? 'REQUIRES_ACTION'
+            : result.ok ? 'SUCCEEDED' : 'FAILED';
       const reason = typeof result.data?.reason === 'string' ? result.data.reason : task.action === 'SYNC_FACEBOOK_GROUPS' && result.data?.complete === false ? 'Đồng bộ chưa đọc hết danh sách nhóm; hãy kiểm tra browser hoặc đồng bộ lại trước khi chọn tất cả nhóm.' : null;
 
       await this.prisma.$transaction([
         this.prisma.task.update({
           where: { id: task.id },
-          data: { status: requiresAction ? 'REQUIRES_ACTION' : result.ok ? 'SUCCEEDED' : 'FAILED', lastError: reason },
+          data: { status: finalTaskStatus, lastError: cancellationRequested || (pauseRequested && result.ok) ? null : reason },
         }),
         this.prisma.taskRun.update({
           where: { id: run.id },
           data: {
-            status: result.ok ? 'SUCCEEDED' : 'FAILED',
-            result: { ...(result.data ?? {}), sideEffectStarted } as Prisma.InputJsonValue,
+            status: cancellationRequested ? 'CANCELLED' : result.ok ? 'SUCCEEDED' : 'FAILED',
+            errorCode: result.data?.accountChallenged === true && task.platform === 'TIKTOK' ? 'TIKTOK_VERIFICATION_REQUIRED' : undefined,
+            result: { ...(result.data ?? {}), sideEffectStarted, ...(cancellationRequested ? { cancellationRequested: true } : {}), ...(pauseRequested ? { pauseRequested: true } : {}) } as Prisma.InputJsonValue,
             finishedAt: new Date(),
           },
         }),
         this.prisma.platformAccount.update({
           where: { id: task.accountId },
-          data: { status: result.data?.accountChallenged === true ? 'CHALLENGED' : result.ok || requiresAction ? 'READY' : 'ERROR' },
+          data: { status: tiktokSearchAction ? current.account.status : result.data?.accountChallenged === true ? 'CHALLENGED' : result.ok || requiresAction ? 'READY' : 'ERROR' },
         }),
-        this.prisma.browserProfile.update({
+        ...(tiktokSearchAction ? [] : [this.prisma.browserProfile.update({
           where: { id: profile.id },
           data: { status: 'AVAILABLE' },
-        }),
+        })]),
       ]);
       return result;
     } catch (error) {
       const loginRequired = error instanceof LoginRequiredError;
       const unsupported = error instanceof UnsupportedPlatformActionError;
+      const tiktokSearchAutomation = error instanceof TikTokSearchAutomationError;
+      const tiktokVerificationRequired = error instanceof TikTokVerificationRequiredError;
       const message = error instanceof Error ? error.message : String(error);
+      const control = await this.prisma.task.findUnique({ where: { id: task.id }, select: { status: true, pausedAt: true, cancelledAt: true } });
+      const cancellationRequested = control?.status === 'CANCELLED' || Boolean(control?.cancelledAt);
+      const pauseRequested = !cancellationRequested && (control?.status === 'PAUSED' || Boolean(control?.pausedAt));
 
       await this.prisma.$transaction([
         this.prisma.task.update({
           where: { id: task.id },
           data: {
-            status: loginRequired || externalAction ? 'REQUIRES_ACTION' : 'FAILED',
-            lastError: message,
+            status: cancellationRequested ? 'CANCELLED' : pauseRequested && !loginRequired && !tiktokVerificationRequired && !externalAction ? 'PAUSED' : loginRequired || tiktokVerificationRequired || externalAction ? 'REQUIRES_ACTION' : 'FAILED',
+            lastError: cancellationRequested || pauseRequested ? null : message,
           },
         }),
         this.prisma.taskRun.update({
           where: { id: run.id },
           data: {
-            status: 'FAILED',
-            error: message,
-            result: { sideEffectStarted },
+            status: cancellationRequested ? 'CANCELLED' : 'FAILED',
+            error: cancellationRequested || pauseRequested ? undefined : message,
+            result: { sideEffectStarted, ...(cancellationRequested ? { cancellationRequested: true } : {}), ...(pauseRequested ? { pauseRequested: true } : {}) },
             errorCode: loginRequired
               ? 'LOGIN_REQUIRED'
+              : tiktokVerificationRequired
+                ? 'TIKTOK_VERIFICATION_REQUIRED'
+              : tiktokSearchAutomation
+                ? 'TIKTOK_SEARCH_UI_ERROR'
               : unsupported
                 ? 'UNSUPPORTED_ACTION'
                 : 'EXECUTION_ERROR',
@@ -438,16 +521,19 @@ export class BrowserTaskActivities {
         }),
         this.prisma.platformAccount.update({
           where: { id: task.accountId },
-          data: { status: loginRequired ? 'LOGIN_REQUIRED' : authenticated ? 'READY' : 'ERROR' },
+          data: { status: tiktokSearchAction ? current.account.status : loginRequired ? 'LOGIN_REQUIRED' : tiktokVerificationRequired ? 'CHALLENGED' : authenticated ? 'READY' : 'ERROR' },
         }),
-        this.prisma.browserProfile.update({
+        ...(tiktokSearchAction ? [] : [this.prisma.browserProfile.update({
           where: { id: profile.id },
           data: { status: 'AVAILABLE' },
-        }),
+        })]),
       ]);
 
-      if (loginRequired || unsupported || externalAction) {
-        return { ok: false, data: { reason: message, requiresAction: true } };
+      if (tiktokSearchAutomation) {
+        return { ok: false, data: { reason: message } };
+      }
+      if (loginRequired || tiktokVerificationRequired || unsupported || externalAction) {
+        return { ok: false, data: { reason: message, requiresAction: true, ...(tiktokVerificationRequired ? { accountChallenged: true } : {}) } };
       }
       throw error;
     } finally {
@@ -457,7 +543,7 @@ export class BrowserTaskActivities {
         // persistence and confirmation finish before Chromium is torn down.
         if (this.runtime.closeProfile) {
           await waitForBrowserClose();
-          await this.runtime.closeProfile(profile.id, browserSessionId).catch(() => undefined);
+          await this.runtime.closeProfile(runtimeProfileId, browserSessionId).catch(() => undefined);
         }
         await this.prisma.browserSession.update({ where: { id: browserSessionId }, data: { status: 'CLOSED', closedAt: new Date() } });
       }

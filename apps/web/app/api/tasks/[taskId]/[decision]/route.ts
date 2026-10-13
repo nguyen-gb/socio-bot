@@ -6,8 +6,8 @@ export async function POST(
   context: { params: Promise<{ taskId: string; decision: string }> },
 ) {
   const { taskId, decision } = await context.params;
-  if (decision !== 'approve' && decision !== 'reject') {
-    return NextResponse.json({ message: 'Invalid decision' }, { status: 404 });
+  if (!['approve', 'reject', 'retry', 'retry-action', 'cancel', 'pause', 'resume'].includes(decision)) {
+    return NextResponse.json({ message: 'Invalid task operation' }, { status: 404 });
   }
   return forwardAuthenticated(
     request,

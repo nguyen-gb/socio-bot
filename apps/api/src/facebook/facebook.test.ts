@@ -411,7 +411,7 @@ test('approval schedules spacing independently for each account and dispatches o
   const writes: any[] = []; const starts: any[] = []; let committed = false;
   const jobs = ['a', 'a', 'b', 'b'].map((accountId, index) => ({ id: `job${index}`, workflowId: `task/job${index}`, accountId, approvalStatus: 'PENDING' }));
   const campaign = { id: 'campaign', approvedAt: null, payload: { intervalSeconds: 60 }, tasks: jobs };
-  const tx = { $executeRaw: async () => 0, platformAccount: { findMany: async () => ['a', 'b'].map(account) }, facebookCampaign: { updateMany: async () => ({ count: 1 }) }, task: { count: async () => 0, updateMany: async (input: any) => { writes.push(input); return { count: 1 }; } } };
+  const tx = { $executeRaw: async () => 0, platformAccount: { findMany: async () => ['a', 'b'].map(account) }, facebookCampaign: { updateMany: async () => ({ count: 1 }) }, task: { count: async () => 0, findMany: async () => [], updateMany: async (input: any) => { writes.push(input); return { count: 1 }; } } };
   const prisma = {
     facebookCampaign: { findFirst: async (input: any) => { assert.equal(input.where.organizationId, 'org'); return campaign; }, findUniqueOrThrow: async () => campaign },
     task: { count: async () => 0 }, platformAccount: { findMany: async () => ['a', 'b'].map(account) },
@@ -423,6 +423,20 @@ test('approval schedules spacing independently for each account and dispatches o
   assert.equal(starts[1][2].getTime() - starts[0][2].getTime(), 60000);
   assert.equal(starts[2][2].getTime(), starts[0][2].getTime());
   assert.equal(starts[3][2].getTime() - starts[2][2].getTime(), 60000);
+});
+test('approval appends to the per-profile queue instead of rejecting active campaigns', async () => {
+  const writes: any[] = []; const starts: any[] = []; const now = Date.now();
+  const jobs = [{ id: 'new-a-1', workflowId: 'task/new-a-1', accountId: 'a', approvalStatus: 'PENDING' }, { id: 'new-a-2', workflowId: 'task/new-a-2', accountId: 'a', approvalStatus: 'PENDING' }];
+  const campaign = { id: 'campaign', approvedAt: null, payload: { intervalSeconds: 60 }, tasks: jobs };
+  const active = [{ accountId: 'a', scheduledAt: new Date(now + 120_000) }, { accountId: 'b', scheduledAt: null }];
+  const tx = { $executeRaw: async () => 0, platformAccount: { findMany: async () => ['a'].map(account) }, facebookCampaign: { updateMany: async () => ({ count: 1 }) }, task: { findMany: async () => active, updateMany: async (input: any) => { writes.push(input); return { count: 1 }; } } };
+  const prisma = { facebookCampaign: { findFirst: async () => campaign, findUniqueOrThrow: async () => campaign }, platformAccount: { findMany: async () => ['a'].map(account) }, $transaction: async (callback: any) => callback(tx) };
+  const service = new FacebookService(prisma as never, {} as never, { startTask: async (...args: any[]) => starts.push(args) } as never);
+  await service.approve('org', 'campaign', 'admin');
+  assert.equal(starts.length, 2);
+  assert.ok(starts[0][2].getTime() >= now + 180_000);
+  assert.equal(starts[1][2].getTime() - starts[0][2].getTime(), 60_000);
+  assert.equal(writes[0].data.status, 'SCHEDULED');
 });
 test('cancel only touches not-started tasks in the workspace', async () => {
   let where: any;

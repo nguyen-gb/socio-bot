@@ -7,3 +7,4 @@ export * from './sessions';
 export * from './proxies';
 export * from './schedules';
 export * from './status';
+export * from './tiktok';

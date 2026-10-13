@@ -2,6 +2,14 @@ import { z } from 'zod';
 import { platformSchema } from './status';
 import { facebookGroupUrlSchema, facebookPostRecipientSourceSchema, facebookPostUrlSchema } from './facebook';
 import { facebookMediaIdsSchema } from './media';
+import {
+  autoCommentTikTokHomePayloadSchema,
+  commentTikTokVideosPayloadSchema,
+  likeTikTokCommentsPayloadSchema,
+  messageTikTokFollowersPayloadSchema,
+  replyTikTokCommentsPayloadSchema,
+  tiktokSearchVideosPayloadSchema,
+} from './tiktok';
 
 const baseActionSchema = z.object({
   platform: platformSchema,
@@ -100,8 +108,40 @@ export const commentFacebookGroupPostsActionSchema = baseActionSchema.extend({
   }),
 });
 
+const tiktokActionBase = baseActionSchema.extend({ platform: z.literal('TIKTOK') });
+
+export const searchTikTokVideosActionSchema = tiktokActionBase.extend({
+  action: z.literal('SEARCH_TIKTOK_VIDEOS'),
+  payload: tiktokSearchVideosPayloadSchema,
+});
+
+export const autoCommentTikTokHomeActionSchema = tiktokActionBase.extend({
+  action: z.literal('AUTO_COMMENT_TIKTOK_HOME'),
+  payload: autoCommentTikTokHomePayloadSchema,
+});
+
+export const commentTikTokVideosActionSchema = tiktokActionBase.extend({
+  action: z.literal('COMMENT_TIKTOK_VIDEOS'),
+  payload: commentTikTokVideosPayloadSchema,
+});
+
+export const replyTikTokCommentsActionSchema = tiktokActionBase.extend({
+  action: z.literal('REPLY_TIKTOK_COMMENTS'),
+  payload: replyTikTokCommentsPayloadSchema,
+});
+
+export const likeTikTokCommentsActionSchema = tiktokActionBase.extend({
+  action: z.literal('LIKE_TIKTOK_COMMENTS'),
+  payload: likeTikTokCommentsPayloadSchema,
+});
+
+export const messageTikTokFollowersActionSchema = tiktokActionBase.extend({
+  action: z.literal('MESSAGE_TIKTOK_FOLLOWERS'),
+  payload: messageTikTokFollowersPayloadSchema,
+});
+
 export function requiresExternalApproval(action: string): boolean {
-  return ['PUBLISH_POST', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action);
+  return ['PUBLISH_POST', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS', 'AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action);
 }
 
 export const platformActionSchema = z.discriminatedUnion('action', [
@@ -116,6 +156,12 @@ export const platformActionSchema = z.discriminatedUnion('action', [
   scanFacebookPostCommentsActionSchema,
   replyFacebookPostCommentsActionSchema,
   commentFacebookGroupPostsActionSchema,
+  searchTikTokVideosActionSchema,
+  autoCommentTikTokHomeActionSchema,
+  commentTikTokVideosActionSchema,
+  replyTikTokCommentsActionSchema,
+  likeTikTokCommentsActionSchema,
+  messageTikTokFollowersActionSchema,
 ]);
 export type PlatformAction = z.infer<typeof platformActionSchema>;
 

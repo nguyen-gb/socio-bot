@@ -1,4 +1,5 @@
 import type { ManagedBrowserSession } from '@socio/browser-runtime';
+import { gotoPlatformPage } from '@socio/platform-core';
 import type { BrowserContext } from 'playwright';
 import type { ProfileCredentials } from '../secrets/secrets.service';
 
@@ -23,7 +24,13 @@ async function hasAuthCookie(session: ManagedBrowserSession, platform: Supported
 
 export async function isPlatformChallenged(session: ManagedBrowserSession): Promise<boolean> {
   if (/\/(checkpoint|challenge|captcha)(\/|\?|$)/i.test(session.page.url())) return true;
-  return session.page.locator('iframe[src*="captcha"],input[name="captcha_response"]').first().isVisible();
+  if (await session.page.locator('iframe[src*="captcha"],input[name="captcha_response"], [class*="bdturing"], [id*="bdturing"]').first().isVisible()) return true;
+  try {
+    const signalText = await session.page.evaluate(() => document.body?.innerText ?? '');
+    return /bdturing|bdturing-verify|whirl|verify to continue|security verification|captcha|unusual traffic|too many requests|anti.?bot|robot|xác minh|bất thường/i.test(signalText);
+  } catch {
+    return false;
+  }
 }
 
 export async function isPlatformAuthenticated(session: ManagedBrowserSession, platform: SupportedPlatform): Promise<boolean> {
@@ -56,20 +63,30 @@ export async function initializePlatformSession(
     try { await session.context.addCookies(parseCookieInput(credentials.cookies, settings.home)); importedCookies = true; }
     catch { /* Invalid imports must not prevent password/manual fallback. */ }
   }
-  await session.page.goto(settings.home, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  await gotoPlatformPage(
+    session.page,
+    settings.home,
+    platform === 'TIKTOK' ? settings.login : undefined,
+  );
   await waitForLoginPage(session, platform);
   if (await isPlatformChallenged(session) || await isPlatformAuthenticated(session, platform)) return;
   if (credentials?.cookies && !importedCookies) {
     try {
       const cookies = parseCookieInput(credentials.cookies, settings.home);
       await session.context.addCookies(cookies);
-      await session.page.goto(settings.home, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      await gotoPlatformPage(
+        session.page,
+        settings.home,
+        platform === 'TIKTOK' ? settings.login : undefined,
+      );
       await waitForLoginPage(session, platform);
     } catch { /* A stale/invalid import must not suppress password/manual fallback. */ }
     if (await isPlatformChallenged(session) || await isPlatformAuthenticated(session, platform)) return;
   }
   if (credentials?.login && credentials.password) {
-    if (!session.page.url().includes('/login')) await session.page.goto(settings.login, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    if (!session.page.url().includes('/login')) {
+      await gotoPlatformPage(session.page, settings.login);
+    }
     await attemptPasswordLogin(platform, session, { login: credentials.login, password: credentials.password });
     await waitForLoginPage(session, platform);
   }
