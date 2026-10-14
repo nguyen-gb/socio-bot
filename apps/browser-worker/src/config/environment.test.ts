@@ -49,3 +49,23 @@ test('browser mode follows the environment default and accepts an explicit overr
     }
   }
 });
+
+
+test('browser locale and timezone reject malformed values before launching the worker', () => {
+  const previous = Object.fromEntries(['BROWSER_LOCALE', 'BROWSER_TIMEZONE_ID'].map(key => [key, process.env[key]]));
+  try {
+    process.env.BROWSER_LOCALE = 'en_US';
+    assert.throws(() => loadEnvironment(), /Invalid BROWSER_LOCALE/);
+    process.env.BROWSER_LOCALE = 'en-US';
+    process.env.BROWSER_TIMEZONE_ID = 'Mars/Olympus_Mons';
+    assert.throws(() => loadEnvironment(), /Invalid BROWSER_TIMEZONE_ID/);
+    process.env.BROWSER_TIMEZONE_ID = 'Asia/Ho_Chi_Minh';
+    assert.equal(loadEnvironment().browserLocale, 'en-US');
+    assert.equal(loadEnvironment().browserTimezoneId, 'Asia/Ho_Chi_Minh');
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});

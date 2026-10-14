@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -146,6 +147,46 @@ test('persistent Chromium profile survives a close and reopen', async () => {
   } finally {
     await runtime.closeAll();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('explicitly allowlisted localStorage is restored before page scripts run', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-browser-local-storage-'));
+  const profileId = '00000000-0000-4000-8000-000000000555';
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html' });
+    response.end('<script>document.title = localStorage.getItem("fixture-token") || "missing";</script>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port.toString()}`;
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7));
+  try {
+    const first = await runtime.openProfile({ profileId, headless: true, sessionStateOrigins: [origin] });
+    await first.page.goto(`${origin}/`);
+    await first.page.evaluate(() => window.localStorage.setItem('fixture-token', 'persisted-local-storage'));
+    await first.close();
+
+    // The persistent browser directory is deliberately removed so this test
+    // verifies the encrypted sidecar rather than Chromium's own profile.
+    const profilePath = join(root, profileId);
+    const sealed = await readFile(join(profilePath, 'session-cookies.enc'), 'utf8');
+    await rm(profilePath, { recursive: true, force: true });
+    await (await import('node:fs/promises')).mkdir(profilePath, { recursive: true });
+    await writeFile(join(profilePath, 'session-cookies.enc'), sealed, { mode: 0o600 });
+
+    const second = await runtime.openProfile({ profileId, headless: true, sessionStateOrigins: [origin] });
+    await second.page.goto(`${origin}/`);
+    assert.equal(await second.page.title(), 'persisted-local-storage');
+    await second.close();
+  } finally {
+    await runtime.closeAll();
+    await rm(root, { recursive: true, force: true });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 

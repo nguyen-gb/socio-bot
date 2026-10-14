@@ -323,7 +323,7 @@ export class BrowserTaskActivities {
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
                 await initializePlatformSession(session, 'FACEBOOK', credentials);
-                if (await isPlatformChallenged(session)) {
+                if (await isPlatformChallenged(session, 'FACEBOOK')) {
                   blocked = { ok: false, data: { requiresAction: true, accountChallenged: true, reason: 'Facebook yêu cầu xác minh/CAPTCHA. Hãy thao tác thủ công.' } };
                 }
                 if (!blocked && !(await isPlatformAuthenticated(session, 'FACEBOOK'))) {
@@ -335,7 +335,7 @@ export class BrowserTaskActivities {
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
                 await initializePlatformSession(session, 'TIKTOK', credentials);
-                if (await isPlatformChallenged(session)) {
+                if (await isPlatformChallenged(session, 'TIKTOK')) {
                   blocked = { ok: false, data: { requiresAction: true, accountChallenged: true, reason: 'TikTok yêu cầu xác minh/CAPTCHA. Hãy thao tác thủ công.' } };
                 }
                 if (!blocked && !(await isPlatformAuthenticated(session, 'TIKTOK'))) {
@@ -379,7 +379,21 @@ export class BrowserTaskActivities {
                   session.signal?.throwIfAborted();
                 },
               };
-              const actionResult = blocked ?? await adapter.execute(action, actionSession);
+              let actionResult = blocked ?? await adapter.execute(action, actionSession);
+              // An adapter can finish on a new verification screen without
+              // throwing (for example a challenge appears after navigation).
+              // Do not record that as an ordinary success or retry the action.
+              if (!blocked && !tiktokSearchAction && await isPlatformChallenged(session, action.platform)) {
+                actionResult = {
+                  ok: false,
+                  data: {
+                    ...actionResult.data,
+                    requiresAction: true,
+                    accountChallenged: true,
+                    reason: `${action.platform} yêu cầu xác minh. Hãy hoàn tất CAPTCHA/xác minh thủ công trên browser trước khi tiếp tục.`,
+                  },
+                };
+              }
               if (!actionResult.ok) {
                 retainTrace = true;
                 await this.artifacts

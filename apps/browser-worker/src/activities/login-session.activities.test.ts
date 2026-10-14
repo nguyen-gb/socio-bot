@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Context } from '@temporalio/activity';
 import { LoginSessionActivities, parseCookieInput } from './login-session.activities';
-import { initializePlatformSession, isPlatformAuthenticated } from './platform-login';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged } from './platform-login';
 
 test('cookie header is scoped to the selected platform URL', () => {
   const cookies = parseCookieInput(
@@ -190,4 +190,42 @@ test('cookie JSON rejects domains outside the selected platform', () => {
       'https://www.instagram.com/',
     ),
   );
+});
+
+test('challenge recognition does not treat ordinary feed text about CAPTCHA as a challenge', async () => {
+  const { classifyChallengePage } = await import('./challenge-signals.js');
+  assert.equal(classifyChallengePage({ url: 'https://www.facebook.com/groups/123', title: 'My group', bodyText: 'A long article about CAPTCHA and robot verification, with multiple links and news'.repeat(15) }), null);
+  assert.equal(classifyChallengePage({ url: 'https://x.com/home', title: 'Home / X', foregroundText: 'Latest comments about AI robots' }), null);
+  assert.equal(classifyChallengePage({ url: 'https://www.tiktok.com/challenge/123' }), 'url');
+  assert.equal(classifyChallengePage({ url: 'https://www.instagram.com/', visibleWidget: true }), 'visible_widget');
+  assert.equal(classifyChallengePage({ url: 'https://www.facebook.com/', title: 'Security verification' }), 'page_title');
+  assert.equal(classifyChallengePage({ url: 'https://www.facebook.com/', foregroundText: 'Verify you are human to continue' }), 'foreground_message');
+  assert.equal(classifyChallengePage({ url: 'https://www.facebook.com/', bodyText: 'Security verification is required to continue' }), 'short_interstitial');
+});
+
+test('TikTok challenge nodes expose their visible verification text to the shared detector', async () => {
+  let selector = '';
+  let evaluateSource = '';
+  const session = {
+    page: {
+      url: () => 'https://www.tiktok.com/',
+      locator: (value: string) => {
+        selector = value;
+        return { first: () => ({ isVisible: async () => false }) };
+      },
+      evaluate: async (pageFunction: unknown) => {
+        evaluateSource = String(pageFunction);
+        return {
+          title: 'TikTok',
+          foregroundText: '',
+          visibleChallengeText: 'Verify to continue',
+          bodyText: '',
+        };
+      },
+    },
+  };
+
+  assert.equal(await isPlatformChallenged(session as never, 'TIKTOK'), true);
+  assert.match(selector, /data-e2e\*="captcha"/i);
+  assert.match(evaluateSource, /data-e2e\*="verify"/i);
 });

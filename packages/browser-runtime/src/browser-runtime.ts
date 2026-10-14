@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import type { PlatformSession } from '@socio/platform-core';
 import { SlotPool, type SlotLease } from './slot-pool';
-import { ProfileSessionCookies } from './profile-session-cookies';
+import { ProfileSessionCookies, type ProfileSessionStateOptions } from './profile-session-cookies';
 import { BrowserProcessRegistry, type BrowserProcessRecord } from './browser-process';
 import { withDeadline } from './deadline';
 
@@ -38,6 +38,8 @@ export interface OpenProfileOptions {
   ephemeral?: boolean;
   /** Send the standard Do Not Track preference without changing browser identity. */
   privacyMode?: boolean;
+  /** Explicit first-party origins whose localStorage may be persisted with the session. */
+  sessionStateOrigins?: readonly string[];
 }
 
 export interface ManagedBrowserSession extends PlatformSession {
@@ -60,6 +62,7 @@ interface ActiveSession {
   abort: AbortController;
   forcing?: Promise<void>;
   persistenceAbort: AbortController;
+  sessionState: ProfileSessionStateOptions;
 }
 
 export class BrowserRuntime {
@@ -149,7 +152,11 @@ export class BrowserRuntime {
       context.setDefaultTimeout(15_000);
       context.setDefaultNavigationTimeout(45_000);
       if (!options.ephemeral) {
-        await withDeadline(this.cookies.restore(profilePath, options.profileId, context), 10_000, 'Cookie restore timed out');
+        await withDeadline(
+          this.cookies.restore(profilePath, options.profileId, context, { localStorageOrigins: options.sessionStateOrigins }),
+          10_000,
+          'Cookie restore timed out',
+        );
       }
     } catch (error) {
       try {
@@ -172,6 +179,7 @@ export class BrowserRuntime {
       record,
       abort,
       persistenceAbort: new AbortController(),
+      sessionState: { localStorageOrigins: options.sessionStateOrigins },
     };
     this.sessions.set(options.profileId, active);
     context.once('close', () => {
@@ -219,7 +227,13 @@ export class BrowserRuntime {
         try {
           await withDeadline((async () => {
             if (!active.ephemeral) {
-              await this.cookies.save(active.profilePath, profileId, active.context, active.persistenceAbort.signal);
+              await this.cookies.save(
+                active.profilePath,
+                profileId,
+                active.context,
+                active.persistenceAbort.signal,
+                active.sessionState,
+              );
             }
             await active.context.close();
             if (active.ephemeral) await this.removeEphemeralProfile(active.profilePath);
@@ -245,7 +259,7 @@ export class BrowserRuntime {
     if (ownerId && active.record.ownerId !== ownerId) return;
     if (!active.forcing) active.forcing = (async () => {
       active.abort.abort(new Error('Browser was force closed'));
-      active.persistenceAbort.abort(new Error('Browser cookie save cancelled'));
+      active.persistenceAbort.abort(new Error('Browser session state save cancelled'));
       await this.processes.terminate(active.record);
       if (active.ephemeral) await this.removeEphemeralProfile(active.profilePath);
       this.release(profileId, active);

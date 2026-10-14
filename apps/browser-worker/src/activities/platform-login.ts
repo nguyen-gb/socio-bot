@@ -2,6 +2,7 @@ import type { ManagedBrowserSession } from '@socio/browser-runtime';
 import { gotoPlatformPage } from '@socio/platform-core';
 import type { BrowserContext } from 'playwright';
 import type { ProfileCredentials } from '../secrets/secrets.service';
+import { classifyChallengePage } from './challenge-signals';
 
 export const PLATFORM_LOGIN = {
   FACEBOOK: { home: 'https://www.facebook.com/', login: 'https://www.facebook.com/login/', authCookies: ['c_user'] },
@@ -22,12 +23,61 @@ async function hasAuthCookie(session: ManagedBrowserSession, platform: Supported
   return (await session.context.cookies(settings.home)).some(cookie => settings.authCookies.includes(cookie.name as never) && !!cookie.value);
 }
 
-export async function isPlatformChallenged(session: ManagedBrowserSession): Promise<boolean> {
-  if (/\/(checkpoint|challenge|captcha)(\/|\?|$)/i.test(session.page.url())) return true;
-  if (await session.page.locator('iframe[src*="captcha"],input[name="captcha_response"], [class*="bdturing"], [id*="bdturing"]').first().isVisible()) return true;
+export async function isPlatformChallenged(
+  session: ManagedBrowserSession,
+  platform?: SupportedPlatform,
+): Promise<boolean> {
+  const url = session.page.url();
+  // Route-only checks are fast and work even if the tab is no longer usable.
+  if (classifyChallengePage({ url })) return true;
   try {
-    const signalText = await session.page.evaluate(() => document.body?.innerText ?? '');
-    return /bdturing|bdturing-verify|whirl|verify to continue|security verification|captcha|unusual traffic|too many requests|anti.?bot|robot|xác minh|bất thường/i.test(signalText);
+    // Query visible elements directly: the first matching element may be
+    // hidden while another CAPTCHA iframe/dialog is visible.
+    const widgetSelectors = [
+      'iframe[src*="captcha" i]:visible',
+      'iframe[src*="recaptcha" i]:visible',
+      'iframe[src*="hcaptcha" i]:visible',
+      'iframe[src*="challenges.cloudflare.com" i]:visible',
+      'input[name="captcha_response"]:visible',
+      '[class*="bdturing" i]:visible',
+      '[id*="bdturing" i]:visible',
+      ...(platform === 'TIKTOK' ? [
+        '[data-e2e*="captcha" i]:visible',
+        '[data-e2e*="bdturing" i]:visible',
+      ] : []),
+    ];
+    const visibleWidget = await session.page.locator(widgetSelectors.join(',')).first().isVisible();
+    if (visibleWidget) return true;
+  } catch { /* A closed page cannot be inspected; never classify as verified. */ }
+  try {
+    const snapshot = await session.page.evaluate((platformName?: string) => {
+      const visible = (element: Element) => {
+        const style = window.getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+      };
+      const foregroundText = [...document.querySelectorAll('h1,h2,[role="alert"],[role="dialog"]')]
+        .filter(visible).slice(0, 8).map(element => (element as HTMLElement).innerText || '').join(' ').slice(0, 1200);
+      const visibleChallengeText = platformName === 'TIKTOK'
+        ? [...document.querySelectorAll<HTMLElement>([
+          '[data-e2e*="captcha" i]',
+          '[data-e2e*="verify" i]',
+          '[class*="captcha" i]',
+          '[class*="verify" i]',
+          '[class*="bdturing" i]',
+          '[id*="captcha" i]',
+          '[id*="verify" i]',
+          '[id*="bdturing" i]',
+        ].join(','))]
+          .filter(visible)
+          .slice(0, 8)
+          .map(element => `${element.innerText || ''} ${element.getAttribute('aria-label') || ''}`)
+          .join(' ')
+          .trim()
+          .slice(0, 1200)
+        : '';
+      return { title: document.title, foregroundText, visibleChallengeText, bodyText: document.body?.innerText?.trim().slice(0, 401) ?? '' };
+    }, platform);
+    return classifyChallengePage({ url, ...snapshot }) !== null;
   } catch {
     return false;
   }
@@ -38,7 +88,7 @@ export async function isPlatformAuthenticated(session: ManagedBrowserSession, pl
   try { url = new URL(session.page.url()); } catch { return false; }
   const baseHost = new URL(PLATFORM_LOGIN[platform].home).hostname.replace(/^www\./, '');
   if (url.hostname !== baseHost && !url.hostname.endsWith(`.${baseHost}`)) return false;
-  if (/\/(login|checkpoint|challenge|captcha)(\/|$)/i.test(url.pathname) || await isPlatformChallenged(session)) return false;
+  if (/\/(login|checkpoint|challenge|captcha)(\/|$)/i.test(url.pathname) || await isPlatformChallenged(session, platform)) return false;
   if (!(await hasAuthCookie(session, platform))) return false;
   if (await session.page.locator('input[type="password"]:visible').first().isVisible()) return false;
   if (platform === 'FACEBOOK') {
@@ -69,7 +119,7 @@ export async function initializePlatformSession(
     platform === 'TIKTOK' ? settings.login : undefined,
   );
   await waitForLoginPage(session, platform);
-  if (await isPlatformChallenged(session) || await isPlatformAuthenticated(session, platform)) return;
+  if (await isPlatformChallenged(session, platform) || await isPlatformAuthenticated(session, platform)) return;
   if (credentials?.cookies && !importedCookies) {
     try {
       const cookies = parseCookieInput(credentials.cookies, settings.home);
@@ -81,7 +131,7 @@ export async function initializePlatformSession(
       );
       await waitForLoginPage(session, platform);
     } catch { /* A stale/invalid import must not suppress password/manual fallback. */ }
-    if (await isPlatformChallenged(session) || await isPlatformAuthenticated(session, platform)) return;
+    if (await isPlatformChallenged(session, platform) || await isPlatformAuthenticated(session, platform)) return;
   }
   if (credentials?.login && credentials.password) {
     if (!session.page.url().includes('/login')) {

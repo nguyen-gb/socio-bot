@@ -97,8 +97,8 @@ export function loadEnvironment(): WorkerEnvironment {
     // connection needs more time (for example BROWSER_CLOSE_DELAY_MS=10000).
     browserCloseDelayMs: positiveInteger(process.env.BROWSER_CLOSE_DELAY_MS, 5_000),
     browserChannel: optionalString(process.env.BROWSER_CHANNEL),
-    browserLocale: optionalString(process.env.BROWSER_LOCALE),
-    browserTimezoneId: optionalString(process.env.BROWSER_TIMEZONE_ID),
+    browserLocale: browserLocale(process.env.BROWSER_LOCALE),
+    browserTimezoneId: browserTimezone(process.env.BROWSER_TIMEZONE_ID),
     tiktokSearchMode,
     tiktokSearchFixtureScenario,
     redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
@@ -160,4 +160,21 @@ function enumValue<const T extends readonly string[]>(
     throw new Error(`Expected one of ${allowed.join(', ')}, received ${resolved}`);
   }
   return resolved as T[number];
+}
+
+/** Fail fast on invalid standard browser settings instead of repeatedly
+ * failing task launches and retrying a broken configuration. */
+function browserLocale(value: string | undefined): string | undefined {
+  const locale = optionalString(value);
+  if (!locale) return undefined;
+  try { return Intl.getCanonicalLocales(locale)[0]; }
+  catch { throw new Error(`Invalid BROWSER_LOCALE: ${locale}`); }
+}
+
+function browserTimezone(value: string | undefined): string | undefined {
+  const timezone = optionalString(value);
+  if (!timezone) return undefined;
+  try { new Intl.DateTimeFormat('en-US', { timeZone: timezone }); }
+  catch { throw new Error(`Invalid BROWSER_TIMEZONE_ID: ${timezone}`); }
+  return timezone;
 }

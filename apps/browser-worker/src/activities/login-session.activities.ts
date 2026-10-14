@@ -157,7 +157,7 @@ export class LoginSessionActivities {
             const checking = { ...managed, page: platformPage };
             try {
               const authenticated = await withDeadline(isPlatformAuthenticated(checking, platform), 10_000, 'Browser login check timed out');
-              status = authenticated ? 'READY' : await withDeadline(isPlatformChallenged(checking), 5_000, 'Browser challenge check timed out') ? 'CHALLENGED' : 'LOGIN_REQUIRED';
+              status = authenticated ? 'READY' : await withDeadline(isPlatformChallenged(checking, platform), 5_000, 'Browser challenge check timed out') ? 'CHALLENGED' : 'LOGIN_REQUIRED';
             } catch (error) { if (!platformPage.isClosed()) throw error; }
           }
           if (status !== reportedStatus) {

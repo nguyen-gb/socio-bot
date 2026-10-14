@@ -53,7 +53,8 @@ test('successful random-member messages are persisted and reserved recipients ar
   assert.equal(await (service as any).reserveMessageRecipient({ organizationId: 'org', accountId: id, taskId: 'another-task', groupUrl: 'https://www.facebook.com/groups/123/', profileUrl: 'https://www.facebook.com/100028475506542' }), false);
 });
 const task = (override: Record<string, unknown> = {}) => ({ id, accountId: id, action: 'JOIN_FACEBOOK_GROUP', platform: 'FACEBOOK', payload: { groupUrl: 'https://www.facebook.com/groups/123/' }, status: 'QUEUED', approvalStatus: 'APPROVED', attemptCount: 0, maxAttempts: 1, account: { status: 'READY', browserProfile: { id: 'profile', sessions: [] } }, ...override });
-async function scenario(row: any, attempt = 1, claim = 0, workflowId?: string) {
+type ScenarioContext = { result: any; error?: unknown; opened: boolean; updates: any[]; leased: boolean };
+async function scenario(row: any, attempt = 1, claim = 0, workflowId?: string): Promise<ScenarioContext> {
   const updates: any[] = []; let opened = false; let leased = false;
   const original = Context.current;
   Context.current = () => ({ heartbeat: () => {}, info: { attempt } }) as unknown as Context;
@@ -70,7 +71,7 @@ async function scenario(row: any, attempt = 1, claim = 0, workflowId?: string) {
       const result = await service.executeBrowserTask({ taskId: id, workflowId });
       return { result, opened, updates, leased };
     } catch (error) {
-      return { error, opened, updates, leased };
+      return { result: undefined, error, opened, updates, leased };
     }
   } finally { Context.current = original; }
 }
@@ -129,6 +130,96 @@ test('proxy or interactive browser changed after approval stops before sending',
   ]) {
     const context = await scenario(task({ account }));
     assert.equal(context.opened, false); assert.equal(context.result.data?.requiresAction, true);
+  }
+});
+
+test('challenge appearing after an adapter result becomes manual action and marks the account challenged', async () => {
+  const original = Context.current;
+  Context.current = () => ({ heartbeat: () => {}, info: { attempt: 1 } }) as unknown as Context;
+  try {
+    let pageUrl = 'about:blank';
+    let taskStatus: string | undefined;
+    let accountStatus: string | undefined;
+    let runResult: Record<string, unknown> | undefined;
+    const row = {
+      id,
+      organizationId: 'org',
+      accountId: id,
+      action: 'HEALTH_CHECK',
+      platform: 'TIKTOK',
+      payload: {},
+      status: 'QUEUED',
+      approvalStatus: 'NOT_REQUIRED',
+      attemptCount: 0,
+      maxAttempts: 1,
+      workflowId: undefined,
+      cancelledAt: null,
+      pausedAt: null,
+      campaign: null,
+      account: {
+        status: 'READY',
+        browserProfile: { id: 'profile', metadata: {}, sessions: [] },
+        proxyBinding: null,
+      },
+    };
+    const page = {
+      url: () => pageUrl,
+      title: async () => 'TikTok challenge',
+      goto: async (target: string) => {
+        pageUrl = target === 'https://www.tiktok.com/'
+          ? 'https://www.tiktok.com/challenge/123'
+          : target;
+      },
+      locator: () => ({ count: async () => 0 }),
+      on: () => {},
+      off: () => {},
+    };
+    const context = { tracing: { start: async () => {}, stop: async () => {} } };
+    const prisma = {
+      task: {
+        findUnique: async () => row,
+        findUniqueOrThrow: async () => row,
+        updateMany: async () => ({ count: 1 }),
+        update: async ({ data }: any) => { taskStatus = data.status; },
+      },
+      platformAccount: {
+        update: async ({ data }: any) => { accountStatus = data.status; },
+        updateMany: async () => ({ count: 0 }),
+      },
+      browserProfile: { update: async () => {}, updateMany: async () => ({ count: 0 }) },
+      browserSession: {
+        create: async () => ({ id: 'browser-session' }),
+        updateMany: async () => ({ count: 1 }),
+        update: async () => {},
+      },
+      taskRun: {
+        create: async () => ({ id: 'run' }),
+        update: async ({ data }: any) => { runResult = data.result; },
+      },
+      $transaction: async (input: any) => typeof input === 'function' ? input(prisma) : Promise.all(input),
+    };
+    const service = new BrowserTaskActivities(
+      prisma as never,
+      { withLease: async (_profileId: string, callback: any) => callback() } as never,
+      { workerId: 'worker' } as never,
+      { restore: async () => {}, capture: async () => {} } as never,
+      { temporaryPath: async () => 'fixture.har', captureScreenshot: async () => {}, captureFailure: async () => {}, captureTrace: async () => {}, captureConsoleLog: async () => {}, captureHar: async () => {} } as never,
+      {} as never,
+      { get: (name: string) => name === 'browserCloseDelayMs' ? 0 : undefined } as never,
+      { withProfile: async (_options: unknown, callback: any) => callback({ page, context, profileId: 'profile', slot: 0 }) } as never,
+      {} as never,
+    );
+
+    const result = await service.executeBrowserTask({ taskId: id });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.data?.requiresAction, true);
+    assert.equal(result.data?.accountChallenged, true);
+    assert.equal(taskStatus, 'REQUIRES_ACTION');
+    assert.equal(accountStatus, 'CHALLENGED');
+    assert.equal((runResult?.sideEffectStarted as boolean | undefined), false);
+  } finally {
+    Context.current = original;
   }
 });
 

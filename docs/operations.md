@@ -60,10 +60,29 @@ Back up PostgreSQL and the object-storage volume together. Profile snapshot rows
 
 ### Browser compatibility
 
-The worker can use a locally installed Chrome-compatible channel with `BROWSER_CHANNEL=chrome`, and set `BROWSER_LOCALE`/`BROWSER_TIMEZONE_ID` to match the authorized profile. Campaign/automation mode follows `NODE_ENV` by default, with `BROWSER_HEADLESS` available as an explicit override for a local headed run. Interactive sessions opened from **Profiles** use the same browser mode. The runtime uses persistent profiles, native user-agent, normal viewport behavior, touch/device defaults, enabled service workers and a maximized headed window. TikTok Search uses one shared anonymous profile at `PROFILE_ROOT/search-tiktok-anonymous` for all search campaigns; it never restores the account's logged-in profile snapshot, and the shared profile lease serializes those campaigns. Search also sends the standard `DNT: 1` preference, but websites may choose not to honor it. The runtime deliberately does not spoof `navigator.webdriver`, disable security features, rotate fingerprints or bypass CAPTCHA; verification still requires manual action.
+The worker can use a locally installed Chrome-compatible channel with `BROWSER_CHANNEL=chrome`, and set `BROWSER_LOCALE`/`BROWSER_TIMEZONE_ID` to match the authorized profile. Campaign/automation mode follows `NODE_ENV` by default, with `BROWSER_HEADLESS` available as an explicit override for a local headed run. Interactive sessions opened from **Profiles** use the same browser mode. The runtime uses persistent profiles, native user-agent, normal viewport behavior, touch/device defaults, enabled service workers and a maximized headed window. TikTok Search uses one shared anonymous profile at `PROFILE_ROOT/search-tiktok-anonymous` for all search campaigns; it never restores the account's logged-in profile snapshot, and the shared profile lease serializes those campaigns. Search does not inject a synthetic `DNT: 1` header; the browser uses its native privacy settings. The runtime deliberately does not spoof `navigator.webdriver`, disable security features, rotate fingerprints or bypass CAPTCHA; verification still requires manual action.
 
 For deterministic product/workflow tests, set `TIKTOK_SEARCH_MODE=fixture` outside production. The fixture provider supports `TIKTOK_SEARCH_FIXTURE_SCENARIO=success|empty|challenge`, exercises the same adapter/task result contract, and makes no request to TikTok. Production rejects fixture mode at worker startup. Live mode remains the only mode that uses TikTok's real Search UI, and a CAPTCHA/anti-bot challenge is surfaced as `REQUIRES_ACTION` for manual handling.
 
 Reviewed Facebook group join/text-post campaigns are enabled separately from the generic connector. See [facebook.md](facebook.md). Test on authorized groups before use; questions, CAPTCHA, account restrictions and ambiguous outcomes require manual action.
 
 `PUBLISH_POST` requests require ADMIN approval and remain held as `DRAFT`. This repository does not send them to an external platform by default. Enabling a real connector requires explicit authorization for the target Page/account, a platform-issued token supplied through a secret provider, and a staging verification before production dispatch.
+
+### Interactive verification handling
+
+When a platform presents a verification screen, the browser worker records the
+account as `CHALLENGED` and leaves the task in `REQUIRES_ACTION` rather than
+recording a false success. Use the account's interactive browser session to
+complete the verification manually, then confirm the account is `READY` before
+resuming work. A completed challenge is not solved programmatically and should
+not cause the system to replay an uncertain posting/message action.
+
+Challenge detection examines visible widgets, checkpoint routes and high-signal
+page titles/headings; it deliberately does not treat incidental feed text about
+robots or CAPTCHA as proof that an account was challenged. Workers check after
+adapter execution as well as before authenticated actions. A short interstitial
+may be recognized from body text, but normal longer feeds are ignored.
+
+`TIKTOK_SEARCH_MODE=fixture` can be used to exercise success, empty and
+challenge handling without contacting the live platform. This is intentionally
+restricted to non-production environments.
