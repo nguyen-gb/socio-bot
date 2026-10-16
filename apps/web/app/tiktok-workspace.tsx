@@ -9,7 +9,7 @@ import { useToast, useToastError } from './toast';
 
 interface Account { id: string; username?: string; platform: string; status: string }
 interface MediaAsset { id: string; fileName: string; contentType: string; status: string }
-interface VideoRow { videoUrl: string; videoId?: string; username?: string; description?: string; thumbnailUrl?: string; likes?: number; views?: number; comments?: number; statsSource?: 'TIKTOK_VIDEO_STATS' }
+interface VideoRow { videoUrl: string; videoId?: string; title?: string; username?: string; profileUrl?: string; description?: string; thumbnailUrl?: string; likes?: number; publishedAt?: string; views?: number; comments?: number; statsSource?: 'TIKTOK_VIDEO_STATS' }
 interface TikTokPayload { name?: string; query?: string; username?: string; videoUrls?: string[]; text?: string; mediaAssetIds?: string[]; maxVideos?: number; maxFollowers?: number; maxReplies?: number; maxLikes?: number; minLikes?: number; intervalSeconds?: number }
 interface TaskItem { id: string; action: string; status: string; approvalStatus?: string; attemptCount?: number; createdAt: string; lastError?: string; pausedAt?: string | null; cancelledAt?: string | null; account: Account; payload?: TikTokPayload; runs?: Array<{ result?: unknown }> }
 interface TikTokWorkspaceProps { accounts: Account[]; canOperate: boolean; canAdmin: boolean; onNavigateProfiles: () => void }
@@ -122,7 +122,7 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
   const [accountId, setAccountId] = useState('');
   const [name, setName] = useState('');
   const [query, setQuery] = useState('');
-  const [maxVideos, setMaxVideos] = useState(30);
+  const [maxVideos, setMaxVideos] = useState(100);
   const [minLikes, setMinLikes] = useState<number>();
   const [maxLikesFilter, setMaxLikesFilter] = useState<number>();
   const [minViews, setMinViews] = useState<number>();
@@ -358,7 +358,7 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
       <DividerLike title="Thiết lập Search video" />
       <div className="tiktok-search-row">
         <Field label="Từ khóa"><Input value={query} onChange={event => setQuery(event.target.value)} placeholder="Ví dụ: áo khoác nam" /></Field>
-        <NumberField label="Số video tối đa" value={maxVideos} onChange={value => setMaxVideos(value ?? 30)} min={1} max={100} />
+        <NumberField label="Số video tối đa" value={maxVideos} onChange={value => setMaxVideos(value ?? 100)} min={1} max={100} />
       </div>
       <div className="tiktok-filter-grid">
         <NumberField label="Tim tối thiểu" value={minLikes} onChange={setMinLikes} min={0} placeholder="Bỏ qua" />
@@ -456,8 +456,8 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
           {selectedCampaign.action === 'SEARCH_TIKTOK_VIDEOS' ? <>
             <Alert type={selectedCampaign.status === 'SUCCEEDED' ? 'info' : 'warning'} showIcon title={selectedCampaign.status === 'SUCCEEDED' ? `${selectedResults.length} video đã được lưu trong campaign` : 'Campaign Search cần xử lý trước khi có kết quả'} description={selectedCampaign.status === 'SUCCEEDED' ? 'Search campaign chỉ lưu metadata. Nếu cần, chọn các video rồi mở dialog campaign hành động; nếu không thì chỉ cần đóng phần kết quả này.' : selectedCampaign.lastError ?? 'Search dùng user-data tạm và không yêu cầu profile TikTok đăng nhập; chỉ cần chạy lại nếu UI TikTok gặp lỗi.'} action={selectedCampaign.status === 'SUCCEEDED' ? undefined : <Space>{['FAILED', 'REQUIRES_ACTION'].includes(selectedCampaign.status) ? <Button type="primary" disabled={!canOperate} loading={retryingId === selectedCampaign.id} onClick={() => retryTask(selectedCampaign)}>Chạy lại Search</Button> : null}</Space>} />
             <Alert type="info" showIcon title="Nguồn số liệu Search" description="Trang Search của TikTok chỉ cung cấp số tim trên card. View và comment chỉ hiển thị khi TikTok trả về video stats xác thực; hệ thống không dùng số tim thay thế." />
-            <Table<VideoRow> rowKey="videoUrl" size="small" scroll={{ x: 900 }} dataSource={selectedResults} pagination={{ pageSize: 8, hideOnSinglePage: true }} rowSelection={{ selectedRowKeys: selectedVideoUrls, onChange: keys => setSelectedVideoUrls(keys.map(String)) }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có video metadata" /> }} columns={[
-              { title: 'Video', render: (_: unknown, video: VideoRow) => <Flex gap={10} align="center"><div className="tiktok-thumb">{video.thumbnailUrl ? <img src={video.thumbnailUrl} alt="" /> : '♪'}</div><div className="tiktok-video-cell"><a href={video.videoUrl} target="_blank" rel="noreferrer">{video.username ?? video.videoId ?? 'Mở video'}</a><small>{video.description ?? video.videoUrl}</small></div></Flex> },
+            <Table<VideoRow> rowKey="videoUrl" size="small" scroll={{ x: 900 }} dataSource={selectedResults} pagination={{ pageSize: 100, hideOnSinglePage: true, showTotal: total => `${total} video` }} rowSelection={{ preserveSelectedRowKeys: true, selectedRowKeys: selectedVideoUrls, onChange: keys => setSelectedVideoUrls(current => { const visibleKeys = new Set(selectedResults.map(video => video.videoUrl)); const preserved = current.filter(key => !visibleKeys.has(key)); return [...preserved, ...keys.map(String)]; }) }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có video metadata" /> }} columns={[
+              { title: 'Video', render: (_: unknown, video: VideoRow) => { const username = video.username?.replace(/^@/, ''); const profileUrl = video.profileUrl ?? (username ? `https://www.tiktok.com/@${encodeURIComponent(username)}` : undefined); return <Flex gap={10} align="center"><div className="tiktok-thumb">{video.thumbnailUrl ? <img src={video.thumbnailUrl} alt="" /> : '♪'}</div><div className="tiktok-video-cell"><a href={video.videoUrl} target="_blank" rel="noreferrer">{video.title ?? video.description ?? video.videoId ?? 'Mở video'}</a><small>{profileUrl ? <a href={profileUrl} target="_blank" rel="noreferrer">{video.username}</a> : 'Không rõ người đăng'}</small><small>{video.publishedAt ?? 'Không rõ ngày đăng'}</small></div></Flex>; } },
               { title: 'Tim', dataIndex: 'likes', render: (value: number) => numberLabel(value) },
               { title: 'View', dataIndex: 'views', render: (value: number) => numberLabel(value) },
               { title: 'Cmt', dataIndex: 'comments', render: (value: number) => numberLabel(value) },

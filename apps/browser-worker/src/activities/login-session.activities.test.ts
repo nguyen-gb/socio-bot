@@ -94,7 +94,7 @@ test('invalid cookie input falls back to password, or remains open for manual lo
   assert.equal(manual.events.includes('close'), false);
 });
 
-test('TikTok login falls back to the login route when the entry route is rejected without a body', async () => {
+test('TikTok login keeps the root entry when Chromium reports a root navigation race', async () => {
   const targets: string[] = [];
   let currentUrl = 'about:blank';
   const locator = () => ({
@@ -124,11 +124,43 @@ test('TikTok login falls back to the login route when the entry route is rejecte
 
   await initializePlatformSession(session as never, 'TIKTOK');
 
-  assert.deepEqual(targets, [
-    'https://www.tiktok.com/',
-    'https://www.tiktok.com/login',
-  ]);
-  assert.equal(currentUrl, 'https://www.tiktok.com/login');
+  assert.deepEqual(targets, ['https://www.tiktok.com/']);
+  assert.equal(currentUrl, 'about:blank');
+});
+
+test('TikTok direct-entry options still start at the root before the action opens a profile', async () => {
+  const targets: string[] = [];
+  let currentUrl = 'about:blank';
+  const locator = () => ({
+    first: () => locator(),
+    isVisible: async () => false,
+  });
+  const session = {
+    profileId: 'profile',
+    slot: 0,
+    context: {
+      cookies: async () => [{ name: 'sessionid', value: 'fresh-session' }],
+      addCookies: async () => {},
+    },
+    page: {
+      url: () => currentUrl,
+      locator,
+      goto: async (target: string, options?: { waitUntil?: string }) => {
+        targets.push(target);
+        currentUrl = target;
+      },
+      waitForTimeout: async () => {},
+    },
+  };
+
+  await initializePlatformSession(session as never, 'TIKTOK', undefined, {
+    entryUrl: 'https://www.tiktok.com/@army2.space',
+    allowLoginFallback: false,
+    allowPasswordLogin: false,
+  });
+
+  assert.deepEqual(targets, ['https://www.tiktok.com/']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/');
 });
 
 test('CAPTCHA does not trigger password submission or claim READY', async () => {

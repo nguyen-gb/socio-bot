@@ -9,11 +9,13 @@ import {
 import {
   autoCommentTikTokHome,
   commentTikTokVideos,
+  enterTikTokRoot,
   likeTikTokComments,
   messageTikTokFollowers,
   replyTikTokComments,
   searchTikTokVideos,
   type TikTokSearchProvider,
+  type TikTokRotateCaptchaSolver,
   TikTokSearchAutomationError,
   TikTokVerificationRequiredError,
 } from './tiktok-automation';
@@ -98,7 +100,10 @@ export class XAdapter extends WebPlatformAdapter {
 
 export class TikTokAdapter extends WebPlatformAdapter {
   readonly platform = 'TIKTOK' as const;
-  constructor(private readonly options: { searchProvider?: TikTokSearchProvider } = {}) {
+  constructor(private readonly options: {
+    searchProvider?: TikTokSearchProvider;
+    captchaSolver?: TikTokRotateCaptchaSolver;
+  } = {}) {
     super();
   }
 
@@ -117,6 +122,11 @@ export class TikTokAdapter extends WebPlatformAdapter {
     if (action.action === 'HEALTH_CHECK' || action.action === 'GET_PROFILE') {
       return super.execute(action, session);
     }
+    // TikTok owns the first route transition: always start at its ordinary
+    // root and use commit so a client-side redirect is not mistaken for a
+    // failed navigation. The action itself decides which surface to open
+    // next (search, For You, profile, or video).
+    await enterTikTokRoot(session.page);
     // The worker initializes/authenticates sessions for side-effect actions.
     // Search is the read-only exception: it runs in a fresh anonymous context
     // and must not be rejected just because that context has no login.
@@ -131,7 +141,7 @@ export class TikTokAdapter extends WebPlatformAdapter {
         try {
           videos = this.options.searchProvider
             ? await this.options.searchProvider.search(action.payload.query, action.payload.maxVideos)
-            : await searchTikTokVideos(session, action.payload.query, action.payload.maxVideos);
+            : await searchTikTokVideos(session, action.payload.query, action.payload.maxVideos, this.options.captchaSolver);
         } catch (error) {
           if (error instanceof TikTokVerificationRequiredError) {
             return {
@@ -157,17 +167,48 @@ export class TikTokAdapter extends WebPlatformAdapter {
         return { ok: true, data: { query: action.payload.query, videos: filtered, count: filtered.length } };
       }
       case 'AUTO_COMMENT_TIKTOK_HOME':
-        return { ok: true, data: await autoCommentTikTokHome(session, action.payload) };
+        {
+          const data = await autoCommentTikTokHome(session, action.payload, this.options.captchaSolver);
+          return { ok: typeof data.sent === 'number' && data.sent > 0, data };
+        }
       case 'COMMENT_TIKTOK_VIDEOS':
-        return { ok: true, data: await commentTikTokVideos(session, action.payload) };
+        {
+          const data = await commentTikTokVideos(session, action.payload, this.options.captchaSolver);
+          return { ok: typeof data.sent === 'number' && data.sent > 0, data };
+        }
       case 'REPLY_TIKTOK_COMMENTS':
-        return { ok: true, data: await replyTikTokComments(session, action.payload) };
+        return { ok: true, data: await replyTikTokComments(session, action.payload, this.options.captchaSolver) };
       case 'LIKE_TIKTOK_COMMENTS':
         return { ok: true, data: await likeTikTokComments(session, action.payload) };
       case 'MESSAGE_TIKTOK_FOLLOWERS':
-        return { ok: true, data: await messageTikTokFollowers(session, action.payload) };
+        {
+          const data = await messageTikTokFollowers(session, action.payload, this.options.captchaSolver);
+          return { ok: typeof data.sent === 'number' && data.sent > 0, data };
+        }
       default:
         throw new UnsupportedPlatformActionError(this.platform, action.action);
     }
+  }
+
+  protected async healthCheck(session: PlatformSession): Promise<ActionResult> {
+    await enterTikTokRoot(session.page);
+    const currentUrl = session.page.url().toLowerCase();
+    let loginRequired = this.definition.loginUrlFragments.some((fragment) => currentUrl.includes(fragment));
+    if (!loginRequired) {
+      for (const selector of this.definition.loginSelectors) {
+        if ((await session.page.locator(selector).count()) > 0) {
+          loginRequired = true;
+          break;
+        }
+      }
+    }
+    return {
+      ok: !loginRequired,
+      data: {
+        loginRequired,
+        url: session.page.url(),
+        title: await session.page.title(),
+      },
+    };
   }
 }

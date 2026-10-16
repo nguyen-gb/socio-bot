@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Context } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
@@ -13,21 +13,24 @@ import {
   type MaterializedScheduledTask,
   type MaterializeScheduledTaskInput,
 } from '@socio/contracts';
-import { withDeadline, type BrowserRuntime, type RuntimeProxy } from '@socio/browser-runtime';
+import { withDeadline, type BrowserRuntime, type ManagedBrowserSession, type RuntimeProxy } from '@socio/browser-runtime';
 import { Prisma } from '@socio/database';
 import { FacebookAdapter } from '@socio/facebook-adapter';
 import {
   LoginRequiredError,
   PlatformAdapterRegistry,
   type PlatformAdapter,
+  type BrowserPage,
   UnsupportedPlatformActionError,
 } from '@socio/platform-core';
 import {
   InstagramAdapter,
   TikTokAdapter,
   createTikTokFixtureSearchProvider,
+  solveVisibleTikTokRotateCaptcha,
   TikTokSearchAutomationError,
   TikTokVerificationRequiredError,
+  type TikTokRotateCaptchaSolver,
   XAdapter,
 } from '@socio/web-platform-adapters';
 import type { WorkerEnvironment } from '../config/environment';
@@ -41,13 +44,16 @@ import { SecretsService } from '../secrets/secrets.service';
 import type { ObjectStorage } from '@socio/object-storage';
 import { OBJECT_STORAGE } from '../storage/object-storage.providers';
 import { loadTaskImages } from '../storage/task-images';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, profileLoginSettings } from './platform-login';
+import { AntiCaptchaService } from '../captcha/anticaptcha.service';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformSessionStateOrigins, profileLoginSettings } from './platform-login';
+import { installTikTokImAuthBridge } from './tiktok-im-auth-bridge';
 
 const sharedTikTokSearchProfileId = 'search-tiktok-anonymous';
 
 @Injectable()
 export class BrowserTaskActivities {
   private readonly adapters: PlatformAdapterRegistry;
+  private readonly tiktokCaptchaSolver?: TikTokRotateCaptchaSolver;
   private readonly logger = new Logger(BrowserTaskActivities.name);
 
   constructor(
@@ -60,6 +66,7 @@ export class BrowserTaskActivities {
     private readonly config: ConfigService<WorkerEnvironment, true>,
     @Inject(BROWSER_RUNTIME) private readonly runtime: BrowserRuntime,
     @Inject(OBJECT_STORAGE) private readonly objects: ObjectStorage,
+    @Optional() private readonly anticaptcha?: AntiCaptchaService,
   ) {
     const facebook = new FacebookAdapter();
     // A few lightweight unit fixtures construct this activity with a partial
@@ -72,6 +79,12 @@ export class BrowserTaskActivities {
       ? 'fixture'
       : 'live';
     const tiktokSearchFixtureScenario = configGet?.call(this.config, 'tiktokSearchFixtureScenario', { infer: true });
+    this.tiktokCaptchaSolver = this.anticaptcha?.enabled
+      ? {
+        solveRotate: (imageBase64s) => this.anticaptcha!.solveTikTokRotate(imageBase64s),
+        report: (message) => this.logger.warn(`TikTok rotate CAPTCHA: ${message}`),
+      }
+      : undefined;
     this.adapters = new PlatformAdapterRegistry([
       facebook,
       new InstagramAdapter(),
@@ -84,6 +97,7 @@ export class BrowserTaskActivities {
               : 'success',
           )
           : undefined,
+        captchaSolver: this.tiktokCaptchaSolver,
       }),
     ]);
   }
@@ -281,8 +295,10 @@ export class BrowserTaskActivities {
             ),
             headless: this.config.get('browserHeadless', { infer: true }),
             channel: this.config.get('browserChannel', { infer: true }),
+            automationMode: this.config.get('browserAutomationMode', { infer: true }),
             locale: this.config.get('browserLocale', { infer: true }),
             timezoneId: this.config.get('browserTimezoneId', { infer: true }),
+            sessionStateOrigins: platformSessionStateOrigins(action.platform),
             recordHarPath: harPath,
             // Keep the browser alive until the action result and task run have
             // been durably persisted. Closing inside withProfile() can abort
@@ -308,21 +324,27 @@ export class BrowserTaskActivities {
               );
             };
             session.page.on('console', recordConsole);
+            const captureTestScreenshots = this.shouldCaptureStepScreenshots(task);
             await withDeadline(session.context.tracing.start({
-              screenshots: true,
+              screenshots: captureTestScreenshots,
               snapshots: true,
               sources: true,
             }), 10_000, 'Trace startup timed out');
             let retainTrace = false;
-            await this.artifacts
-              .captureScreenshot(task.id, run.id, session.page, 'BEFORE_SCREENSHOT')
-              .catch(() => undefined);
+            if (captureTestScreenshots) {
+              await this.artifacts
+                .captureScreenshot(task.id, run.id, session.page, 'BEFORE_SCREENSHOT')
+                .catch(() => undefined);
+            }
             try {
               let blocked: ActionResult | undefined;
               if (action.platform === 'FACEBOOK' && facebookBrowserAction) {
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
                 await initializePlatformSession(session, 'FACEBOOK', credentials);
+                if (await isPlatformChallenged(session, 'FACEBOOK')) {
+                  await this.anticaptcha?.trySolveVisibleRecaptcha(session.page);
+                }
                 if (await isPlatformChallenged(session, 'FACEBOOK')) {
                   blocked = { ok: false, data: { requiresAction: true, accountChallenged: true, reason: 'Facebook yêu cầu xác minh/CAPTCHA. Hãy thao tác thủ công.' } };
                 }
@@ -332,13 +354,25 @@ export class BrowserTaskActivities {
                 authenticated = !blocked;
               }
               if (action.platform === 'TIKTOK' && tiktokBrowserAction && !tiktokSearchAction) {
+                await installTikTokImAuthBridge(session.context);
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
+                // Every TikTok action starts from the ordinary root. Surface
+                // navigation (profile/video/search) belongs to the action
+                // after the shared session/authentication step.
                 await initializePlatformSession(session, 'TIKTOK', credentials);
+                if (await isPlatformChallenged(session, 'TIKTOK')) {
+                  const rotateCaptcha = await solveVisibleTikTokRotateCaptcha(session.page, this.tiktokCaptchaSolver);
+                  if (!rotateCaptcha.solved) {
+                    if (rotateCaptcha.reason && rotateCaptcha.reason !== 'disabled') this.logger.warn(`TikTok rotate CAPTCHA chưa giải được: ${rotateCaptcha.reason}`);
+                    await this.anticaptcha?.trySolveVisibleRecaptcha(session.page);
+                  }
+                }
                 if (await isPlatformChallenged(session, 'TIKTOK')) {
                   blocked = { ok: false, data: { requiresAction: true, accountChallenged: true, reason: 'TikTok yêu cầu xác minh/CAPTCHA. Hãy thao tác thủ công.' } };
                 }
                 if (!blocked && !(await isPlatformAuthenticated(session, 'TIKTOK'))) {
+                  await this.logTikTokAuthenticationDiagnostics(session);
                   throw new LoginRequiredError('Không xác nhận được phiên đăng nhập TikTok. Hãy mở browser để đăng nhập hoặc kiểm tra cookie.');
                 }
                 authenticated = !blocked;
@@ -347,6 +381,15 @@ export class BrowserTaskActivities {
                 ...session,
                 accountUsername: current.account.username ?? undefined,
                 accountExternalId: current.account.externalId ?? undefined,
+                captureStepScreenshot: captureTestScreenshots
+                  ? async (step: string) => {
+                    await this.artifacts
+                      .captureStepScreenshot(task.id, run.id, session.page, step)
+                      .catch(() => undefined);
+                  }
+                  : undefined,
+                openPage: async () => session.context.newPage(),
+                replacePage: (page: BrowserPage) => { session.page = page as typeof session.page; },
                 reserveMessageRecipient: ['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'].includes(action.action)
                   ? async (recipient: { groupUrl: string; profileUrl: string; displayName?: string }) => this.reserveMessageRecipient({
                     organizationId: current.organizationId,
@@ -384,6 +427,17 @@ export class BrowserTaskActivities {
               // throwing (for example a challenge appears after navigation).
               // Do not record that as an ordinary success or retry the action.
               if (!blocked && !tiktokSearchAction && await isPlatformChallenged(session, action.platform)) {
+                const rotateCaptcha = action.platform === 'TIKTOK'
+                  ? await solveVisibleTikTokRotateCaptcha(session.page, this.tiktokCaptchaSolver)
+                  : { attempted: false, solved: false };
+                if (action.platform === 'TIKTOK' && rotateCaptcha.reason && rotateCaptcha.reason !== 'disabled' && !rotateCaptcha.solved) {
+                  this.logger.warn(`TikTok rotate CAPTCHA chưa giải được: ${rotateCaptcha.reason}`);
+                }
+                const captcha = rotateCaptcha.solved
+                  ? { solved: true }
+                  : await this.anticaptcha?.trySolveVisibleRecaptcha(session.page);
+                if (captcha?.solved) await session.page.waitForTimeout(750);
+                if (!captcha?.solved || await isPlatformChallenged(session, action.platform)) {
                 actionResult = {
                   ok: false,
                   data: {
@@ -393,24 +447,31 @@ export class BrowserTaskActivities {
                     reason: `${action.platform} yêu cầu xác minh. Hãy hoàn tất CAPTCHA/xác minh thủ công trên browser trước khi tiếp tục.`,
                   },
                 };
+                }
               }
               if (!actionResult.ok) {
                 retainTrace = true;
-                await this.artifacts
-                  .captureFailure(task.id, run.id, session.page)
-                  .catch(() => undefined);
+                if (captureTestScreenshots) {
+                  await this.artifacts
+                    .captureFailure(task.id, run.id, session.page)
+                    .catch(() => undefined);
+                }
               }
               return actionResult;
             } catch (error) {
               retainTrace = true;
-              await this.artifacts
-                .captureFailure(task.id, run.id, session.page)
-                .catch(() => undefined);
+              if (captureTestScreenshots) {
+                await this.artifacts
+                  .captureFailure(task.id, run.id, session.page)
+                  .catch(() => undefined);
+              }
               throw error;
             } finally {
-              await this.artifacts
-                .captureScreenshot(task.id, run.id, session.page, 'AFTER_SCREENSHOT')
-                .catch(() => undefined);
+              if (captureTestScreenshots) {
+                await this.artifacts
+                  .captureScreenshot(task.id, run.id, session.page, 'AFTER_SCREENSHOT')
+                  .catch(() => undefined);
+              }
               if (retainTrace) {
                 await this.artifacts
                   .captureTrace(task.id, run.id, session.context)
@@ -472,6 +533,14 @@ export class BrowserTaskActivities {
             ? 'REQUIRES_ACTION'
             : result.ok ? 'SUCCEEDED' : 'FAILED';
       const reason = typeof result.data?.reason === 'string' ? result.data.reason : task.action === 'SYNC_FACEBOOK_GROUPS' && result.data?.complete === false ? 'Đồng bộ chưa đọc hết danh sách nhóm; hãy kiểm tra browser hoặc đồng bộ lại trước khi chọn tất cả nhóm.' : null;
+      // A TikTok action may fail before the Post control is armed (for
+      // example while the comment editor or CAPTCHA is still hydrating). In
+      // that case no external side effect started and the authenticated
+      // profile is still safe to retry. Keep it READY instead of forcing a
+      // manual re-login after every selector/CAPTCHA recovery iteration.
+      const retryableTikTokFailure = task.platform === 'TIKTOK'
+        && current.account.status === 'READY'
+        && !sideEffectStarted;
 
       await this.prisma.$transaction([
         this.prisma.task.update({
@@ -489,7 +558,7 @@ export class BrowserTaskActivities {
         }),
         this.prisma.platformAccount.update({
           where: { id: task.accountId },
-          data: { status: tiktokSearchAction ? current.account.status : result.data?.accountChallenged === true ? 'CHALLENGED' : result.ok || requiresAction ? 'READY' : 'ERROR' },
+          data: { status: tiktokSearchAction ? current.account.status : result.data?.accountChallenged === true ? 'CHALLENGED' : result.ok || requiresAction || retryableTikTokFailure ? 'READY' : 'ERROR' },
         }),
         ...(tiktokSearchAction ? [] : [this.prisma.browserProfile.update({
           where: { id: profile.id },
@@ -503,6 +572,18 @@ export class BrowserTaskActivities {
       const tiktokSearchAutomation = error instanceof TikTokSearchAutomationError;
       const tiktokVerificationRequired = error instanceof TikTokVerificationRequiredError;
       const message = error instanceof Error ? error.message : String(error);
+      // A TikTok browser launch/selector failure can happen before the
+      // adapter has armed any external action. Do not turn a previously READY
+      // account into ERROR (or force a manual re-login) just because Chrome
+      // could not be spawned or the page surface was still hydrating. The
+      // task remains retryable and sideEffectStarted is still false.
+      const retryableTikTokPreSideEffectFailure = task.platform === 'TIKTOK'
+        && current.account.status === 'READY'
+        && !sideEffectStarted
+        && !loginRequired
+        && !tiktokVerificationRequired
+        && !unsupported;
+      const requiresManualAction = loginRequired || tiktokVerificationRequired || (externalAction && !retryableTikTokPreSideEffectFailure);
       const control = await this.prisma.task.findUnique({ where: { id: task.id }, select: { status: true, pausedAt: true, cancelledAt: true } });
       const cancellationRequested = control?.status === 'CANCELLED' || Boolean(control?.cancelledAt);
       const pauseRequested = !cancellationRequested && (control?.status === 'PAUSED' || Boolean(control?.pausedAt));
@@ -511,7 +592,7 @@ export class BrowserTaskActivities {
         this.prisma.task.update({
           where: { id: task.id },
           data: {
-            status: cancellationRequested ? 'CANCELLED' : pauseRequested && !loginRequired && !tiktokVerificationRequired && !externalAction ? 'PAUSED' : loginRequired || tiktokVerificationRequired || externalAction ? 'REQUIRES_ACTION' : 'FAILED',
+            status: cancellationRequested ? 'CANCELLED' : pauseRequested && !loginRequired && !tiktokVerificationRequired && !requiresManualAction ? 'PAUSED' : requiresManualAction ? 'REQUIRES_ACTION' : 'FAILED',
             lastError: cancellationRequested || pauseRequested ? null : message,
           },
         }),
@@ -535,7 +616,7 @@ export class BrowserTaskActivities {
         }),
         this.prisma.platformAccount.update({
           where: { id: task.accountId },
-          data: { status: tiktokSearchAction ? current.account.status : loginRequired ? 'LOGIN_REQUIRED' : tiktokVerificationRequired ? 'CHALLENGED' : authenticated ? 'READY' : 'ERROR' },
+          data: { status: tiktokSearchAction ? current.account.status : loginRequired ? 'LOGIN_REQUIRED' : tiktokVerificationRequired ? 'CHALLENGED' : authenticated || retryableTikTokPreSideEffectFailure ? 'READY' : 'ERROR' },
         }),
         ...(tiktokSearchAction ? [] : [this.prisma.browserProfile.update({
           where: { id: profile.id },
@@ -544,6 +625,9 @@ export class BrowserTaskActivities {
       ]);
 
       if (tiktokSearchAutomation) {
+        return { ok: false, data: { reason: message } };
+      }
+      if (retryableTikTokPreSideEffectFailure) {
         return { ok: false, data: { reason: message } };
       }
       if (loginRequired || tiktokVerificationRequired || unsupported || externalAction) {
@@ -563,6 +647,33 @@ export class BrowserTaskActivities {
       }
     }
     }, { waitTimeoutMs: 10 * 60_000, onWait: () => Context.current().heartbeat({ stage: 'waiting_profile', taskId: task.id }) });
+  }
+
+  private async logTikTokAuthenticationDiagnostics(session: ManagedBrowserSession): Promise<void> {
+    try {
+      const cookies = await session.context.cookies('https://www.tiktok.com');
+      const pageState = await session.page.evaluate(() => ({
+        url: window.location.href,
+        title: document.title,
+        body: (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 300),
+        hasNavigation: Boolean(document.querySelector('[data-e2e="nav-messages"], [data-e2e="nav-profile"], [role="navigation"]')),
+      }));
+      this.logger.warn(`TikTok authentication check failed: ${JSON.stringify({
+        ...pageState,
+        cookieNames: cookies.map(cookie => cookie.name).sort(),
+      })}`);
+    } catch (error) {
+      this.logger.warn(`TikTok authentication diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private shouldCaptureStepScreenshots(task: { payload: unknown }): boolean {
+    if (this.config.get('nodeEnv', { infer: true }) === 'production') return false;
+    const payload = task.payload;
+    if (!payload || typeof payload !== 'object') return false;
+    const name = 'name' in payload && typeof payload.name === 'string' ? payload.name : '';
+    const markedAsTest = 'test' in payload && payload.test === true;
+    return markedAsTest || name.toLowerCase().startsWith('test-');
   }
 
   private async persistFacebookResult(

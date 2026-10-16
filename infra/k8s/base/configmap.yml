@@ -20,6 +20,12 @@ data:
   PROFILE_ROOT: /var/lib/socio/profiles
   ARTIFACT_ROOT: /var/lib/socio/artifacts
   SECRET_ROOT: /run/secrets/socio
+  BROWSER_CHANNEL: chrome
+  BROWSER_AUTOMATION_MODE: chrome
+  BROWSER_HEADLESS: "true"
+  ANTICAPTCHA_API_URL: https://anticaptcha.top/api/captcha
+  ANTICAPTCHA_AUTO_SOLVE: "false"
+  ANTICAPTCHA_TIMEOUT_MS: "120000"
   BROWSER_MAX_SLOTS: "2"
   PROFILE_LEASE_TTL_MS: "1200000"
   REMOTE_SESSION_PORT: "3010"

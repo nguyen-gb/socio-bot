@@ -48,6 +48,21 @@ test('force close interrupts a pending task and persisted identity rejects a reu
   } finally { await runtime.closeAll(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('profile recovery removes stale Chrome Singleton locks when no process owns the profile', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-stale-locks-'));
+  const profile = join(root, 'fixture');
+  try {
+    await import('node:fs/promises').then(({ mkdir }) => mkdir(profile, { recursive: true }));
+    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      await writeFile(join(profile, name), 'stale');
+    }
+    await new BrowserProcessRegistry(root).recover('fixture');
+    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      await assert.rejects(stat(join(profile, name)), /ENOENT/);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('task deadline bounds a stuck callback and recovers the slot', async () => {
   const root = await mkdtemp(join(tmpdir(), 'socio-task-timeout-'));
   const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7));
@@ -155,7 +170,73 @@ test('explicitly allowlisted localStorage is restored before page scripts run', 
   const profileId = '00000000-0000-4000-8000-000000000555';
   const server = createServer((_request, response) => {
     response.writeHead(200, { 'content-type': 'text/html' });
-    response.end('<script>document.title = localStorage.getItem("fixture-token") || "missing";</script>');
+    response.end('<script>document.title = [localStorage.getItem("fixture-token"), sessionStorage.getItem("fixture-session")].join("|");</script>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port.toString()}`;
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7));
+  try {
+    const first = await runtime.openProfile({ profileId, headless: true, sessionStateOrigins: [origin], persistSessionStorage: true });
+    await first.page.goto(`${origin}/`);
+    await first.page.evaluate(() => window.localStorage.setItem('fixture-token', 'persisted-local-storage'));
+    await first.page.evaluate(() => window.sessionStorage.setItem('fixture-session', 'persisted-session-storage'));
+    await first.page.evaluate(async () => {
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.open('fixture-db', 1);
+        request.onupgradeneeded = () => request.result.createObjectStore('items');
+        request.onsuccess = () => {
+          const database = request.result;
+          const transaction = database.transaction('items', 'readwrite');
+          transaction.objectStore('items').put('persisted-indexed-db', 'fixture-key');
+          transaction.oncomplete = () => { database.close(); resolve(); };
+          transaction.onerror = () => reject(transaction.error);
+        };
+        request.onerror = () => reject(request.error);
+      });
+    });
+    await first.close();
+
+    // The persistent browser directory is deliberately removed so this test
+    // verifies the encrypted sidecar rather than Chromium's own profile.
+    const profilePath = join(root, profileId);
+    const sealed = await readFile(join(profilePath, 'session-cookies.enc'), 'utf8');
+    await rm(profilePath, { recursive: true, force: true });
+    await (await import('node:fs/promises')).mkdir(profilePath, { recursive: true });
+    await writeFile(join(profilePath, 'session-cookies.enc'), sealed, { mode: 0o600 });
+
+    const second = await runtime.openProfile({ profileId, headless: true, sessionStateOrigins: [origin], persistSessionStorage: true });
+    await second.page.goto(`${origin}/`);
+    assert.equal(await second.page.title(), 'persisted-local-storage|persisted-session-storage');
+    assert.equal(await second.page.evaluate(async () => await new Promise<string | null>((resolve, reject) => {
+      const request = indexedDB.open('fixture-db');
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction('items', 'readonly');
+        const read = transaction.objectStore('items').get('fixture-key');
+        read.onsuccess = () => { database.close(); resolve(typeof read.result === 'string' ? read.result : null); };
+        read.onerror = () => reject(read.error);
+      };
+      request.onerror = () => reject(request.error);
+    })), 'persisted-indexed-db');
+    await second.close();
+  } finally {
+    await runtime.closeAll();
+    await rm(root, { recursive: true, force: true });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('tab-scoped sessionStorage is reset by default while durable storage remains', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-browser-session-reset-'));
+  const profileId = '00000000-0000-4000-8000-000000000556';
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html' });
+    response.end('<script>document.title = [localStorage.getItem("fixture-token"), sessionStorage.getItem("fixture-session")].join("|");</script>');
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -168,20 +249,16 @@ test('explicitly allowlisted localStorage is restored before page scripts run', 
   try {
     const first = await runtime.openProfile({ profileId, headless: true, sessionStateOrigins: [origin] });
     await first.page.goto(`${origin}/`);
-    await first.page.evaluate(() => window.localStorage.setItem('fixture-token', 'persisted-local-storage'));
+    await first.page.evaluate(() => {
+      window.localStorage.setItem('fixture-token', 'durable');
+      window.sessionStorage.setItem('fixture-session', 'stale-tab-state');
+    });
     await first.close();
-
-    // The persistent browser directory is deliberately removed so this test
-    // verifies the encrypted sidecar rather than Chromium's own profile.
-    const profilePath = join(root, profileId);
-    const sealed = await readFile(join(profilePath, 'session-cookies.enc'), 'utf8');
-    await rm(profilePath, { recursive: true, force: true });
-    await (await import('node:fs/promises')).mkdir(profilePath, { recursive: true });
-    await writeFile(join(profilePath, 'session-cookies.enc'), sealed, { mode: 0o600 });
 
     const second = await runtime.openProfile({ profileId, headless: true, sessionStateOrigins: [origin] });
     await second.page.goto(`${origin}/`);
-    assert.equal(await second.page.title(), 'persisted-local-storage');
+    assert.equal(await second.page.title(), 'durable|');
+    assert.equal(await second.page.evaluate(() => window.sessionStorage.getItem('fixture-session')), null);
     await second.close();
   } finally {
     await runtime.closeAll();

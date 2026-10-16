@@ -1,4 +1,4 @@
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, readdir, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import type { PlatformSession } from '@socio/platform-core';
@@ -18,6 +18,8 @@ export interface BrowserViewport {
   height: number;
 }
 
+export type BrowserAutomationMode = 'playwright' | 'chrome';
+
 export interface OpenProfileOptions {
   profileId: string;
   ownerId?: string;
@@ -25,6 +27,13 @@ export interface OpenProfileOptions {
   headless?: boolean;
   /** Optional installed browser channel, for example `chrome` or `msedge`. */
   channel?: string;
+  /**
+   * Launch with Playwright's defaults, or with the branded Chrome defaults
+   * used by a regular interactive Chrome window. The Chrome mode only removes
+   * Playwright's automation switch and keeps the browser UA/device settings
+   * unchanged.
+   */
+  automationMode?: BrowserAutomationMode;
   locale?: string;
   timezoneId?: string;
   /** `null` follows the native browser window size, like a normal Chrome window. */
@@ -38,8 +47,10 @@ export interface OpenProfileOptions {
   ephemeral?: boolean;
   /** Send the standard Do Not Track preference without changing browser identity. */
   privacyMode?: boolean;
-  /** Explicit first-party origins whose localStorage may be persisted with the session. */
+  /** Explicit first-party origins whose browser storage may be persisted with the session. */
   sessionStateOrigins?: readonly string[];
+  /** Keep tab-scoped sessionStorage only for an explicitly compatible app. */
+  persistSessionStorage?: boolean;
 }
 
 export interface ManagedBrowserSession extends PlatformSession {
@@ -55,6 +66,8 @@ interface ActiveSession {
   context: BrowserContext;
   profilePath: string;
   ephemeral: boolean;
+  ownerId?: string;
+  identity: object;
   lease: SlotLease;
   promise: Promise<ManagedBrowserSession>;
   closing?: Promise<void>;
@@ -63,6 +76,7 @@ interface ActiveSession {
   forcing?: Promise<void>;
   persistenceAbort: AbortController;
   sessionState: ProfileSessionStateOptions;
+  processWatchdog?: ReturnType<typeof setInterval>;
 }
 
 export class BrowserRuntime {
@@ -90,7 +104,7 @@ export class BrowserRuntime {
   async openProfile(options: OpenProfileOptions): Promise<ManagedBrowserSession> {
     const current = this.sessions.get(options.profileId);
     if (current) {
-      if (options.ownerId && current.record.ownerId !== options.ownerId) throw new Error('Browser belongs to another session');
+      if (options.ownerId && current.ownerId !== options.ownerId) throw new Error('Browser belongs to another session');
       return current.promise;
     }
     const pending = this.opening.get(options.profileId);
@@ -104,24 +118,35 @@ export class BrowserRuntime {
   private async launch(options: OpenProfileOptions): Promise<ManagedBrowserSession> {
     const lease = await this.slots.acquire(options.slotTimeoutMs);
     const profilePath = resolve(this.profileRoot, options.profileId);
+    // A complete persistent profile already contains IndexedDB/OPFS and other
+    // durable browser state. Only use Playwright's destructive structured-state
+    // restore when recovery is genuinely sidecar-only (for example after a
+    // profile directory was lost but session-cookies.enc survived).
+    const restoreStructuredOriginState = await isSidecarOnlyProfile(profilePath);
     let context: BrowserContext | undefined;
     let record: BrowserProcessRecord | undefined;
     try {
-      record = await this.processes.begin(options.profileId, options.ownerId);
       await mkdir(profilePath, { recursive: true });
+      record = await this.processes.begin(options.profileId, options.ownerId);
       const viewport = options.viewport ?? null;
       const headless = options.headless ?? true;
-      context = await chromium.launchPersistentContext(profilePath, {
-        args: [
-          `--socio-session-token=${record.token}`,
-          // With viewport:null, this gives headed local runs the same initial
-          // window behavior as a manually opened Chrome window. It is not
-          // used in headless/container runs.
-          ...(!headless ? ['--start-maximized'] : []),
-        ],
+      const automationMode = options.automationMode ?? 'playwright';
+      const launchArgs = [
+        `--socio-session-token=${record.token}`,
+        // With viewport:null, this gives headed local runs the same initial
+        // window behavior as a manually opened Chrome window. It is not
+        // used in headless/container runs.
+        ...(!headless ? ['--start-maximized'] : []),
+      ];
+      const ignoredDefaultArgs = [
         // Headless Chromium hides native scrollbars by default. Remote users
         // need visible, draggable thumbs just like in a normal browser.
-        ignoreDefaultArgs: ['--hide-scrollbars'],
+        '--hide-scrollbars',
+        ...(automationMode === 'chrome' ? ['--enable-automation'] : []),
+      ];
+      context = await chromium.launchPersistentContext(profilePath, {
+        args: launchArgs,
+        ignoreDefaultArgs: ignoredDefaultArgs,
         timeout: 45_000,
         headless,
         channel: options.channel,
@@ -129,14 +154,15 @@ export class BrowserRuntime {
         // Chromium sandbox enabled so headed Chrome does not show the
         // unsupported command-line flag warning and retains normal isolation.
         chromiumSandbox: true,
-        // Keep the page surface close to a regular Chrome window. Do not
-        // override user-agent or webdriver signals to evade CAPTCHA.
+        // Keep the page surface close to a regular Chrome window. Chrome mode
+        // only suppresses Playwright's automation launch marker; it does not
+        // add unsupported command-line flags or spoof page APIs.
         viewport,
         ...(viewport ? { deviceScaleFactor: 1 } : {}),
         isMobile: false,
         hasTouch: false,
-        colorScheme: 'light',
-        reducedMotion: 'no-preference',
+        // Leave color scheme and reduced-motion preferences to the host OS,
+        // matching a normal Chrome launch instead of emulating a fixed theme.
         locale: options.locale,
         timezoneId: options.timezoneId,
         // Do not inject a DNT header. Chrome does not send it by default, and
@@ -153,7 +179,11 @@ export class BrowserRuntime {
       context.setDefaultNavigationTimeout(45_000);
       if (!options.ephemeral) {
         await withDeadline(
-          this.cookies.restore(profilePath, options.profileId, context, { localStorageOrigins: options.sessionStateOrigins }),
+          this.cookies.restore(profilePath, options.profileId, context, {
+            stateOrigins: options.sessionStateOrigins,
+            persistSessionStorage: options.persistSessionStorage,
+            restoreStructuredOriginState,
+          }),
           10_000,
           'Cookie restore timed out',
         );
@@ -168,25 +198,36 @@ export class BrowserRuntime {
       throw error;
     }
 
+    if (!context || !record) throw new Error('Browser process was not created');
     const abort = new AbortController();
-    const promise = this.createManagedSession(options.profileId, context, lease, record, abort);
-    const active = {
+    const identity = {};
+    const promise = this.createManagedSession(options.profileId, context, lease, record, identity, abort);
+    const active: ActiveSession = {
       context,
       profilePath,
       ephemeral: options.ephemeral === true,
+      ownerId: options.ownerId,
+      identity,
       lease,
       promise,
       record,
       abort,
       persistenceAbort: new AbortController(),
-      sessionState: { localStorageOrigins: options.sessionStateOrigins },
+      sessionState: {
+        stateOrigins: options.sessionStateOrigins,
+        persistSessionStorage: options.persistSessionStorage,
+      },
     };
     this.sessions.set(options.profileId, active);
+    active.processWatchdog = setInterval(() => {
+      void this.watchProcess(options.profileId, active);
+    }, 2_500);
+    active.processWatchdog.unref?.();
     context.once('close', () => {
       abort.abort(new Error('Browser was closed'));
       // Keep the slot until controlled close/force-close has verified termination.
       if (!this.sessions.get(options.profileId)?.closing && !this.sessions.get(options.profileId)?.forcing) {
-        void this.forceCloseProfile(options.profileId, record.ownerId).catch(() => undefined);
+        void this.forceCloseProfile(options.profileId, options.ownerId).catch(() => undefined);
       }
     });
     try { return await promise; }
@@ -219,7 +260,7 @@ export class BrowserRuntime {
       if (pending) { await pending.catch(() => undefined); return this.closeProfile(profileId, ownerId); }
       return;
     }
-    if (ownerId && active.record.ownerId !== ownerId) return;
+    if (ownerId && active.ownerId !== ownerId) return;
     if (active.forcing) return active.forcing;
     if (!active.closing) {
       active.abort.abort(new Error('Browser is closing'));
@@ -236,12 +277,16 @@ export class BrowserRuntime {
               );
             }
             await active.context.close();
+            // Playwright normally closes the persistent context's Chromium
+            // tree. Verify the exact managed process as well so a crashed
+            // root/child cannot leave a profile lock for the next run.
+            await this.processes.terminate(active.record);
             if (active.ephemeral) await this.removeEphemeralProfile(active.profilePath);
           })(), this.closeTimeoutMs, 'Browser close timed out');
-          await this.processes.forget(active.record);
+          if (active.record) await this.processes.forget(active.record);
           this.release(profileId, active);
         } catch {
-          await this.forceCloseProfile(profileId, active.record.ownerId);
+          await this.forceCloseProfile(profileId, active.ownerId ?? ownerId);
         }
       })();
     }
@@ -256,7 +301,7 @@ export class BrowserRuntime {
       if (pending) { await pending.catch(() => undefined); return this.forceCloseProfile(profileId, ownerId); }
       return this.processes.recover(profileId, ownerId);
     }
-    if (ownerId && active.record.ownerId !== ownerId) return;
+    if (ownerId && active.ownerId !== ownerId) return;
     if (!active.forcing) active.forcing = (async () => {
       active.abort.abort(new Error('Browser was force closed'));
       active.persistenceAbort.abort(new Error('Browser session state save cancelled'));
@@ -279,6 +324,7 @@ export class BrowserRuntime {
     context: BrowserContext,
     lease: SlotLease,
     record: BrowserProcessRecord,
+    identity: object,
     abort: AbortController,
   ): Promise<ManagedBrowserSession> {
     const pages = context.pages();
@@ -291,18 +337,51 @@ export class BrowserRuntime {
       slot: lease.slot,
       processId: record.pid,
       signal: abort.signal,
-      close: () => this.sessions.get(profileId)?.record === record ? this.closeProfile(profileId, record.ownerId) : Promise.resolve(),
+      close: () => {
+        const active = this.sessions.get(profileId);
+        return active?.identity === identity
+          ? this.closeProfile(profileId, active.ownerId)
+          : Promise.resolve();
+      },
     };
   }
 
   private release(profileId: string, expected: ActiveSession): void {
     const active = this.sessions.get(profileId);
     if (!active || active !== expected) return;
+    if (active.processWatchdog) clearInterval(active.processWatchdog);
     this.sessions.delete(profileId);
     active.lease.release();
   }
 
+  private async watchProcess(profileId: string, expected: ActiveSession): Promise<void> {
+    const active = this.sessions.get(profileId);
+    if (!active || active !== expected || active.closing || active.forcing) return;
+    try {
+      const alive = await this.processes.isAlive(active.record);
+      if (alive === false) {
+        const error = new Error('Managed Chromium process exited unexpectedly');
+        active.abort.abort(error);
+        await this.forceCloseProfile(profileId, active.ownerId);
+      }
+    } catch {
+      // Process inspection is best-effort. The normal Playwright close event
+      // and task deadline remain the fallback when inspection is unavailable.
+    }
+  }
+
   private async removeEphemeralProfile(profilePath: string): Promise<void> {
     await rm(profilePath, { recursive: true, force: true });
+  }
+}
+
+async function isSidecarOnlyProfile(profilePath: string): Promise<boolean> {
+  try {
+    const entries = await readdir(profilePath, { withFileTypes: true });
+    return entries.length > 0
+      && entries.every((entry) => entry.isFile() && entry.name === 'session-cookies.enc');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
   }
 }

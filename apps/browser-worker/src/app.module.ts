@@ -16,6 +16,7 @@ import { TaskArtifactsService } from './storage/task-artifacts.service';
 import { SecretsService } from './secrets/secrets.service';
 import { WorkerRegistryService } from './worker-registry/worker-registry.service';
 import { BrowserControlService } from './runtime/browser-control.service';
+import { AntiCaptchaService } from './captcha/anticaptcha.service';
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { BrowserControlService } from './runtime/browser-control.service';
     ProfileSnapshotsService,
     TaskArtifactsService,
     SecretsService,
+    AntiCaptchaService,
   ],
 })
 export class AppModule {}

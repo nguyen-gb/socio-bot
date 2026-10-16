@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { PlatformAction } from '@socio/contracts';
 import type { BrowserPage, PlatformSession } from '@socio/platform-core';
-import { createTikTokFixtureSearchProvider } from './tiktok-automation';
+import { createTikTokFixtureSearchProvider, solveVisibleTikTokRotateCaptcha } from './tiktok-automation';
 import { InstagramAdapter, TikTokAdapter, XAdapter } from './web-platform-adapters';
 
 const accountId = '00000000-0000-4000-8000-000000000002';
@@ -35,6 +35,51 @@ test('TikTok fixture challenge is surfaced as a verification result', async () =
   assert.equal(result.data?.accountChallenged, true);
 });
 
+test('TikTok rotate solver sends the two rendered images and drags the native slider', async () => {
+  let solved = false;
+  const mouseEvents: string[] = [];
+  const box = (x: number, y: number, width: number, height: number) => ({ x, y, width, height });
+  const locatorFor = (selector: string) => {
+    const isInside = selector.includes('captcha_verify_img_slide');
+    const isOutside = selector.includes('#captcha-verify-image') || selector.includes('captcha_verify_img:not');
+    const isTrack = selector.includes('slidebar');
+    const isHandle = selector.includes('drag-icon');
+    const active = isInside || isOutside || isTrack || isHandle;
+    const candidate = {
+      count: async () => active ? 1 : 0,
+      nth: () => candidate,
+      isVisible: async () => active,
+      screenshot: async () => Buffer.from(isInside ? 'inside' : 'outside'),
+      boundingBox: async () => isTrack ? box(100, 300, 300, 40) : isHandle ? box(100, 300, 40, 40) : box(100, 100, isInside ? 160 : 240, isInside ? 160 : 240),
+    };
+    return candidate;
+  };
+  const page = {
+    url: () => 'https://www.tiktok.com/login',
+    title: async () => 'TikTok',
+    goto: async () => undefined,
+    locator: locatorFor,
+    evaluate: async () => solved ? { bodyText: '', challengeNode: false } : { bodyText: 'captcha', challengeNode: true },
+    waitForTimeout: async () => undefined,
+    mouse: {
+      move: async () => { mouseEvents.push('move'); },
+      down: async () => { mouseEvents.push('down'); },
+      up: async () => { mouseEvents.push('up'); solved = true; },
+    },
+  } as unknown as BrowserPage & { evaluate: (pageFunction: (() => unknown) | string) => Promise<unknown> };
+
+  let receivedImages: readonly [string, string] | undefined;
+  const result = await solveVisibleTikTokRotateCaptcha(page as never, {
+    solveRotate: async (images) => { receivedImages = images; return 0.5; },
+  });
+
+  assert.equal(result.solved, true);
+  assert.deepEqual(receivedImages, [Buffer.from('inside').toString('base64'), Buffer.from('outside').toString('base64')]);
+  assert.equal(mouseEvents[0], 'move');
+  assert.equal(mouseEvents.includes('down'), true);
+  assert.equal(mouseEvents.at(-1), 'up');
+});
+
 for (const [adapter, loginUrl] of [
   [new InstagramAdapter(), 'https://www.instagram.com/accounts/login/'],
   [new XAdapter(), 'https://x.com/i/flow/login'],
@@ -53,7 +98,7 @@ for (const [adapter, loginUrl] of [
   });
 }
 
-test('TikTok health check falls back to the login route when the entry route has no renderable HTTP response', async () => {
+test('TikTok health check starts at root and does not force a login route', async () => {
   const targets: string[] = [];
   let currentUrl = 'about:blank';
   const page: BrowserPage = {
@@ -61,12 +106,9 @@ test('TikTok health check falls back to the login route when the entry route has
     title: async () => 'Login',
     goto: async (url) => {
       targets.push(url);
-      if (url === 'https://www.tiktok.com/') {
-        throw new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://www.tiktok.com/');
-      }
       currentUrl = url;
     },
-    locator: () => ({ count: async () => 0 }),
+    locator: (selector) => ({ count: async () => selector.includes('/login') ? 1 : 0 }),
   };
   const action: PlatformAction = {
     platform: 'TIKTOK',
@@ -79,10 +121,7 @@ test('TikTok health check falls back to the login route when the entry route has
 
   assert.equal(result.ok, false);
   assert.equal(result.data?.loginRequired, true);
-  assert.deepEqual(targets, [
-    'https://www.tiktok.com/',
-    'https://www.tiktok.com/login',
-  ]);
+  assert.deepEqual(targets, ['https://www.tiktok.com/']);
 });
 
 test('TikTok search returns bounded metadata without requiring an external-action approval', async () => {
@@ -143,9 +182,9 @@ test('TikTok search returns bounded metadata without requiring an external-actio
   assert.equal(result.ok, true);
   assert.equal(result.data?.count, 1);
   assert.equal((result.data?.videos as Array<{ videoId: string }>)[0]?.videoId, '1234567890123456789');
-  assert.deepEqual(events.slice(0, 3), ['goto:https://www.tiktok.com/', 'dismiss-got-it', 'click-for-you']);
-  assert.deepEqual(events.slice(-3), ['focus-search', 'fill:du lịch', 'press:Enter']);
+  assert.match(events[0] ?? '', /^goto:https:\/\/www\.tiktok\.com\/$/);
   assert.equal(events.some((event) => event.includes('/foryou')), false);
+  assert.equal(events.some((event) => event.includes('click-for-you')), false);
 });
 
 test('TikTok search fails closed when TikTok returns no data without an explicit empty state', async () => {
@@ -219,17 +258,23 @@ test('TikTok view filters do not treat an unavailable view metric as a match', a
 
 test('TikTok live comment refuses to run without the worker approval hook', async () => {
   let currentUrl = 'about:blank';
+  let editorValue = '';
   const fakeLocator = {
     count: async () => 1,
     first: () => fakeLocator,
-    fill: async () => undefined,
+    fill: async (value: string) => { editorValue = value; },
+    textContent: async () => editorValue,
     click: async () => undefined,
   };
   const page: BrowserPage = {
     url: () => currentUrl,
     title: async () => 'TikTok',
     goto: async (url) => { currentUrl = url; },
-    locator: (selector) => selector.includes('contenteditable') || selector.includes('comment-input') ? fakeLocator : { count: async () => 0 },
+    locator: (selector) => selector.includes('contenteditable')
+      || selector.includes('comment-input')
+      || selector.includes('comment-post')
+      ? fakeLocator
+      : { count: async () => 0 },
   };
   const action: PlatformAction = {
     platform: 'TIKTOK', accountId, action: 'COMMENT_TIKTOK_VIDEOS',
@@ -238,7 +283,7 @@ test('TikTok live comment refuses to run without the worker approval hook', asyn
 
   const result = await new TikTokAdapter().execute(action, session(page));
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
   assert.equal(result.data?.sent, 0);
   assert.match(String((result.data?.failures as Array<{ reason: string }>)[0]?.reason), /approved task execution context/i);
 });

@@ -15,8 +15,20 @@ export interface WorkerEnvironment {
   /** Time to leave Chromium open after an action result before closing it. */
   browserCloseDelayMs: number;
   browserChannel?: string;
+  browserAutomationMode: 'playwright' | 'chrome';
   browserLocale?: string;
   browserTimezoneId?: string;
+  /** Diagnostic screenshots are opt-in and should remain disabled in production. */
+  captureStepScreenshots: boolean;
+  anticaptchaApiKey?: string;
+  anticaptchaApiUrl: string;
+  anticaptchaRecognitionUrl: string;
+  anticaptchaResultUrl: string;
+  anticaptchaApiTransport: 'json' | 'multipart';
+  anticaptchaAutoSolve: boolean;
+  anticaptchaTimeoutMs: number;
+  anticaptchaTikTokRotateInvert: boolean;
+  anticaptchaTikTokRotateMode: 'ratio' | 'degrees';
   /** Search provider used by TikTok product tests; live is the production-safe default. */
   tiktokSearchMode: 'live' | 'fixture';
   tiktokSearchFixtureScenario: 'success' | 'empty' | 'challenge';
@@ -72,7 +84,6 @@ export function loadEnvironment(): WorkerEnvironment {
   if (nodeEnv === 'production' && tiktokSearchMode === 'fixture') {
     throw new Error('TIKTOK_SEARCH_MODE=fixture is only allowed outside production');
   }
-
   return {
     nodeEnv,
     workerName:
@@ -97,8 +108,48 @@ export function loadEnvironment(): WorkerEnvironment {
     // connection needs more time (for example BROWSER_CLOSE_DELAY_MS=10000).
     browserCloseDelayMs: positiveInteger(process.env.BROWSER_CLOSE_DELAY_MS, 5_000),
     browserChannel: optionalString(process.env.BROWSER_CHANNEL),
+    browserAutomationMode: enumValue(
+      process.env.BROWSER_AUTOMATION_MODE,
+      ['playwright', 'chrome'] as const,
+      'playwright',
+    ),
     browserLocale: browserLocale(process.env.BROWSER_LOCALE),
     browserTimezoneId: browserTimezone(process.env.BROWSER_TIMEZONE_ID),
+    captureStepScreenshots: booleanValue(process.env.CAPTURE_STEP_SCREENSHOTS, false),
+    anticaptchaApiKey: optionalString(process.env.ANTICAPTCHA_API_KEY),
+    anticaptchaApiUrl: anticaptchaApiUrl(process.env.ANTICAPTCHA_API_URL),
+    anticaptchaRecognitionUrl: anticaptchaEndpoint(
+      process.env.ANTICAPTCHA_RECOGNITION_URL,
+      'https://anticaptcha.top/in.php',
+      'ANTICAPTCHA_RECOGNITION_URL',
+    ),
+    anticaptchaResultUrl: anticaptchaEndpoint(
+      process.env.ANTICAPTCHA_RESULT_URL,
+      'https://anticaptcha.top/res.php',
+      'ANTICAPTCHA_RESULT_URL',
+    ),
+    anticaptchaApiTransport: enumValue(
+      process.env.ANTICAPTCHA_API_TRANSPORT,
+      ['json', 'multipart'] as const,
+      'json',
+    ),
+    anticaptchaAutoSolve: anticaptchaAutoSolve(
+      process.env.ANTICAPTCHA_AUTO_SOLVE,
+      process.env.ANTICAPTCHA_API_KEY,
+    ),
+    anticaptchaTimeoutMs: positiveInteger(
+      process.env.ANTICAPTCHA_TIMEOUT_MS,
+      120_000,
+    ),
+    anticaptchaTikTokRotateInvert: booleanValue(
+      process.env.ANTICAPTCHA_TIKTOK_ROTATE_INVERT,
+      false,
+    ),
+    anticaptchaTikTokRotateMode: enumValue(
+      process.env.ANTICAPTCHA_TIKTOK_ROTATE_MODE,
+      ['ratio', 'degrees'] as const,
+      'degrees',
+    ),
     tiktokSearchMode,
     tiktokSearchFixtureScenario,
     redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
@@ -148,6 +199,30 @@ function booleanValue(value: string | undefined, fallback: boolean): boolean {
 function optionalString(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized || undefined;
+}
+
+function anticaptchaApiUrl(value: string | undefined): string {
+  const endpoint = optionalString(value) ?? 'https://anticaptcha.top/api/captcha';
+  return anticaptchaEndpoint(endpoint, endpoint, 'ANTICAPTCHA_API_URL');
+}
+
+function anticaptchaEndpoint(value: string | undefined, fallback: string, name: string): string {
+  const endpoint = optionalString(value) ?? fallback;
+  let parsed: URL;
+  try { parsed = new URL(endpoint); }
+  catch { throw new Error(`Invalid ${name}`); }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error(`${name} must use http or https`);
+  }
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function anticaptchaAutoSolve(value: string | undefined, apiKey: string | undefined): boolean {
+  const enabled = booleanValue(value, false);
+  if (enabled && !optionalString(apiKey)) {
+    throw new Error('ANTICAPTCHA_API_KEY is required when ANTICAPTCHA_AUTO_SOLVE=true');
+  }
+  return enabled;
 }
 
 function enumValue<const T extends readonly string[]>(

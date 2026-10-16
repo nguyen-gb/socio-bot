@@ -1,6 +1,9 @@
 FROM mcr.microsoft.com/playwright:v1.63.0-noble
 WORKDIR /app
 RUN corepack enable
+# Use the branded Google Chrome binary for production browser sessions.
+# The Playwright base image provides Chromium, but not necessarily Chrome.
+RUN npx playwright install chrome
 COPY . .
 RUN corepack pnpm install --frozen-lockfile
 RUN corepack pnpm --filter @socio/browser-worker... build

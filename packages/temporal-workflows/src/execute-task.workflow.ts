@@ -10,6 +10,11 @@ export interface BrowserTaskActivities {
 
 const { executeBrowserTask } = proxyActivities<BrowserTaskActivities>({
   startToCloseTimeout: '15 minutes',
+  // Keep task execution on the task queue's active worker pool. The local
+  // Temporal server may expose SDK build capabilities while no compatible
+  // version set is configured; the default intent would otherwise leave the
+  // activity scheduled indefinitely without a worker claiming it.
+  versioningIntent: 'DEFAULT',
   // Restoring a persisted browser profile and launching Chrome can take over
   // 30 seconds on a cold worker. Avoid a false Temporal retry before the
   // browser task has even been claimed.

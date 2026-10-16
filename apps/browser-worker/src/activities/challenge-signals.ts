@@ -1,7 +1,8 @@
 /**
  * Conservative classification of an interactive verification screen.
  * A post that merely *mentions* CAPTCHA, robots or verification is not a
- * challenge. Never use this result to solve or bypass a site challenge.
+ * challenge. This module only classifies the visible page state; the caller
+ * decides whether a configured provider may attempt a supported solve.
  */
 export type ChallengeSignal = 'url' | 'visible_widget' | 'page_title' | 'foreground_message' | 'short_interstitial';
 

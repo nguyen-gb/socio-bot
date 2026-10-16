@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const execute = promisify(execFile);
@@ -43,7 +43,11 @@ async function processes(): Promise<ProcessIdentity[]> {
 // A PID alone is unsafe after a worker restart: OSes reuse them. Validate both
 // creation time and an unguessable launch marker before terminating a process.
 export class BrowserProcessRegistry {
-  constructor(private readonly root: string) {}
+  private readonly absoluteRoot: string;
+
+  constructor(private readonly root: string) {
+    this.absoluteRoot = resolve(root);
+  }
   private file(profileId: string) {
     if (!/^[a-zA-Z0-9_-]+$/.test(profileId)) throw new Error('Invalid browser profile id');
     return join(this.root, '.processes', `${profileId}.json`);
@@ -69,6 +73,17 @@ export class BrowserProcessRegistry {
     record.pid = match.pid; record.started = match.started;
     await this.save(record);
   }
+
+  /** Return false when the exact managed browser tree has disappeared. */
+  async isAlive(record: BrowserProcessRecord): Promise<boolean | undefined> {
+    let rows: ProcessIdentity[];
+    try { rows = await processes(); }
+    catch (error) {
+      if (error instanceof ProcessInspectionUnavailable) return undefined;
+      throw error;
+    }
+    return rows.some(p => p.command?.includes(`--socio-session-token=${record.token}`));
+  }
   async terminate(record: BrowserProcessRecord): Promise<void> {
     let all: ProcessIdentity[];
     try { all = await processes(); }
@@ -83,7 +98,8 @@ export class BrowserProcessRegistry {
       }
       throw error;
     }
-    const root = all.find(p => p.command?.includes(`--socio-session-token=${record.token}`) && !p.command.includes('--type='));
+    const owned = all.filter(p => p.command?.includes(`--socio-session-token=${record.token}`));
+    const root = owned.find(p => !p.command.includes('--type='));
     if (root) {
       if (record.pid && (root.pid !== record.pid || root.started !== record.started)) throw new Error('Browser process identity changed; refusing termination');
       if (process.platform === 'win32') {
@@ -94,17 +110,56 @@ export class BrowserProcessRegistry {
           try { process.kill(pid, 'SIGKILL'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
         }
       }
+    } else if (process.platform === 'win32') {
+      // A crashed Chrome root can disappear while a child still owns the
+      // profile. Kill only descendants carrying this launch's unguessable
+      // session token; never fall back to taskkill /IM chrome.exe.
+      for (const process of owned) {
+        await execute('taskkill.exe', ['/PID', String(process.pid), '/T', '/F'], { windowsHide: true, timeout: 10_000 }).catch(() => undefined);
+      }
     }
-    if ((await processes()).some(p => p.command?.includes(`--socio-session-token=${record.token}`) && !p.command.includes('--type='))) throw new Error('Chromium process is still running');
+    if ((await processes()).some(p => p.command?.includes(`--socio-session-token=${record.token}`))) throw new Error('Chromium process is still running');
     await this.forget(record);
   }
   async recover(profileId: string, ownerId?: string): Promise<void> {
-    let record: BrowserProcessRecord;
+    let record: BrowserProcessRecord | undefined;
     try { record = JSON.parse(await readFile(this.file(profileId), 'utf8')); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
-    if (record.profileId !== profileId || !/^[0-9a-f-]{36}$/.test(record.token)) throw new Error('Invalid browser process record');
-    if (ownerId && record.ownerId !== ownerId) return;
-    await this.terminate(record);
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (record) {
+      if (record.profileId !== profileId || !/^[0-9a-f-]{36}$/.test(record.token)) throw new Error('Invalid browser process record');
+      if (ownerId && record.ownerId !== ownerId) return;
+      await this.terminate(record);
+    }
+    await this.removeStaleProfileLocks(profileId);
+  }
+
+  /**
+   * Chrome leaves Singleton* files behind after a hard worker/Chrome crash.
+   * They are safe to remove only after process inspection proves that no
+   * browser currently owns this exact profile directory. Never touch locks
+   * when inspection is unavailable: a user's normal Chrome must win over
+   * recovery rather than being accidentally interrupted.
+   */
+  private async removeStaleProfileLocks(profileId: string): Promise<void> {
+    let rows: ProcessIdentity[];
+    try { rows = await processes(); }
+    catch (error) {
+      if (error instanceof ProcessInspectionUnavailable) return;
+      throw error;
+    }
+
+    const profilePath = resolve(this.absoluteRoot, profileId);
+    const normalizedProfilePath = profilePath.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+    const ownsProfile = rows.some((process) => {
+      const command = (process.command ?? '').replace(/["']/g, '').replace(/[\\/]+/g, '/').toLowerCase();
+      return command.includes(`--user-data-dir=${normalizedProfilePath}`)
+        || command.includes(`--user-data-dir=${normalizedProfilePath} `);
+    });
+    if (ownsProfile) throw new Error(`Browser profile is still in use: ${profileId}`);
+
+    for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      await rm(join(profilePath, lockName), { force: true });
+    }
   }
   async forget(record: BrowserProcessRecord): Promise<void> {
     // A late close event must never remove a newer browser's record.

@@ -74,6 +74,36 @@ export class TaskArtifactsService {
     }
   }
 
+  async captureStepScreenshot(
+    taskId: string,
+    taskRunId: string,
+    page: Page,
+    step: string,
+  ): Promise<void> {
+    const safeStep = step.replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'step';
+    const path = await this.temporaryPath('.png');
+    try {
+      await page.screenshot({ path, fullPage: true, timeout: 5_000 });
+      const stored = await this.objects.putFile(
+        `artifacts/tasks/${taskId}/runs/${taskRunId}/steps/${safeStep}-${randomUUID()}.png`,
+        path,
+        'image/png',
+      );
+      await this.prisma.artifact.create({
+        data: {
+          taskId,
+          taskRunId,
+          type: 'STEP_SCREENSHOT',
+          storageUri: stored.uri,
+          contentType: 'image/png',
+          sizeBytes: BigInt(stored.sizeBytes),
+        },
+      });
+    } finally {
+      await rm(path, { force: true });
+    }
+  }
+
   async captureTrace(
     taskId: string,
     taskRunId: string,

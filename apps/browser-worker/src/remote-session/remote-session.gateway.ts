@@ -16,6 +16,11 @@ interface RegisteredSession {
   latestFrame?: string;
 }
 
+interface InputViewport {
+  width: number;
+  height: number;
+}
+
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 720;
 
@@ -23,6 +28,7 @@ const VIEWPORT_HEIGHT = 720;
 export class RemoteSessionGateway implements OnModuleDestroy {
   private readonly inputQueues = new WeakMap<CDPSession, Promise<void>>();
   private readonly mouseStates = new WeakMap<CDPSession, { x: number; y: number; down: boolean }>();
+  private readonly inputViewports = new WeakMap<CDPSession, InputViewport>();
   private readonly sessions = new Map<string, RegisteredSession>();
   private readonly port: number;
   private readonly secret: string;
@@ -85,10 +91,16 @@ export class RemoteSessionGateway implements OnModuleDestroy {
       throw new Error(`Remote session ${sessionId} is already registered`);
     }
 
-    const browser = new RemoteBrowser(page, message => {
+    let browser!: RemoteBrowser;
+    browser = new RemoteBrowser(page, message => {
       if (message['type'] === 'tabChanging') registered.latestFrame = undefined;
       const encoded = JSON.stringify(message);
-      if (message['type'] === 'frame') registered.latestFrame = encoded;
+      if (message['type'] === 'frame') {
+        registered.latestFrame = encoded;
+        const width = typeof message['inputWidth'] === 'number' ? message['inputWidth'] : undefined;
+        const height = typeof message['inputHeight'] === 'number' ? message['inputHeight'] : undefined;
+        if (width && height) this.inputViewports.set(browser.cdp, { width, height });
+      }
       for (const client of registered.clients) if (client.readyState === WebSocket.OPEN) client.send(encoded);
       void this.publisher?.publish(relayChannel(sessionId, 'output'), encoded);
     }, cdp => this.queueCommand(cdp, '{"type":"release"}'));
@@ -274,6 +286,7 @@ export class RemoteSessionGateway implements OnModuleDestroy {
     if (!parsed.success) return;
 
     const command = parsed.data;
+    const viewport = this.inputViewports.get(cdp) ?? { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT };
     const mouse = this.mouseStates.get(cdp) ?? { x: 0, y: 0, down: false };
     this.mouseStates.set(cdp, mouse);
     if (command.type === 'release') {
@@ -284,8 +297,8 @@ export class RemoteSessionGateway implements OnModuleDestroy {
       return;
     }
     if (command.type === 'wheel' || command.type === 'mouse') {
-      mouse.x = Math.min(VIEWPORT_WIDTH - 1, Math.round(command.x * VIEWPORT_WIDTH));
-      mouse.y = Math.min(VIEWPORT_HEIGHT - 1, Math.round(command.y * VIEWPORT_HEIGHT));
+      mouse.x = Math.min(viewport.width - 1, Math.max(0, Math.round(command.x * viewport.width)));
+      mouse.y = Math.min(viewport.height - 1, Math.max(0, Math.round(command.y * viewport.height)));
       if (command.type === 'wheel') {
         await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: mouse.x, y: mouse.y, deltaX: command.deltaX, deltaY: command.deltaY, modifiers: 0 });
       } else {
@@ -300,8 +313,8 @@ export class RemoteSessionGateway implements OnModuleDestroy {
       return;
     }
     if (command.type === 'click') {
-      const x = Math.round(command.x * VIEWPORT_WIDTH);
-      const y = Math.round(command.y * VIEWPORT_HEIGHT);
+      const x = Math.min(viewport.width - 1, Math.max(0, Math.round(command.x * viewport.width)));
+      const y = Math.min(viewport.height - 1, Math.max(0, Math.round(command.y * viewport.height)));
       await cdp.send('Input.dispatchMouseEvent', {
         type: 'mousePressed',
         x,

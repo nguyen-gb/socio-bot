@@ -44,10 +44,14 @@ export type TikTokSearchVideosInput = z.infer<typeof tiktokSearchVideosSchema>;
 
 const tiktokContentFields = {
   name: tiktokCampaignNameSchema,
-  videoUrls: z.array(tiktokVideoUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]),
   text: z.string().trim().max(5_000).default(''),
   mediaAssetIds: facebookMediaIdsSchema,
   intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+};
+
+const tiktokVideoTargetFields = {
+  ...tiktokContentFields,
+  videoUrls: z.array(tiktokVideoUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]),
 };
 
 function refineTikTokContent(input: { text: string; mediaAssetIds: string[] }, context: z.RefinementCtx) {
@@ -57,7 +61,7 @@ function refineTikTokContent(input: { text: string; mediaAssetIds: string[] }, c
 }
 
 const commentTikTokVideosPayloadShape = {
-  ...tiktokContentFields,
+  ...tiktokVideoTargetFields,
   maxVideos: z.number().int().min(1).max(100).default(10),
 };
 export const commentTikTokVideosPayloadSchema = z.object(commentTikTokVideosPayloadShape).superRefine(refineTikTokContent);

@@ -8,10 +8,45 @@ export const PLATFORM_LOGIN = {
   FACEBOOK: { home: 'https://www.facebook.com/', login: 'https://www.facebook.com/login/', authCookies: ['c_user'] },
   INSTAGRAM: { home: 'https://www.instagram.com/', login: 'https://www.instagram.com/accounts/login/', authCookies: ['sessionid'] },
   X: { home: 'https://x.com/home', login: 'https://x.com/i/flow/login', authCookies: ['auth_token'] },
-  TIKTOK: { home: 'https://www.tiktok.com/', login: 'https://www.tiktok.com/login', authCookies: ['sessionid', 'sessionid_ss'] },
+  // TikTok profiles can be authenticated with either the legacy sessionid
+  // pair or the sid/uid cookie family. Keep all first-party auth variants in
+  // the check so a restored Chrome profile is not mistaken for an anonymous
+  // session just because it does not contain the legacy pair.
+  TIKTOK: {
+    home: 'https://www.tiktok.com/',
+    login: 'https://www.tiktok.com/login',
+    authCookies: ['sessionid', 'sessionid_ss', 'sid_tt', 'sid_tt_ss', 'sid_guard', 'uid_tt', 'uid_tt_ss'],
+  },
 } as const;
 export type SupportedPlatform = keyof typeof PLATFORM_LOGIN;
+
+const PLATFORM_SESSION_ORIGINS: Record<SupportedPlatform, readonly string[]> = {
+  FACEBOOK: ['https://www.facebook.com', 'https://facebook.com'],
+  INSTAGRAM: ['https://www.instagram.com'],
+  X: ['https://x.com', 'https://twitter.com'],
+  TIKTOK: ['https://www.tiktok.com'],
+};
+
+/**
+ * Return the first-party origins whose browser storage belongs to a platform
+ * profile. The allowlist is shared by login and every automation action so a
+ * profile does not silently lose origin state just because the action is not
+ * TikTok.
+ */
+export function platformSessionStateOrigins(platform: SupportedPlatform): readonly string[] {
+  return PLATFORM_SESSION_ORIGINS[platform];
+}
+
 type BrowserCookie = Parameters<BrowserContext['addCookies']>[0][number];
+
+export interface PlatformSessionInitializationOptions {
+  /** Legacy option retained for callers; TikTok always starts at its root. */
+  entryUrl?: string;
+  /** Do not redirect a direct-entry flow to the platform login route. */
+  allowLoginFallback?: boolean;
+  /** Do not submit stored credentials in a direct-entry flow. */
+  allowPasswordLogin?: boolean;
+}
 
 export function profileLoginSettings(value: unknown): { credentialsRef?: string } {
   const metadata = asRecord(value);
@@ -89,6 +124,12 @@ export async function isPlatformAuthenticated(session: ManagedBrowserSession, pl
   const baseHost = new URL(PLATFORM_LOGIN[platform].home).hostname.replace(/^www\./, '');
   if (url.hostname !== baseHost && !url.hostname.endsWith(`.${baseHost}`)) return false;
   if (/\/(login|checkpoint|challenge|captcha)(\/|$)/i.test(url.pathname) || await isPlatformChallenged(session, platform)) return false;
+  // A TikTok document can retain the authenticated cookies while the actual
+  // document has been replaced by its anti-bot/HTTP error surface. Treating
+  // that shell as authenticated lets every action continue and later fail in
+  // a misleading place (for example, an empty Inbox composer). Stop at the
+  // session boundary so the operator gets a retry/login-required result.
+  if (platform === 'TIKTOK' && await hasUnusableTikTokDocument(session)) return false;
   if (!(await hasAuthCookie(session, platform))) return false;
   if (await session.page.locator('input[type="password"]:visible').first().isVisible()) return false;
   if (platform === 'FACEBOOK') {
@@ -99,13 +140,45 @@ export async function isPlatformAuthenticated(session: ManagedBrowserSession, pl
   return true;
 }
 
+async function hasUnusableTikTokDocument(session: ManagedBrowserSession): Promise<boolean> {
+  try {
+    return await session.page.evaluate(() => {
+      const visible = (element: Element): boolean => {
+        const style = window.getComputedStyle(element);
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && style.opacity !== '0'
+          && element.getClientRects().length > 0;
+      };
+      const bodyText = (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim();
+      const title = document.title ?? '';
+      if (/access to (?:www\.)?tiktok\.com was denied|you don't have authorization to view this page|http error 403|err_http_response_code_failure/i.test(`${title} ${bodyText}`)) return true;
+      if (/^please wait\.?$/i.test(bodyText) && !document.querySelector('[data-e2e], input, button, video')) return true;
+      const hasRetry = [...document.querySelectorAll('button,a')]
+        .filter(visible)
+        .some(element => /refresh|try again|tải lại|thử lại/i.test((element as HTMLElement).innerText || element.getAttribute('aria-label') || ''));
+      return hasRetry && /something went wrong|please try again later|page unavailable|không thể tải|đã xảy ra lỗi/i.test(bodyText);
+    });
+  } catch {
+    return false;
+  }
+}
+
 export async function initializePlatformSession(
   session: ManagedBrowserSession,
   platform: SupportedPlatform,
   credentials?: ProfileCredentials,
+  options: PlatformSessionInitializationOptions = {},
 ): Promise<void> {
   const settings = PLATFORM_LOGIN[platform];
   if (!settings) throw new Error(`Unsupported login platform: ${String(platform)}`);
+  // TikTok must always get the same cold-start route, including login and
+  // follower/profile actions. The requested surface is opened by the action
+  // only after this shared session/bootstrap step completes.
+  const entryUrl = platform === 'TIKTOK' ? settings.home : options.entryUrl ?? settings.home;
+  const allowLoginFallback = options.allowLoginFallback ?? !options.entryUrl;
+  const allowPasswordLogin = options.allowPasswordLogin ?? !options.entryUrl;
+  const fallbackUrl = platform === 'TIKTOK' && allowLoginFallback ? settings.login : undefined;
   // Prefer the latest browser session over potentially stale imported credentials.
   // Legacy snapshots have no session-cookie sidecar, so seed missing auth cookies.
   let importedCookies = false;
@@ -113,33 +186,66 @@ export async function initializePlatformSession(
     try { await session.context.addCookies(parseCookieInput(credentials.cookies, settings.home)); importedCookies = true; }
     catch { /* Invalid imports must not prevent password/manual fallback. */ }
   }
-  await gotoPlatformPage(
-    session.page,
-    settings.home,
-    platform === 'TIKTOK' ? settings.login : undefined,
-  );
+  await gotoPlatformEntryPage(session, platform, entryUrl, fallbackUrl);
   await waitForLoginPage(session, platform);
   if (await isPlatformChallenged(session, platform) || await isPlatformAuthenticated(session, platform)) return;
   if (credentials?.cookies && !importedCookies) {
     try {
       const cookies = parseCookieInput(credentials.cookies, settings.home);
       await session.context.addCookies(cookies);
-      await gotoPlatformPage(
-        session.page,
-        settings.home,
-        platform === 'TIKTOK' ? settings.login : undefined,
-      );
+      await gotoPlatformEntryPage(session, platform, entryUrl, fallbackUrl);
       await waitForLoginPage(session, platform);
     } catch { /* A stale/invalid import must not suppress password/manual fallback. */ }
     if (await isPlatformChallenged(session, platform) || await isPlatformAuthenticated(session, platform)) return;
   }
-  if (credentials?.login && credentials.password) {
+  if (allowPasswordLogin && credentials?.login && credentials.password) {
     if (!session.page.url().includes('/login')) {
       await gotoPlatformPage(session.page, settings.login);
     }
     await attemptPasswordLogin(platform, session, { login: credentials.login, password: credentials.password });
     await waitForLoginPage(session, platform);
   }
+}
+
+async function gotoPlatformEntryPage(
+  session: ManagedBrowserSession,
+  platform: SupportedPlatform,
+  entryUrl: string,
+  fallbackUrl?: string,
+): Promise<void> {
+  // TikTok's root entry can hand the document to its feed route while
+  // Chromium is still waiting for DOMContentLoaded. That client-side handoff
+  // is reported as ERR_ABORTED at /foryou even though the requested navigation
+  // was the root URL. Use commit for this first navigation and accept the race
+  // without requiring the resulting document to remain on a particular route;
+  // never navigate to /foryou ourselves.
+  if (platform === 'TIKTOK' && entryUrl === PLATFORM_LOGIN.TIKTOK.home) {
+    try {
+      await session.page.goto(entryUrl, { waitUntil: 'commit', timeout: 45_000 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const isNavigationRace = /ERR_ABORTED|ERR_HTTP_RESPONSE_CODE_FAILURE|interrupted by another navigation|chrome-error:\/\/chromewebdata/i.test(message);
+      await session.page.waitForTimeout?.(350);
+      if (!isNavigationRace) throw error;
+    }
+    return;
+  }
+  try {
+    await gotoPlatformPage(session.page, entryUrl, fallbackUrl);
+  } catch (error) {
+    // TikTok can render a usable profile surface while Chromium reports the
+    // entry response as ERR_HTTP_RESPONSE_CODE_FAILURE. In a direct-entry
+    // flow, retry at commit so the worker can inspect that rendered surface;
+    // importantly, do not hide the problem by navigating to Home or Login.
+    if (platform !== 'TIKTOK' || fallbackUrl || !isHttpResponseCodeFailure(error)) throw error;
+    await session.page.waitForTimeout?.(750);
+    await session.page.goto(entryUrl, { waitUntil: 'commit', timeout: 45_000 });
+  }
+}
+
+function isHttpResponseCodeFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(message);
 }
 
 async function waitForLoginPage(session: ManagedBrowserSession, platform: SupportedPlatform): Promise<void> {

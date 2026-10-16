@@ -13,6 +13,7 @@ export class RemoteBrowser {
   private timer?: ReturnType<typeof setInterval>;
   private lastState = '';
   private listeners = new Map<Page, () => void>();
+  private inputViewport = { width: 1280, height: 720 };
   private onPage = (page: Page) => { this.track(page); void this.run(() => this.activate(page)).catch(() => undefined); };
   constructor(page: Page, private emit: (message: { type: string; [key: string]: unknown }) => void, private release: (cdp: CDPSession) => Promise<void>) { this.context = page.context(); }
   run<T>(work: () => Promise<T>): Promise<T> {
@@ -47,12 +48,36 @@ export class RemoteBrowser {
     }
     this.activeId = id;
     this.emit({ type: 'tabChanging', activeTabId: id });
-    await page.setViewportSize({ width: 1280, height: 720 });
+    // Headed sessions are opened in a maximized native Chrome window. Forcing
+    // a 1280x720 Playwright viewport inside that larger window leaves a white
+    // strip on the right of the real browser surface. Keep the native viewport
+    // for headed sessions; retain the fixed logical viewport for headless
+    // sessions used by the remote canvas.
+    const configuredViewport = typeof page.viewportSize === 'function'
+      ? page.viewportSize()
+      : { width: 1280, height: 720 };
+    if (configuredViewport) {
+      await page.setViewportSize({ width: 1280, height: 720 });
+      this.inputViewport = { width: 1280, height: 720 };
+    } else {
+      this.inputViewport = await page.evaluate(() => ({
+        width: Math.max(1, Math.round(window.innerWidth)),
+        height: Math.max(1, Math.round(window.innerHeight)),
+      })).catch(() => ({ width: 1280, height: 720 }));
+    }
     await page.bringToFront();
     const cdp = await this.context.newCDPSession(page); this.cdp = cdp;
     cdp.on('Page.screencastFrame', event => {
       void cdp.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
-      if (!this.disposed && this.cdp === cdp) this.emit({ type: 'frame', tabId: id, data: event.data, width: 1280, height: 720 });
+      if (!this.disposed && this.cdp === cdp) this.emit({
+        type: 'frame',
+        tabId: id,
+        data: event.data,
+        width: 1280,
+        height: 720,
+        inputWidth: this.inputViewport.width,
+        inputHeight: this.inputViewport.height,
+      });
     });
     await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 72, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 });
     await this.state(true);

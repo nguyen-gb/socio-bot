@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type {
   LoginSessionResult,
@@ -15,11 +15,14 @@ import { BROWSER_RUNTIME } from '../runtime/runtime.providers';
 import { ProfileSnapshotsService } from '../storage/profile-snapshots.service';
 import { WorkerRegistryService } from '../worker-registry/worker-registry.service';
 import { SecretsService } from '../secrets/secrets.service';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, profileLoginSettings, PLATFORM_LOGIN, type SupportedPlatform } from './platform-login';
+import { AntiCaptchaService } from '../captcha/anticaptcha.service';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformSessionStateOrigins, profileLoginSettings, PLATFORM_LOGIN, type SupportedPlatform } from './platform-login';
 export { parseCookieInput } from './platform-login';
 
 @Injectable()
 export class LoginSessionActivities {
+  private readonly logger = new Logger(LoginSessionActivities.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly leases: ProfileLeaseService,
@@ -29,6 +32,7 @@ export class LoginSessionActivities {
     private readonly secrets: SecretsService,
     private readonly config: ConfigService<WorkerEnvironment, true>,
     @Inject(BROWSER_RUNTIME) private readonly runtime: BrowserRuntime,
+    @Optional() private readonly anticaptcha?: AntiCaptchaService,
   ) {}
 
   async runInteractiveLoginSession(
@@ -63,6 +67,7 @@ export class LoginSessionActivities {
         if (!initial || initial.status === 'CLOSING' || ['CLOSED', 'CRASHED', 'EXPIRED'].includes(initial.status)) return complete('CLOSED');
         const claimed = await this.prisma.browserSession.updateMany({ where: { id: requestedSession.id, status: 'STARTING' }, data: { workerId: this.registry.workerId } });
         if (claimed.count !== 1) return complete('CLOSED');
+        const platform = requestedSession.profile.account.platform as SupportedPlatform;
         Context.current().heartbeat({ stage: 'restoring_profile_snapshot' });
         await this.snapshots.restore(requestedSession.profile);
         Context.current().heartbeat({ stage: 'opening_login_browser' });
@@ -79,8 +84,10 @@ export class LoginSessionActivities {
           // uses the same headless policy as campaign execution.
           headless: this.config.get('browserHeadless', { infer: true }),
           channel: this.config.get('browserChannel', { infer: true }),
+          automationMode: this.config.get('browserAutomationMode', { infer: true }),
           locale: this.config.get('browserLocale', { infer: true }),
           timezoneId: this.config.get('browserTimezoneId', { infer: true }),
+          sessionStateOrigins: platformSessionStateOrigins(platform),
         });
         const loginSettings = profileLoginSettings(
           requestedSession.profile.metadata,
@@ -88,9 +95,6 @@ export class LoginSessionActivities {
         const credentials = loginSettings.credentialsRef
           ? await this.secrets.profileCredentials(loginSettings.credentialsRef)
           : undefined;
-        const platform = requestedSession.profile.account
-          .platform as SupportedPlatform;
-
         const slot = await this.prisma.workerSlot.findUnique({
           where: {
             workerId_slotIndex: {
@@ -134,6 +138,10 @@ export class LoginSessionActivities {
         if (openedState?.status !== 'RUNNING') return complete('CLOSED');
         await withDeadline(this.gateway.register(requestedSession.id, managed.page), 10_000, 'Remote browser startup timed out');
         await withDeadline(initializePlatformSession(managed, platform, credentials), 150_000, 'Login browser initialization timed out');
+        if (await isPlatformChallenged(managed, platform)) {
+          const captcha = await this.anticaptcha?.trySolveVisibleRecaptcha(managed.page);
+          if (captcha?.solved) await cancellableDelay(750);
+        }
 
         await cancellableDelay(1_500);
         let iteration = 0;
@@ -157,6 +165,7 @@ export class LoginSessionActivities {
             const checking = { ...managed, page: platformPage };
             try {
               const authenticated = await withDeadline(isPlatformAuthenticated(checking, platform), 10_000, 'Browser login check timed out');
+              if (!authenticated && platform === 'TIKTOK') await this.logTikTokAuthenticationDiagnostics(checking);
               status = authenticated ? 'READY' : await withDeadline(isPlatformChallenged(checking, platform), 5_000, 'Browser challenge check timed out') ? 'CHALLENGED' : 'LOGIN_REQUIRED';
             } catch (error) { if (!platformPage.isClosed()) throw error; }
           }
@@ -240,6 +249,24 @@ export class LoginSessionActivities {
         }
       }
     });
+  }
+
+  private async logTikTokAuthenticationDiagnostics(session: ManagedBrowserSession): Promise<void> {
+    try {
+      const cookies = await session.context.cookies('https://www.tiktok.com');
+      const pageState = await session.page.evaluate(() => ({
+        url: window.location.href,
+        title: document.title,
+        body: (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 300),
+        hasNavigation: Boolean(document.querySelector('[data-e2e="nav-messages"], [data-e2e="nav-profile"], [role="navigation"]')),
+      }));
+      this.logger.warn(`TikTok interactive auth check failed: ${JSON.stringify({
+        ...pageState,
+        cookieNames: cookies.map(cookie => cookie.name).sort(),
+      })}`);
+    } catch (error) {
+      this.logger.warn(`TikTok interactive auth diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
 }
