@@ -1,5 +1,5 @@
-import type { ManagedBrowserSession } from '@socio/browser-runtime';
-import { gotoPlatformPage } from '@socio/platform-core';
+import type { FingerprintEmulationOverrides, ManagedBrowserSession } from '@socio/browser-runtime';
+import { clickPlatformReloadButton, gotoPlatformPage, waitForPlatformPageReady } from '@socio/platform-core';
 import type { BrowserContext } from 'playwright';
 import type { ProfileCredentials } from '../secrets/secrets.service';
 import { classifyChallengePage } from './challenge-signals';
@@ -40,8 +40,10 @@ export function platformSessionStateOrigins(platform: SupportedPlatform): readon
 type BrowserCookie = Parameters<BrowserContext['addCookies']>[0][number];
 
 export interface PlatformSessionInitializationOptions {
-  /** Legacy option retained for callers; TikTok always starts at its root. */
+  /** Explicit localized platform entry URL. */
   entryUrl?: string;
+  /** Locale used to build a platform entry URL when entryUrl is omitted. */
+  locale?: string;
   /** Do not redirect a direct-entry flow to the platform login route. */
   allowLoginFallback?: boolean;
   /** Do not submit stored credentials in a direct-entry flow. */
@@ -53,9 +55,57 @@ export function profileLoginSettings(value: unknown): { credentialsRef?: string 
   return typeof metadata.credentialsRef === 'string' ? { credentialsRef: metadata.credentialsRef } : {};
 }
 
+export function profileFingerprintSettings(value: unknown): FingerprintEmulationOverrides | undefined {
+  const metadata = asRecord(value);
+  const fingerprint = metadata.fingerprint;
+  return fingerprint && typeof fingerprint === 'object' && !Array.isArray(fingerprint)
+    ? fingerprint as FingerprintEmulationOverrides
+    : undefined;
+}
+
+function languageCode(locale?: string): string {
+  return (locale?.split('-')[0] || 'en').toLowerCase();
+}
+
+function tiktokLocalePath(locale?: string): string {
+  const language = languageCode(locale);
+  // TikTok uses the country-style segment `vn` for Vietnamese while keeping
+  // the ISO language segment for English and most other locales.
+  return language === 'vi' ? 'vn' : language;
+}
+
+export function platformHomeUrl(platform: SupportedPlatform, locale?: string): string {
+  if (!locale) return PLATFORM_LOGIN[platform].home;
+  const language = languageCode(locale);
+  if (platform === 'TIKTOK') return `https://www.tiktok.com/${tiktokLocalePath(locale)}`;
+  if (platform === 'FACEBOOK') {
+    const region = locale?.split('-')[1]?.toUpperCase() ?? (language === 'vi' ? 'VN' : 'US');
+    return `https://www.facebook.com/?locale=${encodeURIComponent(`${language}_${region}`)}`;
+  }
+  if (platform === 'INSTAGRAM') return `https://www.instagram.com/?hl=${encodeURIComponent(language)}`;
+  return `https://x.com/home?lang=${encodeURIComponent(language)}`;
+}
+
+export function platformHomeUrlForProfile(platform: SupportedPlatform, metadata: unknown): string {
+  return platformHomeUrl(platform, profileFingerprintSettings(metadata)?.locale);
+}
+
+function platformLoginUrl(platform: SupportedPlatform, locale?: string): string {
+  if (!locale) return PLATFORM_LOGIN[platform].login;
+  if (platform === 'TIKTOK') return `https://www.tiktok.com/${tiktokLocalePath(locale)}/login`;
+  const language = languageCode(locale);
+  if (platform === 'FACEBOOK') {
+    const region = locale.split('-')[1]?.toUpperCase() ?? (language === 'vi' ? 'VN' : 'US');
+    return `https://www.facebook.com/login/?locale=${encodeURIComponent(`${language}_${region}`)}`;
+  }
+  if (platform === 'INSTAGRAM') return `https://www.instagram.com/accounts/login/?hl=${encodeURIComponent(language)}`;
+  if (platform === 'X') return `https://x.com/i/flow/login?lang=${encodeURIComponent(language)}`;
+  return PLATFORM_LOGIN.X.login;
+}
+
 async function hasAuthCookie(session: ManagedBrowserSession, platform: SupportedPlatform): Promise<boolean> {
   const settings = PLATFORM_LOGIN[platform];
-  return (await session.context.cookies(settings.home)).some(cookie => settings.authCookies.includes(cookie.name as never) && !!cookie.value);
+  return (await session.context.cookies(settings.home)).some((cookie: { name: string; value: string }) => settings.authCookies.includes(cookie.name as never) && !!cookie.value);
 }
 
 export async function isPlatformChallenged(
@@ -175,10 +225,17 @@ export async function initializePlatformSession(
   // TikTok must always get the same cold-start route, including login and
   // follower/profile actions. The requested surface is opened by the action
   // only after this shared session/bootstrap step completes.
-  const entryUrl = platform === 'TIKTOK' ? settings.home : options.entryUrl ?? settings.home;
-  const allowLoginFallback = options.allowLoginFallback ?? !options.entryUrl;
-  const allowPasswordLogin = options.allowPasswordLogin ?? !options.entryUrl;
-  const fallbackUrl = platform === 'TIKTOK' && allowLoginFallback ? settings.login : undefined;
+  // TikTok campaign/login bootstrap always starts from the canonical root.
+  // Locale-specific routes such as /vn are used only for profile metadata/UI,
+  // never as the first navigation because they can hang on cold sessions.
+  const entryUrl = platform === 'TIKTOK'
+    ? settings.home
+    : options.entryUrl ?? platformHomeUrl(platform, options.locale);
+  const allowLoginFallback = options.allowLoginFallback ?? (!options.entryUrl || Boolean(options.locale));
+  // A localized home URL is still the normal login flow; only an explicit
+  // direct-entry URL without a locale opts out of password submission.
+  const allowPasswordLogin = options.allowPasswordLogin ?? (!options.entryUrl || Boolean(options.locale));
+  const fallbackUrl = platform === 'TIKTOK' && allowLoginFallback ? platformLoginUrl(platform, options.locale) : undefined;
   // Prefer the latest browser session over potentially stale imported credentials.
   // Legacy snapshots have no session-cookie sidecar, so seed missing auth cookies.
   let importedCookies = false;
@@ -219,33 +276,77 @@ async function gotoPlatformEntryPage(
   // was the root URL. Use commit for this first navigation and accept the race
   // without requiring the resulting document to remain on a particular route;
   // never navigate to /foryou ourselves.
-  if (platform === 'TIKTOK' && entryUrl === PLATFORM_LOGIN.TIKTOK.home) {
-    try {
-      await session.page.goto(entryUrl, { waitUntil: 'commit', timeout: 45_000 });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const isNavigationRace = /ERR_ABORTED|ERR_HTTP_RESPONSE_CODE_FAILURE|interrupted by another navigation|chrome-error:\/\/chromewebdata/i.test(message);
-      await session.page.waitForTimeout?.(350);
-      if (!isNavigationRace) throw error;
-    }
+  if (platform === 'TIKTOK') {
+    await gotoTikTokEntryPage(session.page);
     return;
   }
+  await gotoPlatformPage(session.page, entryUrl, fallbackUrl);
+}
+
+async function gotoTikTokEntryPage(page: ManagedBrowserSession['page']): Promise<void> {
+  const entryUrls = ['https://www.tiktok.com/', 'https://www.tiktok.com/en'] as const;
+  let lastError: unknown;
+  for (const target of entryUrls) {
+    try {
+      await page.goto(target, { waitUntil: 'commit', timeout: 45_000 });
+      await waitForPlatformPageReady(page, { settleMs: 600 });
+      if (await hasUnusableTikTokEntryDocument(page)) {
+        // The browser can render a transient 403/chrome-error document even
+        // though the same entry URL succeeds after Chromium's Reload action.
+        // Retry that exact URL once before falling back or reporting failure.
+        await clickPlatformReloadButton(page, { timeoutMs: 45_000 });
+        if (!(await hasUnusableTikTokEntryDocument(page))) return;
+        await page.waitForTimeout?.(350);
+        continue;
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      const navigationRace = /ERR_ABORTED|interrupted by another navigation|chrome-error:\/\/chromewebdata/i.test(message);
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message)) {
+        await clickPlatformReloadButton(page, { timeoutMs: 45_000 });
+        if (!(await hasUnusableTikTokEntryDocument(page))) return;
+      }
+      // A client-side handoff to /foryou is a usable TikTok document even
+      // though Chromium may report the root commit as aborted. Do not replace
+      // that shell with /en; only fall back when the root truly failed.
+      if (navigationRace && isTikTokUsableEntrySurface(page.url())) {
+        await waitForPlatformPageReady(page, { settleMs: 600 });
+        return;
+      }
+      await page.waitForTimeout?.(350);
+    }
+  }
+  if (lastError) throw lastError;
+  throw new Error('TikTok không mở được trang bắt đầu');
+}
+
+function isTikTokUsableEntrySurface(value: string): boolean {
   try {
-    await gotoPlatformPage(session.page, entryUrl, fallbackUrl);
-  } catch (error) {
-    // TikTok can render a usable profile surface while Chromium reports the
-    // entry response as ERR_HTTP_RESPONSE_CODE_FAILURE. In a direct-entry
-    // flow, retry at commit so the worker can inspect that rendered surface;
-    // importantly, do not hide the problem by navigating to Home or Login.
-    if (platform !== 'TIKTOK' || fallbackUrl || !isHttpResponseCodeFailure(error)) throw error;
-    await session.page.waitForTimeout?.(750);
-    await session.page.goto(entryUrl, { waitUntil: 'commit', timeout: 45_000 });
+    const url = new URL(value);
+    if (url.hostname !== 'www.tiktok.com') return false;
+    return url.pathname === '/' || url.pathname === '/en' || url.pathname === '/en/' || url.pathname === '/foryou' || url.pathname === '/foryou/';
+  } catch {
+    return false;
   }
 }
 
-function isHttpResponseCodeFailure(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(message);
+async function hasUnusableTikTokEntryDocument(page: ManagedBrowserSession['page']): Promise<boolean> {
+  if (!page.evaluate) return false;
+  try {
+    return await page.evaluate(() => {
+      const bodyText = (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim();
+      const title = document.title ?? '';
+      if (/access to (?:www\.)?tiktok\.com was denied|you don't have authorization to view this page|http error 403|err_http_response_code_failure/i.test(`${title} ${bodyText}`)) return true;
+      if (/^please wait\.?$/i.test(bodyText) && !document.querySelector('[data-e2e], input, button, video')) return true;
+      const hasRetry = [...document.querySelectorAll('button,a')]
+        .some(element => /refresh|try again|tải lại|thử lại/i.test((element as HTMLElement).innerText || element.getAttribute('aria-label') || ''));
+      return hasRetry && /something went wrong|please try again later|page unavailable|không thể tải|đã xảy ra lỗi/i.test(bodyText);
+    });
+  } catch {
+    return false;
+  }
 }
 
 async function waitForLoginPage(session: ManagedBrowserSession, platform: SupportedPlatform): Promise<void> {

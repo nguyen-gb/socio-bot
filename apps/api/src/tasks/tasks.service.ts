@@ -6,6 +6,23 @@ import { PrismaService } from '../database/prisma.service';
 import { TemporalClientService } from '../temporal/temporal-client.service';
 import { validateFacebookImages } from '../media/facebook-images';
 
+// Browser deadline (15m) + Temporal/teardown grace (17m activity budget).
+const STALE_BROWSER_RUN_MS = 18 * 60_000;
+
+type RetryableTikTokTask = {
+  id: string;
+  organizationId: string;
+  accountId: string;
+  platform: string;
+  action: string;
+  payload: Prisma.JsonValue;
+  status: string;
+  attemptCount: number;
+  lastError: string | null;
+  account: { status: string; browserProfile: { id: string } | null };
+  runs: Array<{ id: string; status: string; startedAt: Date; result: Prisma.JsonValue | null }>;
+};
+
 @Injectable()
 export class TasksService {
   constructor(
@@ -157,14 +174,15 @@ export class TasksService {
   }
 
   async retry(organizationId: string, id: string) {
-    const task = await this.prisma.task.findFirst({
+    let task: RetryableTikTokTask | null = await this.prisma.task.findFirst({
       where: { id, organizationId },
       include: {
-        account: { select: { status: true } },
+        account: { select: { status: true, browserProfile: { select: { id: true } } } },
         runs: { orderBy: { startedAt: 'desc' }, take: 1 },
       },
-    });
+    }) as RetryableTikTokTask | null;
     if (!task) throw new NotFoundException('Task not found');
+    task = await this.reconcileStaleBrowserRun(organizationId, task as RetryableTikTokTask);
     if (task.platform !== 'TIKTOK' || task.action !== 'SEARCH_TIKTOK_VIDEOS') {
       throw new BadRequestException('Chỉ có thể chạy lại campaign Search video TikTok bằng thao tác này.');
     }
@@ -172,56 +190,83 @@ export class TasksService {
     return this.retryTikTokTask(organizationId, task);
   }
 
-  async retryAction(organizationId: string, id: string, userId?: string) {
-    const task = await this.prisma.task.findFirst({
+  async retryAction(organizationId: string, id: string, userId?: string, confirmResultChecked = false) {
+    let task: RetryableTikTokTask | null = await this.prisma.task.findFirst({
       where: { id, organizationId },
       include: {
-        account: { select: { status: true } },
+        account: { select: { status: true, browserProfile: { select: { id: true } } } },
         runs: { orderBy: { startedAt: 'desc' }, take: 1 },
       },
-    });
+    }) as RetryableTikTokTask | null;
     if (!task) throw new NotFoundException('Task not found');
+    task = await this.reconcileStaleBrowserRun(organizationId, task as RetryableTikTokTask);
     if (task.platform !== 'TIKTOK' || !requiresExternalApproval(task.action)) {
       throw new BadRequestException('Chỉ có thể chạy lại campaign hành động TikTok bằng thao tác này.');
     }
-    this.assertRetryableTikTokTask(task);
-    return this.retryTikTokTask(organizationId, task, userId);
+    this.assertRetryableTikTokTask(task, confirmResultChecked);
+    return this.retryTikTokTask(organizationId, task, userId, confirmResultChecked);
   }
 
   async cancel(organizationId: string, id: string) {
-    return this.prisma.$transaction(async tx => {
+    const control = await this.prisma.$transaction(async tx => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`tiktok/task/${id}`}))`;
-      const task = await tx.task.findFirst({ where: { id, organizationId } });
+      const task = await tx.task.findFirst({
+        where: { id, organizationId },
+        include: { account: { select: { browserProfile: { select: { id: true } } } } },
+      });
       if (!task) throw new NotFoundException('Task not found');
       if (task.platform !== 'TIKTOK') throw new BadRequestException('Chỉ có thể hủy campaign TikTok bằng thao tác này.');
-      if (task.status === 'SUCCEEDED' || task.status === 'CANCELLED') {
-        throw new ConflictException('Campaign đã kết thúc và không thể hủy thêm.');
+      if (task.status === 'CANCELLED') {
+        return { workflowId: task.workflowId, response: { cancelled: 0, cancelRequested: false, message: 'Campaign đã được hủy.' } };
+      }
+      if (task.status === 'SUCCEEDED') {
+        return { workflowId: undefined, response: { cancelled: 0, cancelRequested: false, message: 'Campaign đã hoàn tất.' } };
       }
       const now = new Date();
       if (task.status === 'RUNNING') {
         const updated = await tx.task.updateMany({
-          where: { id, organizationId, status: 'RUNNING', cancelledAt: null },
-          data: { cancelledAt: now, pausedAt: null },
+          where: { id, organizationId, status: 'RUNNING' },
+          data: { status: 'CANCELLED', cancelledAt: task.cancelledAt ?? now, pausedAt: null, lastError: null },
         });
-        if (updated.count !== 1 && !task.cancelledAt) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
-        return { cancelled: 0, cancelRequested: true, message: 'Đã yêu cầu hủy. Tác vụ đang chạy sẽ kết thúc an toàn rồi chuyển sang Đã hủy; không khởi chạy phần tiếp theo.' };
+        if (updated.count !== 1) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
+        await tx.taskRun.updateMany({
+          where: { taskId: id, status: 'RUNNING' },
+          data: { status: 'CANCELLED', finishedAt: now, errorCode: 'TASK_CANCELLED', error: null },
+        });
+        const browserCloseRequested = await this.requestTaskBrowserStop(tx, task.accountId, task.account.browserProfile?.id, now);
+        return {
+          workflowId: task.workflowId,
+          response: {
+            cancelled: 1,
+            cancelRequested: false,
+            browserCloseRequested,
+            message: 'Đã hủy campaign và yêu cầu dừng browser đang chạy.',
+          },
+        };
       }
       if (task.cancelledAt) {
-        return { cancelled: 0, cancelRequested: false, message: 'Campaign đã được yêu cầu hủy.' };
+        return { workflowId: task.workflowId, response: { cancelled: 0, cancelRequested: false, message: 'Campaign đã được yêu cầu hủy.' } };
       }
       const updated = await tx.task.updateMany({
         where: { id, organizationId, status: { in: ['DRAFT', 'SCHEDULED', 'QUEUED', 'PAUSED', 'FAILED', 'REQUIRES_ACTION'] } },
         data: { status: 'CANCELLED', cancelledAt: now, pausedAt: null, approvalStatus: task.approvalStatus === 'PENDING' ? 'REJECTED' : undefined, rejectedAt: task.approvalStatus === 'PENDING' ? now : undefined },
       });
       if (updated.count !== 1) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
-      return { cancelled: 1, cancelRequested: false, message: 'Đã hủy phần chưa chạy của campaign TikTok.' };
+      return { workflowId: task.workflowId, response: { cancelled: 1, cancelRequested: false, message: 'Đã hủy phần chưa chạy của campaign TikTok.' } };
     });
+    const workflowCancellationRequested = control.workflowId
+      ? await this.temporal.cancelTask(control.workflowId)
+      : false;
+    return { ...control.response, workflowCancellationRequested };
   }
 
   async pause(organizationId: string, id: string) {
-    return this.prisma.$transaction(async tx => {
+    const control = await this.prisma.$transaction(async tx => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`tiktok/task/${id}`}))`;
-      const task = await tx.task.findFirst({ where: { id, organizationId } });
+      const task = await tx.task.findFirst({
+        where: { id, organizationId },
+        include: { account: { select: { browserProfile: { select: { id: true } } } } },
+      });
       if (!task) throw new NotFoundException('Task not found');
       if (task.platform !== 'TIKTOK') throw new BadRequestException('Chỉ có thể dừng campaign TikTok bằng thao tác này.');
       if (task.status === 'SUCCEEDED' || task.status === 'CANCELLED' || task.cancelledAt) {
@@ -229,7 +274,7 @@ export class TasksService {
       }
       if (task.status === 'PAUSED') {
         if (!task.pausedAt) await tx.task.update({ where: { id }, data: { pausedAt: new Date() } });
-        return { paused: 0, pauseRequested: false, alreadyPaused: true, message: 'Campaign đã đang tạm dừng.' };
+        return { workflowId: task.workflowId, response: { paused: 0, pauseRequested: false, alreadyPaused: true, message: 'Campaign đã đang tạm dừng.' } };
       }
       if (!['RUNNING', 'SCHEDULED', 'QUEUED'].includes(task.status)) {
         throw new ConflictException('Campaign không ở trạng thái đang chạy hoặc đang chờ để tạm dừng.');
@@ -237,19 +282,36 @@ export class TasksService {
       const now = new Date();
       if (task.status === 'RUNNING') {
         const updated = await tx.task.updateMany({
-          where: { id, organizationId, status: 'RUNNING', pausedAt: null, cancelledAt: null },
-          data: { pausedAt: now },
+          where: { id, organizationId, status: 'RUNNING', cancelledAt: null },
+          data: { status: 'PAUSED', pausedAt: task.pausedAt ?? now, lastError: null },
         });
-        if (updated.count !== 1 && !task.pausedAt) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
-        return { paused: 0, pauseRequested: true, message: 'Đã yêu cầu tạm dừng. Tác vụ đang chạy sẽ kết thúc an toàn trước khi dừng.' };
+        if (updated.count !== 1) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
+        await tx.taskRun.updateMany({
+          where: { taskId: id, status: 'RUNNING' },
+          data: { status: 'CANCELLED', finishedAt: now, errorCode: 'TASK_PAUSED', error: null },
+        });
+        const browserCloseRequested = await this.requestTaskBrowserStop(tx, task.accountId, task.account.browserProfile?.id, now);
+        return {
+          workflowId: task.workflowId,
+          response: {
+            paused: 1,
+            pauseRequested: false,
+            browserCloseRequested,
+            message: 'Đã tạm dừng campaign và yêu cầu đóng browser đang chạy.',
+          },
+        };
       }
       const updated = await tx.task.updateMany({
         where: { id, organizationId, status: { in: ['SCHEDULED', 'QUEUED'] }, pausedAt: null, cancelledAt: null },
         data: { status: 'PAUSED', pausedAt: now },
       });
       if (updated.count !== 1) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
-      return { paused: 1, pauseRequested: false, message: 'Đã tạm dừng campaign TikTok; chưa mở browser cho phần còn lại.' };
+      return { workflowId: task.workflowId, response: { paused: 1, pauseRequested: false, message: 'Đã tạm dừng campaign TikTok; chưa mở browser cho phần còn lại.' } };
     });
+    const workflowCancellationRequested = control.workflowId
+      ? await this.temporal.cancelTask(control.workflowId)
+      : false;
+    return { ...control.response, workflowCancellationRequested };
   }
 
   async resume(organizationId: string, id: string) {
@@ -324,7 +386,7 @@ export class TasksService {
     account: { status: string };
     attemptCount: number;
     runs: Array<{ result: Prisma.JsonValue | null }>;
-  }) {
+  }, allowVerifiedRetry = false) {
     if (!['FAILED', 'REQUIRES_ACTION'].includes(task.status)) {
       throw new ConflictException('Campaign này hiện không ở trạng thái có thể chạy lại.');
     }
@@ -335,15 +397,16 @@ export class TasksService {
     const sideEffectStarted = result && typeof result === 'object' && !Array.isArray(result)
       ? (result as Record<string, unknown>).sideEffectStarted
       : undefined;
-    if (task.attemptCount > 0 && sideEffectStarted !== false) {
+    if (task.attemptCount > 0 && sideEffectStarted !== false && !this.canContinueFromCheckpoint(task.action, result) && !allowVerifiedRetry) {
       throw new ConflictException('Kết quả action chưa rõ. Hãy kiểm tra TikTok và xác nhận thủ công trước khi chạy lại để tránh gửi trùng.');
     }
   }
 
   private async retryTikTokTask(
     organizationId: string,
-    task: { id: string; accountId: string; action: string },
+    task: RetryableTikTokTask,
     userId?: string,
+    allowVerifiedRetry = false,
   ) {
     let scheduledAt = new Date();
     const now = Date.now();
@@ -371,10 +434,12 @@ export class TasksService {
       );
       scheduledAt = new Date(queueTail);
       const actionRequiresApproval = requiresExternalApproval(current.action);
+      const continuationPayload = this.continuationPayload(task, allowVerifiedRetry);
       const updated = await tx.task.updateMany({
         where: { id: task.id, organizationId, status: { in: ['FAILED', 'REQUIRES_ACTION'] } },
         data: {
           workflowId,
+          ...(continuationPayload ? { payload: continuationPayload } : {}),
           attemptCount: 0,
           scheduledAt,
           status: scheduledAt.getTime() > now ? 'SCHEDULED' : 'QUEUED',
@@ -396,6 +461,92 @@ export class TasksService {
       });
     }
     return this.prisma.task.findUniqueOrThrow({ where: { id: task.id } });
+  }
+
+  private canContinueFromCheckpoint(action: string, result: Prisma.JsonValue | null | undefined): boolean {
+    if (!['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action)) return false;
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+    if ((result as Record<string, unknown>).checkpointUncertain === true) return false;
+    const report = (result as Record<string, unknown>).report;
+    if (!report || typeof report !== 'object' || Array.isArray(report)) return false;
+    const entries = (report as Record<string, unknown>).entries;
+    if (!Array.isArray(entries) || entries.length === 0) return false;
+    return entries.every((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+      const status = (entry as Record<string, unknown>).status;
+      return status === 'SENT' || status === 'LIKED';
+    });
+  }
+
+  private continuationPayload(task: RetryableTikTokTask, allowUncertainCheckpoint = false): Prisma.InputJsonValue | undefined {
+    const payload = task.payload && typeof task.payload === 'object' && !Array.isArray(task.payload)
+      ? { ...(task.payload as Record<string, unknown>) }
+      : undefined;
+    const result = task.runs[0]?.result;
+    if (!payload || !result || typeof result !== 'object' || Array.isArray(result)) return undefined;
+    if (!allowUncertainCheckpoint && !this.canContinueFromCheckpoint(task.action, result)) return undefined;
+    const report = (result as Record<string, unknown>).report as Record<string, unknown>;
+    if (!report || typeof report !== 'object' || Array.isArray(report) || !Array.isArray(report.entries)) return undefined;
+    const entries = (report.entries as unknown[]).filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object' && !Array.isArray(entry)))
+      .filter(entry => entry.status === 'SENT' || entry.status === 'LIKED');
+    if (entries.length === 0) return undefined;
+    const completedVideoUrls = entries
+      .map((entry) => typeof entry.videoUrl === 'string' ? entry.videoUrl : undefined)
+      .filter((value): value is string => Boolean(value));
+    const completedUsernames = entries
+      .map((entry) => typeof entry.username === 'string' ? entry.username : undefined)
+      .filter((value): value is string => Boolean(value));
+    const priorCompleted = typeof payload.resumeCompletedCount === 'number' && Number.isFinite(payload.resumeCompletedCount)
+      ? payload.resumeCompletedCount
+      : 0;
+    if (completedVideoUrls.length > 0 && ['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS'].includes(task.action)) {
+      const existing = Array.isArray(payload.excludeVideoUrls) ? payload.excludeVideoUrls.filter((value): value is string => typeof value === 'string') : [];
+      const newlyCompleted = [...new Set(completedVideoUrls)].filter(videoUrl => !existing.includes(videoUrl));
+      payload.excludeVideoUrls = [...new Set([...existing, ...completedVideoUrls])];
+      payload.resumeCompletedCount = priorCompleted + newlyCompleted.length;
+    }
+    if (completedUsernames.length > 0 && task.action === 'MESSAGE_TIKTOK_FOLLOWERS') {
+      const existing = Array.isArray(payload.excludeUsernames) ? payload.excludeUsernames.filter((value): value is string => typeof value === 'string') : [];
+      const newlyCompleted = [...new Set(completedUsernames)].filter(username => !existing.includes(username));
+      payload.excludeUsernames = [...new Set([...existing, ...completedUsernames])];
+      payload.resumeCompletedCount = priorCompleted + newlyCompleted.length;
+    }
+    return payload as Prisma.InputJsonValue;
+  }
+
+  private async reconcileStaleBrowserRun<T extends RetryableTikTokTask>(organizationId: string, task: T): Promise<T> {
+    if (task.platform !== 'TIKTOK' || task.status !== 'RUNNING') return task;
+    const run = task.runs[0];
+    if (!run?.startedAt || Date.now() - new Date(run.startedAt).getTime() < STALE_BROWSER_RUN_MS) return task;
+    const result = run.result && typeof run.result === 'object' && !Array.isArray(run.result)
+      ? run.result as Record<string, unknown>
+      : {};
+    const sideEffectStarted = result.sideEffectStarted === true;
+    const nextStatus = sideEffectStarted ? 'REQUIRES_ACTION' : 'FAILED';
+    const message = sideEffectStarted
+      ? 'Browser đã hết thời hạn sau khi bắt đầu hành động; checkpoint đã được lưu. Hãy kiểm tra TikTok trước khi chạy tiếp để tránh gửi trùng.'
+      : 'Browser đã hết thời hạn trước khi gửi; checkpoint đã được lưu và có thể tiếp tục phần còn lại.';
+    const now = new Date();
+    await this.prisma.$transaction(async tx => {
+      const claimed = await tx.task.updateMany({
+        where: { id: task.id, organizationId, status: 'RUNNING' },
+        data: { status: nextStatus, lastError: message },
+      });
+      if (claimed.count !== 1) return;
+      await tx.taskRun.updateMany({
+        where: { id: run.id, status: 'RUNNING' },
+        data: { status: 'FAILED', finishedAt: now, errorCode: 'BROWSER_TASK_TIMEOUT', error: message },
+      });
+      await tx.platformAccount.updateMany({ where: { id: task.accountId, status: 'RUNNING' }, data: { status: 'READY' } });
+      if (task.account.browserProfile?.id) {
+        await tx.browserProfile.updateMany({ where: { id: task.account.browserProfile.id, status: 'LEASED' }, data: { status: 'AVAILABLE' } });
+        await tx.browserSession.updateMany({
+          where: { profileId: task.account.browserProfile.id, status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } },
+          data: { status: 'CLOSED', closedAt: now },
+        });
+      }
+    });
+    return { ...task, status: nextStatus, lastError: message, account: { ...task.account, status: 'READY' } };
   }
 
   private async approveTikTokTask(organizationId: string, id: string, accountId: string, userId?: string) {
@@ -470,6 +621,31 @@ export class TasksService {
     const minimumDuration = payload.query ? 30 : 15;
     const durationSeconds = Math.max(minimumDuration, actionCount * intervalSeconds);
     return start + Math.min(durationSeconds, 24 * 60 * 60) * 1_000;
+  }
+
+  private async requestTaskBrowserStop(
+    tx: Prisma.TransactionClient,
+    accountId: string,
+    profileId: string | undefined,
+    now: Date,
+  ): Promise<boolean> {
+    if (!profileId) {
+      await tx.platformAccount.updateMany({ where: { id: accountId, status: 'RUNNING' }, data: { status: 'READY' } });
+      return false;
+    }
+
+    const sessions = await tx.browserSession.updateMany({
+      where: { profileId, status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } },
+      data: { status: 'CLOSING', forceCloseRequestedAt: now },
+    });
+    if (sessions.count === 0) {
+      // A worker restart can remove the browser session while leaving the task,
+      // run, account and profile marked active. With no live session there is
+      // nothing left to wait for, so release those records immediately.
+      await tx.browserProfile.updateMany({ where: { id: profileId, status: { in: ['LEASED', 'SNAPSHOTTING'] } }, data: { status: 'AVAILABLE' } });
+      await tx.platformAccount.updateMany({ where: { id: accountId, status: 'RUNNING' }, data: { status: 'READY' } });
+    }
+    return sessions.count > 0;
   }
 
   private positiveNumber(value: unknown, fallback: number): number {

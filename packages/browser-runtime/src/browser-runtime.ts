@@ -1,11 +1,20 @@
 import { mkdir, readdir, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { chromium, type BrowserContext, type Page } from 'playwright';
+import { chromium } from 'patchright';
+import type { BrowserContext, Page } from 'playwright';
 import type { PlatformSession } from '@socio/platform-core';
 import { SlotPool, type SlotLease } from './slot-pool';
 import { ProfileSessionCookies, type ProfileSessionStateOptions } from './profile-session-cookies';
 import { BrowserProcessRegistry, type BrowserProcessRecord } from './browser-process';
 import { withDeadline } from './deadline';
+import {
+  fingerprintLaunchOptions,
+  type FingerprintEmulationOverrides,
+  installFingerprintEmulation,
+  loadFingerprintEmulation,
+} from './fingerprint-emulation';
+
+const DEFAULT_EXECUTION_TIMEOUT_MS = 15 * 60_000;
 
 export interface RuntimeProxy {
   server: string;
@@ -18,24 +27,23 @@ export interface BrowserViewport {
   height: number;
 }
 
-export type BrowserAutomationMode = 'playwright' | 'chrome';
+export type BrowserColorScheme = 'light' | 'dark' | 'no-preference';
 
 export interface OpenProfileOptions {
   profileId: string;
   ownerId?: string;
   proxy?: RuntimeProxy;
   headless?: boolean;
-  /** Optional installed browser channel, for example `chrome` or `msedge`. */
+  /** Installed browser channel. Defaults to the demo's Google Chrome Stable. */
   channel?: string;
-  /**
-   * Launch with Playwright's defaults, or with the branded Chrome defaults
-   * used by a regular interactive Chrome window. The Chrome mode only removes
-   * Playwright's automation switch and keeps the browser UA/device settings
-   * unchanged.
-   */
-  automationMode?: BrowserAutomationMode;
   locale?: string;
   timezoneId?: string;
+  /** Leave unset to follow the host OS preference. */
+  colorScheme?: BrowserColorScheme;
+  /** Enable the saved per-profile browser-environment/fingerprint bundle. */
+  emulateFingerprint?: boolean;
+  /** Profile-level fingerprint settings loaded from BrowserProfile.metadata. */
+  fingerprint?: FingerprintEmulationOverrides;
   /** `null` follows the native browser window size, like a normal Chrome window. */
   viewport?: BrowserViewport | null;
   slotTimeoutMs?: number;
@@ -74,6 +82,8 @@ interface ActiveSession {
   record: BrowserProcessRecord;
   abort: AbortController;
   forcing?: Promise<void>;
+  /** Set immediately before an intentional context.close() call. */
+  contextCloseRequested?: boolean;
   persistenceAbort: AbortController;
   sessionState: ProfileSessionStateOptions;
   processWatchdog?: ReturnType<typeof setInterval>;
@@ -128,9 +138,16 @@ export class BrowserRuntime {
     try {
       await mkdir(profilePath, { recursive: true });
       record = await this.processes.begin(options.profileId, options.ownerId);
+      const fingerprint = options.emulateFingerprint
+        ? await loadFingerprintEmulation(profilePath, {
+          locale: options.locale,
+          timezoneId: options.timezoneId,
+          viewport: options.viewport,
+          colorScheme: options.colorScheme,
+        }, options.fingerprint)
+        : undefined;
       const viewport = options.viewport ?? null;
       const headless = options.headless ?? true;
-      const automationMode = options.automationMode ?? 'playwright';
       const launchArgs = [
         `--socio-session-token=${record.token}`,
         // With viewport:null, this gives headed local runs the same initial
@@ -138,25 +155,20 @@ export class BrowserRuntime {
         // used in headless/container runs.
         ...(!headless ? ['--start-maximized'] : []),
       ];
-      const ignoredDefaultArgs = [
-        // Headless Chromium hides native scrollbars by default. Remote users
-        // need visible, draggable thumbs just like in a normal browser.
-        '--hide-scrollbars',
-        ...(automationMode === 'chrome' ? ['--enable-automation'] : []),
-      ];
       context = await chromium.launchPersistentContext(profilePath, {
         args: launchArgs,
-        ignoreDefaultArgs: ignoredDefaultArgs,
+        // Headless Chromium hides native scrollbars by default. Remote users
+        // need visible, draggable thumbs just like in a normal browser.
+        ignoreDefaultArgs: ['--hide-scrollbars'],
         timeout: 45_000,
         headless,
-        channel: options.channel,
-        // Playwright otherwise adds --no-sandbox by default. Keep the real
+        channel: options.channel ?? 'chrome',
+        // Patchright otherwise adds --no-sandbox by default. Keep the real
         // Chromium sandbox enabled so headed Chrome does not show the
         // unsupported command-line flag warning and retains normal isolation.
         chromiumSandbox: true,
-        // Keep the page surface close to a regular Chrome window. Chrome mode
-        // only suppresses Playwright's automation launch marker; it does not
-        // add unsupported command-line flags or spoof page APIs.
+        // Match the demo's browser-context environment. When emulation is
+        // enabled, the saved per-profile bundle below overrides this baseline.
         viewport,
         ...(viewport ? { deviceScaleFactor: 1 } : {}),
         isMobile: false,
@@ -165,6 +177,9 @@ export class BrowserRuntime {
         // matching a normal Chrome launch instead of emulating a fixed theme.
         locale: options.locale,
         timezoneId: options.timezoneId,
+        colorScheme: options.colorScheme,
+        bypassCSP: fingerprint !== undefined,
+        ...(fingerprint ? fingerprintLaunchOptions(fingerprint) : {}),
         // Do not inject a DNT header. Chrome does not send it by default, and
         // forcing a privacy header makes the anonymous search profile less
         // like an ordinary user-created Chrome profile without reliably
@@ -173,7 +188,8 @@ export class BrowserRuntime {
         recordHar: options.recordHarPath
           ? { path: options.recordHarPath, content: 'omit', mode: 'minimal' }
           : undefined,
-      });
+      }) as unknown as BrowserContext;
+      if (fingerprint) await installFingerprintEmulation(context, fingerprint);
       await this.processes.identify(record);
       context.setDefaultTimeout(15_000);
       context.setDefaultNavigationTimeout(45_000);
@@ -225,8 +241,11 @@ export class BrowserRuntime {
     active.processWatchdog.unref?.();
     context.once('close', () => {
       abort.abort(new Error('Browser was closed'));
-      // Keep the slot until controlled close/force-close has verified termination.
-      if (!this.sessions.get(options.profileId)?.closing && !this.sessions.get(options.profileId)?.forcing) {
+      const active = this.sessions.get(options.profileId);
+      // A context can disappear while a graceful close is blocked in cookie
+      // persistence. Escalate immediately unless this close event was caused
+      // by our own intentional context.close() call.
+      if (active && !active.contextCloseRequested && !active.forcing) {
         void this.forceCloseProfile(options.profileId, options.ownerId).catch(() => undefined);
       }
     });
@@ -246,7 +265,7 @@ export class BrowserRuntime {
         session.signal?.addEventListener('abort', onAbort, { once: true });
         if (session.signal?.aborted) onAbort();
       });
-      return await withDeadline(Promise.race([callback(session), aborted]), options.executionTimeoutMs ?? 5 * 60_000, 'Browser task timed out; browser will be terminated');
+      return await withDeadline(Promise.race([callback(session), aborted]), options.executionTimeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS, 'Browser task timed out; browser will be terminated');
     } finally {
       if (onAbort) session.signal?.removeEventListener('abort', onAbort);
       if (options.closeOnComplete !== false) await session.close();
@@ -276,6 +295,7 @@ export class BrowserRuntime {
                 active.sessionState,
               );
             }
+            active.contextCloseRequested = true;
             await active.context.close();
             // Playwright normally closes the persistent context's Chromium
             // tree. Verify the exact managed process as well so a crashed
@@ -298,15 +318,25 @@ export class BrowserRuntime {
     if (!active) {
       // Do not race an in-progress launch; its own startup timeout is bounded.
       const pending = this.opening.get(profileId);
-      if (pending) { await pending.catch(() => undefined); return this.forceCloseProfile(profileId, ownerId); }
-      return this.processes.recover(profileId, ownerId);
+      if (pending) {
+        await withDeadline(pending.catch(() => undefined), this.forceCloseTimeoutMs, 'Browser launch close timed out').catch(() => undefined);
+        const current = this.sessions.get(profileId);
+        if (current) return this.forceCloseProfile(profileId, ownerId);
+      }
+      await withDeadline(this.processes.recover(profileId, ownerId), this.forceCloseTimeoutMs, 'Browser recovery timed out').catch(() => undefined);
+      return;
     }
     if (ownerId && active.ownerId !== ownerId) return;
     if (!active.forcing) active.forcing = (async () => {
       active.abort.abort(new Error('Browser was force closed'));
       active.persistenceAbort.abort(new Error('Browser session state save cancelled'));
-      await this.processes.terminate(active.record);
-      if (active.ephemeral) await this.removeEphemeralProfile(active.profilePath);
+      // Force-close is deliberately bounded. The browser may already be
+      // gone, or Windows process inspection/taskkill may be unavailable; in
+      // either case callers must not keep a worker session in CLOSING forever.
+      await withDeadline(this.processes.terminate(active.record), this.forceCloseTimeoutMs, 'Browser termination timed out').catch(() => undefined);
+      if (active.ephemeral) {
+        await withDeadline(this.removeEphemeralProfile(active.profilePath), this.forceCloseTimeoutMs, 'Ephemeral profile cleanup timed out').catch(() => undefined);
+      }
       this.release(profileId, active);
     })();
     try { await active.forcing; }
@@ -356,7 +386,7 @@ export class BrowserRuntime {
 
   private async watchProcess(profileId: string, expected: ActiveSession): Promise<void> {
     const active = this.sessions.get(profileId);
-    if (!active || active !== expected || active.closing || active.forcing) return;
+    if (!active || active !== expected || active.forcing) return;
     try {
       const alive = await this.processes.isAlive(active.record);
       if (alive === false) {
@@ -372,6 +402,15 @@ export class BrowserRuntime {
 
   private async removeEphemeralProfile(profilePath: string): Promise<void> {
     await rm(profilePath, { recursive: true, force: true });
+  }
+
+  /**
+   * Graceful close is intentionally short, but Windows process enumeration
+   * and taskkill can each need several seconds. Never release a profile while
+   * that exact browser tree is still being terminated.
+   */
+  private get forceCloseTimeoutMs(): number {
+    return Math.max(this.closeTimeoutMs, 15_000);
   }
 }
 

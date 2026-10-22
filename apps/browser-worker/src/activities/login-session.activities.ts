@@ -16,7 +16,7 @@ import { ProfileSnapshotsService } from '../storage/profile-snapshots.service';
 import { WorkerRegistryService } from '../worker-registry/worker-registry.service';
 import { SecretsService } from '../secrets/secrets.service';
 import { AntiCaptchaService } from '../captcha/anticaptcha.service';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformSessionStateOrigins, profileLoginSettings, PLATFORM_LOGIN, type SupportedPlatform } from './platform-login';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrlForProfile, platformSessionStateOrigins, profileFingerprintSettings, profileLoginSettings, PLATFORM_LOGIN, type SupportedPlatform } from './platform-login';
 export { parseCookieInput } from './platform-login';
 
 @Injectable()
@@ -68,6 +68,9 @@ export class LoginSessionActivities {
         const claimed = await this.prisma.browserSession.updateMany({ where: { id: requestedSession.id, status: 'STARTING' }, data: { workerId: this.registry.workerId } });
         if (claimed.count !== 1) return complete('CLOSED');
         const platform = requestedSession.profile.account.platform as SupportedPlatform;
+        const emulateFingerprint = this.config.get('browserFingerprintEmulation', { infer: true });
+        const fingerprint = emulateFingerprint ? profileFingerprintSettings(requestedSession.profile.metadata) : undefined;
+        const localizedHomeUrl = platformHomeUrlForProfile(platform, requestedSession.profile.metadata);
         Context.current().heartbeat({ stage: 'restoring_profile_snapshot' });
         await this.snapshots.restore(requestedSession.profile);
         Context.current().heartbeat({ stage: 'opening_login_browser' });
@@ -84,9 +87,12 @@ export class LoginSessionActivities {
           // uses the same headless policy as campaign execution.
           headless: this.config.get('browserHeadless', { infer: true }),
           channel: this.config.get('browserChannel', { infer: true }),
-          automationMode: this.config.get('browserAutomationMode', { infer: true }),
-          locale: this.config.get('browserLocale', { infer: true }),
-          timezoneId: this.config.get('browserTimezoneId', { infer: true }),
+          locale: fingerprint?.locale ?? this.config.get('browserLocale', { infer: true }),
+          timezoneId: fingerprint?.timezoneId ?? this.config.get('browserTimezoneId', { infer: true }),
+          colorScheme: fingerprint?.colorScheme ?? this.config.get('browserColorScheme', { infer: true }),
+          viewport: fingerprint?.viewport ?? this.config.get('browserViewport', { infer: true }),
+          emulateFingerprint,
+          fingerprint,
           sessionStateOrigins: platformSessionStateOrigins(platform),
         });
         const loginSettings = profileLoginSettings(
@@ -137,7 +143,7 @@ export class LoginSessionActivities {
         const openedState = await this.prisma.browserSession.findUnique({ where: { id: requestedSession.id } });
         if (openedState?.status !== 'RUNNING') return complete('CLOSED');
         await withDeadline(this.gateway.register(requestedSession.id, managed.page), 10_000, 'Remote browser startup timed out');
-        await withDeadline(initializePlatformSession(managed, platform, credentials), 150_000, 'Login browser initialization timed out');
+        await withDeadline(initializePlatformSession(managed, platform, credentials, { locale: fingerprint?.locale, entryUrl: localizedHomeUrl }), 150_000, 'Login browser initialization timed out');
         if (await isPlatformChallenged(managed, platform)) {
           const captcha = await this.anticaptcha?.trySolveVisibleRecaptcha(managed.page);
           if (captcha?.solved) await cancellableDelay(750);
@@ -159,7 +165,7 @@ export class LoginSessionActivities {
           if (!state || state.status === 'CLOSING' || managed.signal?.aborted) return complete('CLOSED');
           // Closing the original tab or browsing another site must not crash the
           // session or falsely mark a logged-in account as LOGIN_REQUIRED.
-          const platformPage = this.gateway.getPlatformPage(requestedSession.id, PLATFORM_LOGIN[platform].home);
+          const platformPage = this.gateway.getPlatformPage(requestedSession.id, localizedHomeUrl);
           let status = reportedStatus;
           if (platformPage) {
             const checking = { ...managed, page: platformPage };
@@ -192,7 +198,7 @@ export class LoginSessionActivities {
         }
       } catch (error) {
         const state = await this.prisma.browserSession.findUnique({ where: { id: requestedSession.id } });
-        if (state?.status === 'CLOSING') return complete('CLOSED');
+        if (['CLOSING', 'CLOSED'].includes(state?.status ?? '')) return complete('CLOSED');
         if (state && state.expiresAt.getTime() <= Date.now()) return complete('EXPIRED');
         const message = error instanceof Error ? error.message : String(error);
         await this.prisma.$transaction([
@@ -226,6 +232,10 @@ export class LoginSessionActivities {
               ? snapshotError.message
               : String(snapshotError);
             await this.prisma.$transaction([
+              this.prisma.browserProfile.update({
+                where: { id: requestedSession.profileId },
+                data: { status: 'ERROR' },
+              }),
               this.prisma.browserSession.update({
                 where: { id: requestedSession.id },
                 data: { status: 'CRASHED', lastError: `Profile persistence failed: ${message}` },
@@ -262,7 +272,7 @@ export class LoginSessionActivities {
       }));
       this.logger.warn(`TikTok interactive auth check failed: ${JSON.stringify({
         ...pageState,
-        cookieNames: cookies.map(cookie => cookie.name).sort(),
+        cookieNames: cookies.map((cookie: { name: string }) => cookie.name).sort(),
       })}`);
     } catch (error) {
       this.logger.warn(`TikTok interactive auth diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}`);

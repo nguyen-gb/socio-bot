@@ -45,7 +45,7 @@ import type { ObjectStorage } from '@socio/object-storage';
 import { OBJECT_STORAGE } from '../storage/object-storage.providers';
 import { loadTaskImages } from '../storage/task-images';
 import { AntiCaptchaService } from '../captcha/anticaptcha.service';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformSessionStateOrigins, profileLoginSettings } from './platform-login';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrlForProfile, platformSessionStateOrigins, profileFingerprintSettings, profileLoginSettings } from './platform-login';
 import { installTikTokImAuthBridge } from './tiktok-im-auth-bridge';
 
 const sharedTikTokSearchProfileId = 'search-tiktok-anonymous';
@@ -79,9 +79,13 @@ export class BrowserTaskActivities {
       ? 'fixture'
       : 'live';
     const tiktokSearchFixtureScenario = configGet?.call(this.config, 'tiktokSearchFixtureScenario', { infer: true });
+    const anticaptchaTimeoutMs = configGet?.call(this.config, 'anticaptchaTimeoutMs', { infer: true });
     this.tiktokCaptchaSolver = this.anticaptcha?.enabled
       ? {
-        solveRotate: (imageBase64s) => this.anticaptcha!.solveTikTokRotate(imageBase64s),
+        solveRotate: (imageBase64s, timeoutMs) => this.anticaptcha!.solveTikTokRotate(imageBase64s, timeoutMs),
+        // Keep the first TikTok challenge bounded even if an old deployment
+        // still exports ANTICAPTCHA_TIMEOUT_MS=120000.
+        timeoutMs: typeof anticaptchaTimeoutMs === 'number' ? Math.min(anticaptchaTimeoutMs, 30_000) : 30_000,
         report: (message) => this.logger.warn(`TikTok rotate CAPTCHA: ${message}`),
       }
       : undefined;
@@ -152,6 +156,11 @@ export class BrowserTaskActivities {
             proxyBinding: { include: { proxy: true } },
           },
         },
+        runs: {
+          orderBy: { startedAt: 'desc' },
+          take: 1,
+          select: { status: true, result: true },
+        },
       },
     });
     if (!task) throw ApplicationFailure.nonRetryable('Task not found', 'NOT_FOUND');
@@ -162,10 +171,23 @@ export class BrowserTaskActivities {
     if (task.status === 'SUCCEEDED') return { ok: true, data: { alreadyCompleted: true } };
     if (task.status === 'PAUSED' || task.pausedAt || task.status !== 'RUNNING' && (task.campaign?.pausedAt || task.campaign?.cancelledAt)) return { ok: false, data: { paused: true } };
     const externalAction = requiresExternalApproval(task.action);
+    const previousTaskReport = extractTaskReport(task.runs?.[0]?.result);
     if (externalAction && task.approvalStatus !== 'APPROVED') {
       return { ok: false, data: { requiresAction: true, reason: 'External action has not been approved' } };
     }
-    if (externalAction && (task.attemptCount > 0 || task.status === 'RUNNING')) {
+    const latestRunResult = task.runs?.[0]?.result;
+    const latestRunSideEffectStarted = latestRunResult && typeof latestRunResult === 'object' && !Array.isArray(latestRunResult)
+      ? (latestRunResult as { sideEffectStarted?: unknown }).sideEffectStarted === true
+      : undefined;
+    // A timed-out TikTok run that durably recorded `sideEffectStarted:false`
+    // never armed the send/click callback and is safe to retry. A RUNNING task
+    // or a run without that durable marker remains uncertain and needs manual
+    // verification to prevent duplicate messages/comments.
+    const uncertainExternalRetry = externalAction && (
+      task.status === 'RUNNING'
+      || (task.attemptCount > 0 && latestRunSideEffectStarted !== false)
+    );
+    if (uncertainExternalRetry) {
       const markUncertain = async () => {
         const marked = await this.prisma.task.updateMany({ where: { id: task.id, ...(task.workflowId ? { workflowId: task.workflowId } : {}), status: { notIn: ['SUCCEEDED', 'CANCELLED'] } }, data: { status: 'REQUIRES_ACTION', lastError: 'Kết quả lần chạy trước chưa chắc chắn; kiểm tra Facebook trước khi gửi lại.' } });
         if (marked.count !== 1) return;
@@ -254,7 +276,7 @@ export class BrowserTaskActivities {
           data: { status: 'LEASED' },
         });
       }
-      return tx.taskRun.create({ data: { taskId: task.id, workerId: this.registry.workerId, status: 'RUNNING', result: { sideEffectStarted: false } } });
+      return tx.taskRun.create({ data: { taskId: task.id, workerId: this.registry.workerId, status: 'RUNNING', result: { sideEffectStarted: false, ...(previousTaskReport ? { report: previousTaskReport } : {}) } as Prisma.InputJsonValue } });
     });
     if (!run) return { ok: false, data: { cancelled: true, reason: 'Task state changed before execution' } };
     const activityContext = Context.current();
@@ -264,6 +286,7 @@ export class BrowserTaskActivities {
     let browserSessionId: string | undefined;
     let runtimeProfileId = profile.id;
     let browserCloseWaitCompleted = false;
+    const actionProgressEntries: Array<Record<string, unknown>> = [];
     const waitForBrowserClose = async () => {
       if (browserCloseWaitCompleted) return;
       const delayMs = this.config.get('browserCloseDelayMs', { infer: true });
@@ -273,7 +296,10 @@ export class BrowserTaskActivities {
     try {
       const browserSession = await this.prisma.browserSession.create({ data: {
         profileId: profile.id, workerId: this.registry.workerId, mode: 'AUTOMATION', status: 'STARTING',
-        expiresAt: new Date(Date.now() + 6 * 60_000),
+        // The session lease must outlive the browser action deadline. The
+        // previous fixed six-minute expiry could terminate a valid campaign
+        // long before BROWSER_TASK_TIMEOUT_MS and leave it looking stuck.
+        expiresAt: new Date(Date.now() + (this.config.get('browserTaskTimeoutMs', { infer: true }) ?? 15 * 60_000) + 2 * 60_000),
       } });
       browserSessionId = browserSession.id;
       if (!tiktokSearchAction) {
@@ -285,6 +311,10 @@ export class BrowserTaskActivities {
       const harPath = await this.artifacts.temporaryPath('.har');
       try {
         runtimeProfileId = tiktokSearchAction ? searchRuntimeProfileId : profile.id;
+        const emulateFingerprint = this.config.get('browserFingerprintEmulation', { infer: true });
+        const fingerprint = emulateFingerprint && !tiktokSearchAction
+          ? profileFingerprintSettings(current.account.browserProfile?.metadata)
+          : undefined;
         result = await this.runtime.withProfile(
           {
             profileId: runtimeProfileId,
@@ -295,9 +325,13 @@ export class BrowserTaskActivities {
             ),
             headless: this.config.get('browserHeadless', { infer: true }),
             channel: this.config.get('browserChannel', { infer: true }),
-            automationMode: this.config.get('browserAutomationMode', { infer: true }),
-            locale: this.config.get('browserLocale', { infer: true }),
-            timezoneId: this.config.get('browserTimezoneId', { infer: true }),
+            locale: fingerprint?.locale ?? this.config.get('browserLocale', { infer: true }),
+            timezoneId: fingerprint?.timezoneId ?? this.config.get('browserTimezoneId', { infer: true }),
+            colorScheme: fingerprint?.colorScheme ?? this.config.get('browserColorScheme', { infer: true }),
+            viewport: fingerprint?.viewport ?? this.config.get('browserViewport', { infer: true }),
+            emulateFingerprint,
+            fingerprint,
+            executionTimeoutMs: this.config.get('browserTaskTimeoutMs', { infer: true }),
             sessionStateOrigins: platformSessionStateOrigins(action.platform),
             recordHarPath: harPath,
             // Keep the browser alive until the action result and task run have
@@ -341,7 +375,10 @@ export class BrowserTaskActivities {
               if (action.platform === 'FACEBOOK' && facebookBrowserAction) {
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
-                await initializePlatformSession(session, 'FACEBOOK', credentials);
+                await initializePlatformSession(session, 'FACEBOOK', credentials, {
+                  locale: fingerprint?.locale,
+                  entryUrl: platformHomeUrlForProfile('FACEBOOK', current.account.browserProfile?.metadata),
+                });
                 if (await isPlatformChallenged(session, 'FACEBOOK')) {
                   await this.anticaptcha?.trySolveVisibleRecaptcha(session.page);
                 }
@@ -360,7 +397,10 @@ export class BrowserTaskActivities {
                 // Every TikTok action starts from the ordinary root. Surface
                 // navigation (profile/video/search) belongs to the action
                 // after the shared session/authentication step.
-                await initializePlatformSession(session, 'TIKTOK', credentials);
+                await initializePlatformSession(session, 'TIKTOK', credentials, {
+                  locale: fingerprint?.locale,
+                  entryUrl: platformHomeUrlForProfile('TIKTOK', current.account.browserProfile?.metadata),
+                });
                 if (await isPlatformChallenged(session, 'TIKTOK')) {
                   const rotateCaptcha = await solveVisibleTikTokRotateCaptcha(session.page, this.tiktokCaptchaSolver);
                   if (!rotateCaptcha.solved) {
@@ -381,6 +421,7 @@ export class BrowserTaskActivities {
                 ...session,
                 accountUsername: current.account.username ?? undefined,
                 accountExternalId: current.account.externalId ?? undefined,
+                platformHomeUrl: platformHomeUrlForProfile(action.platform, current.account.browserProfile?.metadata),
                 captureStepScreenshot: captureTestScreenshots
                   ? async (step: string) => {
                     await this.artifacts
@@ -390,6 +431,25 @@ export class BrowserTaskActivities {
                   : undefined,
                 openPage: async () => session.context.newPage(),
                 replacePage: (page: BrowserPage) => { session.page = page as typeof session.page; },
+                recordActionProgress: async (entry: Record<string, unknown>) => {
+                  const key = actionProgressTargetKey(entry);
+                  const inProgressIndex = key
+                    ? actionProgressEntries.findIndex(current => current.status === 'IN_PROGRESS' && actionProgressTargetKey(current) === key)
+                    : -1;
+                  if (inProgressIndex >= 0 && entry.status !== 'IN_PROGRESS') actionProgressEntries[inProgressIndex] = entry;
+                  else actionProgressEntries.push(entry);
+                  // Checkpoint each target so a browser deadline still leaves
+                  // a durable report even when the adapter never returns.
+                  await this.prisma.taskRun.update({
+                    where: { id: run.id },
+                    data: {
+                      result: {
+                        sideEffectStarted,
+                        report: { action: previousTaskReport?.action ?? action.action, entries: [...(Array.isArray(previousTaskReport?.entries) ? previousTaskReport.entries : []), ...actionProgressEntries] },
+                      } as Prisma.InputJsonValue,
+                    },
+                  });
+                },
                 reserveMessageRecipient: ['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'].includes(action.action)
                   ? async (recipient: { groupUrl: string; profileUrl: string; displayName?: string }) => this.reserveMessageRecipient({
                     organizationId: current.organizationId,
@@ -418,7 +478,7 @@ export class BrowserTaskActivities {
                 if (state?.status !== 'RUNNING') throw new Error('Browser đã được yêu cầu đóng; dừng trước khi gửi');
                 // Persist BEFORE clicking: even a crash during the click is uncertain.
                 sideEffectStarted = true;
-                await this.prisma.taskRun.update({ where: { id: run.id }, data: { result: { sideEffectStarted: true } } });
+                await this.prisma.taskRun.update({ where: { id: run.id }, data: { result: { sideEffectStarted: true, ...(previousTaskReport || actionProgressEntries.length > 0 ? { report: { action: previousTaskReport?.action ?? action.action, entries: [...(Array.isArray(previousTaskReport?.entries) ? previousTaskReport.entries : []), ...actionProgressEntries] } } : {}) } as Prisma.InputJsonValue } });
                   session.signal?.throwIfAborted();
                 },
               };
@@ -436,7 +496,7 @@ export class BrowserTaskActivities {
                 const captcha = rotateCaptcha.solved
                   ? { solved: true }
                   : await this.anticaptcha?.trySolveVisibleRecaptcha(session.page);
-                if (captcha?.solved) await session.page.waitForTimeout(750);
+                if (captcha?.solved) await session.page.waitForTimeout?.(750);
                 if (!captcha?.solved || await isPlatformChallenged(session, action.platform)) {
                 actionResult = {
                   ok: false,
@@ -541,6 +601,10 @@ export class BrowserTaskActivities {
       const retryableTikTokFailure = task.platform === 'TIKTOK'
         && current.account.status === 'READY'
         && !sideEffectStarted;
+      const persistedReport = mergeTaskReports(
+        extractTaskReport(task.runs?.[0]?.result),
+        buildTaskReport(task, result),
+      );
 
       await this.prisma.$transaction([
         this.prisma.task.update({
@@ -552,7 +616,7 @@ export class BrowserTaskActivities {
           data: {
             status: cancellationRequested ? 'CANCELLED' : result.ok ? 'SUCCEEDED' : 'FAILED',
             errorCode: result.data?.accountChallenged === true && task.platform === 'TIKTOK' ? 'TIKTOK_VERIFICATION_REQUIRED' : undefined,
-            result: { ...(result.data ?? {}), sideEffectStarted, ...(cancellationRequested ? { cancellationRequested: true } : {}), ...(pauseRequested ? { pauseRequested: true } : {}) } as Prisma.InputJsonValue,
+            result: { ...(result.data ?? {}), ...(persistedReport ? { report: persistedReport } : {}), sideEffectStarted, ...(cancellationRequested ? { cancellationRequested: true } : {}), ...(pauseRequested ? { pauseRequested: true } : {}) } as Prisma.InputJsonValue,
             finishedAt: new Date(),
           },
         }),
@@ -587,6 +651,18 @@ export class BrowserTaskActivities {
       const control = await this.prisma.task.findUnique({ where: { id: task.id }, select: { status: true, pausedAt: true, cancelledAt: true } });
       const cancellationRequested = control?.status === 'CANCELLED' || Boolean(control?.cancelledAt);
       const pauseRequested = !cancellationRequested && (control?.status === 'PAUSED' || Boolean(control?.pausedAt));
+      const failureReport = actionProgressEntries.length > 0
+        ? {
+          action: typeof actionProgressEntries[0]?.action === 'string' ? actionProgressEntries[0].action : task.action,
+          entries: actionProgressEntries,
+        }
+        : previousTaskReport
+          ? undefined
+          : buildTaskReport(task, { ok: false, data: { sideEffectStarted, reason: message } });
+      const persistedFailureReport = mergeTaskReports(
+        extractTaskReport(task.runs?.[0]?.result),
+        failureReport,
+      );
 
       await this.prisma.$transaction([
         this.prisma.task.update({
@@ -601,7 +677,13 @@ export class BrowserTaskActivities {
           data: {
             status: cancellationRequested ? 'CANCELLED' : 'FAILED',
             error: cancellationRequested || pauseRequested ? undefined : message,
-            result: { sideEffectStarted, ...(cancellationRequested ? { cancellationRequested: true } : {}), ...(pauseRequested ? { pauseRequested: true } : {}) },
+            result: {
+              sideEffectStarted,
+              ...(actionProgressEntries.some(entry => entry.status === 'IN_PROGRESS') ? { checkpointUncertain: true } : {}),
+              ...(persistedFailureReport ? { report: persistedFailureReport } : {}),
+              ...(cancellationRequested ? { cancellationRequested: true } : {}),
+              ...(pauseRequested ? { pauseRequested: true } : {}),
+            } as Prisma.InputJsonValue,
             errorCode: loginRequired
               ? 'LOGIN_REQUIRED'
               : tiktokVerificationRequired
@@ -660,7 +742,7 @@ export class BrowserTaskActivities {
       }));
       this.logger.warn(`TikTok authentication check failed: ${JSON.stringify({
         ...pageState,
-        cookieNames: cookies.map(cookie => cookie.name).sort(),
+        cookieNames: cookies.map((cookie: { name: string }) => cookie.name).sort(),
       })}`);
     } catch (error) {
       this.logger.warn(`TikTok authentication diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}`);
@@ -757,6 +839,78 @@ export class BrowserTaskActivities {
     try { return normalizeFacebookGroupUrl(value); }
     catch { return normalizeFacebookPostUrl(value); }
   }
+}
+
+function buildTaskReport(
+  task: { action: string; payload: unknown },
+  result: ActionResult,
+): Record<string, unknown> | undefined {
+  const data = result.data ?? {};
+  const existing = data.report;
+  if (existing && typeof existing === 'object' && !Array.isArray(existing)) return existing as Record<string, unknown>;
+  const payload = task.payload && typeof task.payload === 'object' && !Array.isArray(task.payload)
+    ? task.payload as Record<string, unknown>
+    : {};
+  const completedAt = new Date().toISOString();
+  const status = result.ok ? 'SUCCEEDED' : data.sideEffectStarted === true ? 'UNKNOWN' : 'FAILED';
+  const entry = (extra: Record<string, unknown> = {}) => ({ action: task.action, status, completedAt, ...(typeof data.reason === 'string' ? { reason: data.reason } : {}), ...extra });
+
+  if (['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'].includes(task.action)) {
+    const profileUrl = typeof data.profileUrl === 'string' ? data.profileUrl : undefined;
+    if (!profileUrl) return undefined;
+    return { action: 'MESSAGE', entries: [entry({ profileUrl, ...(typeof data.displayName === 'string' ? { displayName: data.displayName } : {}), ...(typeof data.groupUrl === 'string' ? { groupUrl: data.groupUrl } : {}), ...(typeof data.postUrl === 'string' ? { postUrl: data.postUrl } : {}) })] };
+  }
+  if (task.action === 'POST_FACEBOOK_GROUP' && typeof data.groupUrl === 'string') {
+    return { action: 'POST', entries: [entry({ groupUrl: data.groupUrl, ...(typeof data.postUrl === 'string' ? { postUrl: data.postUrl } : {}), ...(typeof data.publicationStatus === 'string' ? { status: data.publicationStatus } : {}) })] };
+  }
+  if (task.action === 'JOIN_FACEBOOK_GROUP' && typeof (payload.groupUrl ?? data.groupUrl) === 'string') {
+    return { action: 'JOIN', entries: [entry({ groupUrl: (payload.groupUrl ?? data.groupUrl) as string, ...(typeof data.membershipStatus === 'string' ? { status: data.membershipStatus } : {}) })] };
+  }
+  if (['COMMENT_FACEBOOK_GROUP_POSTS', 'SCAN_FACEBOOK_POST_COMMENTS'].includes(task.action) && Array.isArray(data.posts)) {
+    return { action: task.action, entries: data.posts.filter((post): post is Record<string, unknown> => Boolean(post && typeof post === 'object' && !Array.isArray(post))).map(post => entry({ ...post, ...(typeof post.commentStatus === 'string' ? { status: post.commentStatus } : typeof post.postStatus === 'string' ? { status: post.postStatus } : {}) })) };
+  }
+  if (['COMMENT_FACEBOOK_GROUP_POSTS', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS'].includes(task.action) && typeof data.postUrl === 'string') {
+    return { action: task.action, entries: [entry({ postUrl: data.postUrl })] };
+  }
+  if (task.action === 'SYNC_FACEBOOK_GROUPS' && Array.isArray(data.groups)) {
+    return { action: 'SYNC', entries: data.groups.filter((group): group is Record<string, unknown> => Boolean(group && typeof group === 'object' && !Array.isArray(group))).map(group => entry({ ...group })) };
+  }
+  if (task.action === 'MESSAGE_TIKTOK_FOLLOWERS' && typeof payload.username === 'string') {
+    return { action: 'MESSAGE', entries: [entry({ username: payload.username })] };
+  }
+  if (['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS'].includes(task.action) && Array.isArray(payload.videoUrls)) {
+    return { action: task.action, entries: payload.videoUrls.filter((videoUrl): videoUrl is string => typeof videoUrl === 'string').map(videoUrl => entry({ videoUrl })) };
+  }
+  return undefined;
+}
+
+function extractTaskReport(result: Prisma.JsonValue | null | undefined): Record<string, unknown> | undefined {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return undefined;
+  const report = (result as Record<string, unknown>).report;
+  return report && typeof report === 'object' && !Array.isArray(report)
+    ? report as Record<string, unknown>
+    : undefined;
+}
+
+function mergeTaskReports(
+  previous: Record<string, unknown> | undefined,
+  current: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!previous) return current;
+  if (!current) return previous;
+  const previousEntries = Array.isArray(previous.entries) ? previous.entries : [];
+  const currentEntries = Array.isArray(current.entries) ? current.entries : [];
+  return {
+    action: current.action ?? previous.action,
+    entries: [...previousEntries, ...currentEntries],
+  };
+}
+
+function actionProgressTargetKey(entry: Record<string, unknown>): string | undefined {
+  for (const field of ['username', 'videoUrl', 'profileUrl', 'postUrl', 'groupUrl']) {
+    if (typeof entry[field] === 'string' && entry[field]) return `${field}:${entry[field]}`;
+  }
+  return undefined;
 }
 
 function redactLog(value: string): string {

@@ -135,23 +135,34 @@ test('TikTok Search retry reuses the same campaign after the profile is READY', 
   assert.equal(temporalStarted, true);
 });
 
-test('TikTok cancel persists a request while a running task finishes safely', async () => {
-  const running = { id: 'tiktok-running', organizationId: 'org', platform: 'TIKTOK', status: 'RUNNING', approvalStatus: 'NOT_REQUIRED', cancelledAt: null, pausedAt: null };
+test('TikTok cancel immediately terminates a running task and releases an orphaned profile', async () => {
+  const running = { id: 'tiktok-running', organizationId: 'org', accountId: 'account', workflowId: 'task/running', platform: 'TIKTOK', status: 'RUNNING', approvalStatus: 'NOT_REQUIRED', cancelledAt: null, pausedAt: null, account: { browserProfile: { id: 'profile' } } };
   let updateInput: any;
+  let runUpdate: any;
+  let workflowCancelled: string | undefined;
   const tx = {
     $executeRaw: async () => 1,
     task: {
       findFirst: async () => running,
       updateMany: async (input: any) => { updateInput = input; return { count: 1 }; },
     },
+    taskRun: { updateMany: async (input: any) => { runUpdate = input; return { count: 1 }; } },
+    browserSession: { updateMany: async () => ({ count: 0 }) },
+    browserProfile: { updateMany: async () => ({ count: 1 }) },
+    platformAccount: { updateMany: async () => ({ count: 1 }) },
   };
   const prisma = { $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx) };
-  const service = new TasksService(prisma as never, {} as never);
+  const temporal = { cancelTask: async (workflowId: string) => { workflowCancelled = workflowId; return true; } };
+  const service = new TasksService(prisma as never, temporal as never);
 
   const result = await service.cancel('org', running.id);
-  assert.equal(result.cancelRequested, true);
+  assert.equal(result.cancelRequested, false);
+  assert.equal(result.cancelled, 1);
   assert.equal(updateInput.where.status, 'RUNNING');
+  assert.equal(updateInput.data.status, 'CANCELLED');
   assert.ok(updateInput.data.cancelledAt instanceof Date);
+  assert.equal(runUpdate.data.status, 'CANCELLED');
+  assert.equal(workflowCancelled, running.workflowId);
 });
 
 test('TikTok pause queues safely and resume dispatches a new workflow', async () => {
@@ -171,13 +182,18 @@ test('TikTok pause queues safely and resume dispatches a new workflow', async ()
     $transaction: async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
     task: { findUniqueOrThrow: async () => current },
   };
-  const temporal = { startTask: async (...args: any[]) => { started = args; } };
+  let cancelledWorkflow: string | undefined;
+  const temporal = {
+    startTask: async (...args: any[]) => { started = args; },
+    cancelTask: async (workflowId: string) => { cancelledWorkflow = workflowId; return true; },
+  };
   const service = new TasksService(prisma as never, temporal as never);
 
   const pauseResult = await service.pause('org', paused.id);
   assert.equal(pauseResult.paused, 1);
   assert.equal(updateInput.data.status, 'PAUSED');
   assert.ok(updateInput.data.pausedAt instanceof Date);
+  assert.equal(cancelledWorkflow, paused.workflowId);
 
   const resumeResult = await service.resume('org', paused.id);
   assert.equal(resumeResult.status, 'QUEUED');

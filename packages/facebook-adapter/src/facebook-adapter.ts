@@ -1,6 +1,7 @@
 import type { ActionResult, PlatformAction } from '@socio/contracts';
 import {
   LoginRequiredError,
+  gotoPlatformPage,
   type PlatformAdapter,
   type PlatformSession,
   UnsupportedPlatformActionError,
@@ -56,10 +57,7 @@ export class FacebookAdapter implements PlatformAdapter {
   }
 
   private async healthCheck(session: PlatformSession): Promise<ActionResult> {
-    await session.page.goto(FACEBOOK_HOME, {
-      waitUntil: 'domcontentloaded',
-      timeout: 45_000,
-    });
+    await gotoPlatformPage(session.page, session.platformHomeUrl ?? FACEBOOK_HOME);
 
     const loginRequired = await this.isLoginRequired(session);
     return {

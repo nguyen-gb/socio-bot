@@ -52,7 +52,7 @@ abstract class WebPlatformAdapter implements PlatformAdapter {
   protected async healthCheck(session: PlatformSession): Promise<ActionResult> {
     await gotoPlatformPage(
       session.page,
-      this.definition.homeUrl,
+      session.platformHomeUrl ?? this.definition.homeUrl,
       this.definition.fallbackUrl,
     );
     const currentUrl = session.page.url().toLowerCase();
@@ -126,7 +126,7 @@ export class TikTokAdapter extends WebPlatformAdapter {
     // root and use commit so a client-side redirect is not mistaken for a
     // failed navigation. The action itself decides which surface to open
     // next (search, For You, profile, or video).
-    await enterTikTokRoot(session.page);
+    await enterTikTokRoot(session.page, session.platformHomeUrl);
     // The worker initializes/authenticates sessions for side-effect actions.
     // Search is the read-only exception: it runs in a fresh anonymous context
     // and must not be rejected just because that context has no login.
@@ -177,9 +177,22 @@ export class TikTokAdapter extends WebPlatformAdapter {
           return { ok: typeof data.sent === 'number' && data.sent > 0, data };
         }
       case 'REPLY_TIKTOK_COMMENTS':
-        return { ok: true, data: await replyTikTokComments(session, action.payload, this.options.captchaSolver) };
+        {
+          const data = await replyTikTokComments(session, action.payload, this.options.captchaSolver);
+          // A reply campaign is complete only when every requested reply was
+          // sent. Returning success for a partial run made the UI show
+          // "Hoàn tất" while still carrying a failure reason from a later
+          // video, which was misleading and unsafe to retry blindly.
+          return { ok: typeof data.sent === 'number' && typeof data.requested === 'number' && data.sent >= data.requested, data };
+        }
       case 'LIKE_TIKTOK_COMMENTS':
-        return { ok: true, data: await likeTikTokComments(session, action.payload) };
+        {
+          const data = await likeTikTokComments(session, action.payload);
+          // A video navigation without opening the comment drawer used to
+          // return a successful task with zero likes. Treat that as a failed
+          // action so the report/manual retry path is visible to the user.
+          return { ok: typeof data.liked === 'number' && data.liked > 0, data };
+        }
       case 'MESSAGE_TIKTOK_FOLLOWERS':
         {
           const data = await messageTikTokFollowers(session, action.payload, this.options.captchaSolver);
@@ -191,7 +204,7 @@ export class TikTokAdapter extends WebPlatformAdapter {
   }
 
   protected async healthCheck(session: PlatformSession): Promise<ActionResult> {
-    await enterTikTokRoot(session.page);
+    await enterTikTokRoot(session.page, session.platformHomeUrl);
     const currentUrl = session.page.url().toLowerCase();
     let loginRequired = this.definition.loginUrlFragments.some((fragment) => currentUrl.includes(fragment));
     if (!loginRequired) {

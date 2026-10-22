@@ -46,7 +46,7 @@ export class ProxyCheckActivities {
       });
       const page = await browser.newPage();
       await page.goto('https://www.facebook.com/robots.txt', {
-        waitUntil: 'commit',
+        waitUntil: 'load',
         timeout: 25_000,
       });
       return {

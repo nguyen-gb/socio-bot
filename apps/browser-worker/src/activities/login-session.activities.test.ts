@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Context } from '@temporalio/activity';
 import { LoginSessionActivities, parseCookieInput } from './login-session.activities';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged } from './platform-login';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrl } from './platform-login';
+
+test('profile locale selects the matching platform entry URL', () => {
+  assert.equal(platformHomeUrl('TIKTOK', 'vi-VN'), 'https://www.tiktok.com/vn');
+  assert.equal(platformHomeUrl('TIKTOK', 'en-US'), 'https://www.tiktok.com/en');
+  assert.equal(platformHomeUrl('FACEBOOK', 'vi-VN'), 'https://www.facebook.com/?locale=vi_VN');
+  assert.equal(platformHomeUrl('INSTAGRAM', 'vi-VN'), 'https://www.instagram.com/?hl=vi');
+  assert.equal(platformHomeUrl('X', 'vi-VN'), 'https://x.com/home?lang=vi');
+});
 
 test('cookie header is scoped to the selected platform URL', () => {
   const cookies = parseCookieInput(
@@ -94,7 +102,7 @@ test('invalid cookie input falls back to password, or remains open for manual lo
   assert.equal(manual.events.includes('close'), false);
 });
 
-test('TikTok login keeps the root entry when Chromium reports a root navigation race', async () => {
+test('TikTok login falls back to the English entry when the root navigation fails', async () => {
   const targets: string[] = [];
   let currentUrl = 'about:blank';
   const locator = () => ({
@@ -114,7 +122,7 @@ test('TikTok login keeps the root entry when Chromium reports a root navigation 
       goto: async (target: string) => {
         targets.push(target);
         if (target === 'https://www.tiktok.com/') {
-          throw new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://www.tiktok.com/');
+          throw new Error('page.goto: Timeout 45000ms exceeded. Call log: navigating to "https://www.tiktok.com/", waiting until "commit"');
         }
         currentUrl = target;
       },
@@ -124,8 +132,8 @@ test('TikTok login keeps the root entry when Chromium reports a root navigation 
 
   await initializePlatformSession(session as never, 'TIKTOK');
 
-  assert.deepEqual(targets, ['https://www.tiktok.com/']);
-  assert.equal(currentUrl, 'about:blank');
+  assert.deepEqual(targets, ['https://www.tiktok.com/', 'https://www.tiktok.com/en']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/en');
 });
 
 test('TikTok direct-entry options still start at the root before the action opens a profile', async () => {

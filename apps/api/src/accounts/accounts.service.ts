@@ -82,7 +82,7 @@ export class AccountsService {
     const profileId = randomUUID();
 
     const authentication = input.authentication;
-    const profileMetadata = authenticationMetadata(authentication, this.vault);
+    const profileMetadata = authenticationMetadata(authentication, this.vault, input.fingerprint);
 
     await this.prisma.$transaction(async (transaction) => {
       await transaction.platformAccount.create({
@@ -150,9 +150,16 @@ export class AccountsService {
       || (authentication.cookies?.trim() || undefined) !== (currentAuthentication.cookies?.trim() || undefined)
     );
     const platformChanged = input.platform !== undefined && input.platform !== account.platform;
-    const profileMetadata: Prisma.InputJsonObject = authenticationChanged && authentication
-      ? authenticationMetadata(authentication, this.vault)
-      : (currentMetadata as Prisma.InputJsonObject);
+    const profileMetadataRecord: Record<string, unknown> = authenticationChanged && authentication
+      ? {
+        ...(authenticationMetadata(authentication, this.vault) as Record<string, unknown>),
+        ...(currentMetadata.fingerprint ? { fingerprint: currentMetadata.fingerprint } : {}),
+      }
+      : { ...currentMetadata };
+    if (input.fingerprint) {
+      profileMetadataRecord.fingerprint = input.fingerprint;
+    }
+    const profileMetadata = profileMetadataRecord as Prisma.InputJsonObject;
 
     await this.prisma.$transaction(async (transaction) => {
       await transaction.platformAccount.update({
@@ -164,7 +171,7 @@ export class AccountsService {
           ...(platformChanged || authenticationChanged ? { status: 'LOGIN_REQUIRED' } : {}),
         },
       });
-      if (authenticationChanged && account.browserProfile) {
+      if ((authenticationChanged || input.fingerprint !== undefined) && account.browserProfile) {
         await transaction.browserProfile.update({
           where: { id: account.browserProfile.id },
           data: { metadata: profileMetadata, status: 'AVAILABLE' },
@@ -196,19 +203,25 @@ export class AccountsService {
             },
           },
         },
-        _count: { select: { tasks: true, schedules: true } },
+        tasks: {
+          where: { status: 'RUNNING' },
+          select: { id: true },
+          take: 1,
+        },
       },
     });
     if (!account) throw new NotFoundException('Account not found');
     if (account.browserProfile?.sessions.length) {
       throw new ConflictException('Close the browser before deleting this account');
     }
-    if (account._count.tasks > 0 || account._count.schedules > 0) {
+    if (account.tasks.length) {
       throw new ConflictException(
-        'Delete this account\'s tasks and schedules before deleting the account',
+        'Wait for this account\'s running task to finish before deleting the account',
       );
     }
     await this.prisma.$transaction(async (transaction) => {
+      await transaction.schedule.deleteMany({ where: { accountId: id } });
+      await transaction.task.deleteMany({ where: { accountId: id } });
       if (account.browserProfile) {
         await transaction.browserSession.deleteMany({
           where: { profileId: account.browserProfile.id },
@@ -224,6 +237,9 @@ export class AccountsService {
     const legacyMethod = String(profileMetadata.loginMethod ?? '');
     const hasCookies = profileMetadata.hasCookies === true || legacyMethod === 'COOKIES';
     const hasPassword = profileMetadata.hasPassword === true || legacyMethod === 'PASSWORD';
+    const fingerprint = profileMetadata.fingerprint && typeof profileMetadata.fingerprint === 'object' && !Array.isArray(profileMetadata.fingerprint)
+      ? profileMetadata.fingerprint
+      : undefined;
     const proxy = account.proxyBinding?.proxy;
     const safeBinding =
       account.proxyBinding && proxy
@@ -240,6 +256,7 @@ export class AccountsService {
             metadata: { hasCookies, hasPassword },
             hasCookies,
             hasPassword,
+            fingerprint,
           }
         : null,
       proxyBinding: safeBinding,
@@ -250,6 +267,7 @@ export class AccountsService {
 function authenticationMetadata(
   authentication: CreateAccountInput['authentication'],
   vault: CredentialVaultService,
+  fingerprint?: CreateAccountInput['fingerprint'],
 ): Prisma.InputJsonObject {
   const hasPassword = Boolean(authentication.login && authentication.password);
   const hasCookies = Boolean(authentication.cookies);
@@ -264,6 +282,7 @@ function authenticationMetadata(
     hasPassword,
     hasCookies,
     ...(credentialsRef ? { credentialsRef } : {}),
+    ...(fingerprint ? { fingerprint: fingerprint as unknown as Prisma.InputJsonValue } : {}),
   };
 }
 

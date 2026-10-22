@@ -98,7 +98,7 @@ test('TikTok comment, reply and like actions require approval', () => {
     idempotencyKey: 'tiktok-comment-0001',
     action: {
       platform: 'TIKTOK', accountId, action: 'COMMENT_TIKTOK_VIDEOS',
-      payload: { videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'], text: 'Xin chào' },
+      payload: { videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'], text: 'Xin chào', intervalSeconds: 5 },
     },
   });
   const reply = createTaskSchema.safeParse({
@@ -128,7 +128,7 @@ test('TikTok follower messaging accepts a bounded username campaign and requires
     idempotencyKey: 'tiktok-follower-dm-0001',
     action: {
       platform: 'TIKTOK', accountId, action: 'MESSAGE_TIKTOK_FOLLOWERS',
-      payload: { name: 'IB follower', username: '@kenh_cua_toi', text: 'Xin chào', maxFollowers: 10, mediaAssetIds: [] },
+      payload: { name: 'IB follower', username: '@kenh_cua_toi', text: 'Xin chào', maxFollowers: 10, mediaAssetIds: [], intervalSeconds: 5 },
     },
   });
   assert.equal(result.success, true);

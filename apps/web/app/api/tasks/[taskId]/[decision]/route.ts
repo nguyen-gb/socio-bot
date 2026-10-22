@@ -9,9 +9,18 @@ export async function POST(
   if (!['approve', 'reject', 'retry', 'retry-action', 'cancel', 'pause', 'resume'].includes(decision)) {
     return NextResponse.json({ message: 'Invalid task operation' }, { status: 404 });
   }
+  // Preserve the JSON confirmation for retry-action. The proxy may retry the
+  // upstream request after refreshing auth, so read the body once and reuse it.
+  const body = await request.text();
   return forwardAuthenticated(
     request,
     `/api/tasks/${encodeURIComponent(taskId)}/${decision}`,
-    { method: 'POST' },
+    {
+      method: 'POST',
+      ...(body ? {
+        body,
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+      } : {}),
+    },
   );
 }

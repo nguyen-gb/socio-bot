@@ -7,7 +7,10 @@ const requiredKeys = [
   'REMOTE_SESSION_SECRET',
   'PROFILE_ENCRYPTION_KEY',
   'BROWSER_HEADLESS',
-  'BROWSER_AUTOMATION_MODE',
+  'BROWSER_CHANNEL',
+  'BROWSER_COLOR_SCHEME',
+  'BROWSER_FINGERPRINT_EMULATION',
+  'BROWSER_TASK_TIMEOUT_MS',
   'TIKTOK_SEARCH_MODE',
   'TIKTOK_SEARCH_FIXTURE_SCENARIO',
 ] as const;
@@ -34,13 +37,29 @@ test('browser mode follows the environment default and accepts an explicit overr
     process.env.BROWSER_HEADLESS = 'true';
     assert.equal(loadEnvironment().browserHeadless, true);
 
-    process.env.BROWSER_AUTOMATION_MODE = 'chrome';
-    assert.equal(loadEnvironment().browserAutomationMode, 'chrome');
-    process.env.BROWSER_AUTOMATION_MODE = 'playwright';
-    assert.equal(loadEnvironment().browserAutomationMode, 'playwright');
-    process.env.BROWSER_AUTOMATION_MODE = 'unsupported';
-    assert.throws(() => loadEnvironment(), /Expected one of playwright, chrome/);
-    delete process.env.BROWSER_AUTOMATION_MODE;
+    delete process.env.BROWSER_CHANNEL;
+    assert.equal(loadEnvironment().browserChannel, 'chrome');
+    process.env.BROWSER_CHANNEL = 'msedge';
+    assert.equal(loadEnvironment().browserChannel, 'msedge');
+
+    process.env.BROWSER_COLOR_SCHEME = 'dark';
+    assert.equal(loadEnvironment().browserColorScheme, 'dark');
+    process.env.BROWSER_COLOR_SCHEME = 'unsupported';
+    assert.throws(() => loadEnvironment(), /Expected one of light, dark, no-preference/);
+    delete process.env.BROWSER_COLOR_SCHEME;
+
+    delete process.env.BROWSER_FINGERPRINT_EMULATION;
+    assert.equal(loadEnvironment().browserFingerprintEmulation, true);
+    process.env.BROWSER_FINGERPRINT_EMULATION = 'false';
+    assert.equal(loadEnvironment().browserFingerprintEmulation, false);
+
+    delete process.env.BROWSER_TASK_TIMEOUT_MS;
+    assert.equal(loadEnvironment().browserTaskTimeoutMs, 900_000);
+    process.env.BROWSER_TASK_TIMEOUT_MS = '900000';
+    assert.equal(loadEnvironment().browserTaskTimeoutMs, 900_000);
+    process.env.BROWSER_TASK_TIMEOUT_MS = '900001';
+    assert.throws(() => loadEnvironment(), /BROWSER_TASK_TIMEOUT_MS/);
+    delete process.env.BROWSER_TASK_TIMEOUT_MS;
 
     process.env.NODE_ENV = 'development';
     process.env.TIKTOK_SEARCH_MODE = 'fixture';
@@ -59,8 +78,9 @@ test('browser mode follows the environment default and accepts an explicit overr
   }
 });
 
-test('browser locale and timezone reject malformed values before launching the worker', () => {
-  const previous = Object.fromEntries(['BROWSER_LOCALE', 'BROWSER_TIMEZONE_ID'].map(key => [key, process.env[key]]));
+test('browser environment rejects malformed values before launching the worker', () => {
+  const keys = ['BROWSER_LOCALE', 'BROWSER_TIMEZONE_ID', 'BROWSER_VIEWPORT'];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   try {
     process.env.BROWSER_LOCALE = 'en_US';
     assert.throws(() => loadEnvironment(), /Invalid BROWSER_LOCALE/);
@@ -68,8 +88,14 @@ test('browser locale and timezone reject malformed values before launching the w
     process.env.BROWSER_TIMEZONE_ID = 'Mars/Olympus_Mons';
     assert.throws(() => loadEnvironment(), /Invalid BROWSER_TIMEZONE_ID/);
     process.env.BROWSER_TIMEZONE_ID = 'Asia/Ho_Chi_Minh';
+    process.env.BROWSER_VIEWPORT = '639x480';
+    assert.throws(() => loadEnvironment(), /Invalid BROWSER_VIEWPORT/);
+    process.env.BROWSER_VIEWPORT = '1280x720';
     assert.equal(loadEnvironment().browserLocale, 'en-US');
     assert.equal(loadEnvironment().browserTimezoneId, 'Asia/Ho_Chi_Minh');
+    assert.deepEqual(loadEnvironment().browserViewport, { width: 1280, height: 720 });
+    process.env.BROWSER_VIEWPORT = 'auto';
+    assert.equal(loadEnvironment().browserViewport, null);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];

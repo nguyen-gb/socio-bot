@@ -56,7 +56,7 @@ const campaignBase = z.object({
   name: z.string().trim().min(1).max(120),
   idempotencyKey: z.string().trim().min(8).max(128),
   accountIds: z.array(z.uuid()).max(100).default([]),
-  intervalSeconds: z.number().int().min(30).max(3600).default(60),
+  intervalSeconds: z.number().int().min(5).max(3600).default(60),
 });
 
 export const joinFacebookGroupsSchema = campaignBase.extend({
@@ -119,7 +119,7 @@ export const messageFacebookRecipientsSchema = campaignBase.extend({
   mediaAssetIds: facebookMediaIdsSchema,
   groupUrls: z.array(facebookGroupUrlSchema).max(100).default([]).transform((urls) => [...new Set(urls)]),
   maxRecipientsPerGroup: z.number().int().min(1).max(50),
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
 }).refine(input => input.text.length > 0 || input.mediaAssetIds.length > 0, {
   message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'],
 });
@@ -137,7 +137,7 @@ export const messageFacebookReactorsSchema = campaignBase.extend({
   mediaAssetIds: facebookMediaIdsSchema,
   recipientSource: facebookPostRecipientSourceSchema.default('REACTORS'),
   maxRecipientsPerPost: z.number().int().min(1).max(50),
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
 }).superRefine((input, context) => {
   if (!input.postUrl && !input.postUrls?.length) context.addIssue({ code: 'custom', message: 'Nhập ít nhất một URL bài viết Facebook', path: ['postUrls'] });
   if (!input.text.length && !input.mediaAssetIds.length) context.addIssue({ code: 'custom', message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'] });
@@ -149,7 +149,7 @@ export const scanFacebookPostCommentsSchema = campaignBase.extend({
   // New campaigns may scan several posts in one campaign via `postUrls`.
   postUrl: facebookPostUrlSchema.optional(),
   postUrls: z.array(facebookPostUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]).optional(),
-  intervalSeconds: z.number().int().min(30).max(3600).default(60),
+  intervalSeconds: z.number().int().min(5).max(3600).default(60),
 }).superRefine((input, context) => {
   if (!input.postUrl && !input.postUrls?.length) {
     context.addIssue({ code: 'custom', message: 'Nhập ít nhất một URL bài viết Facebook', path: ['postUrls'] });
@@ -162,7 +162,7 @@ export const replyFacebookPostCommentsSchema = campaignBase.extend({
   text: z.string().trim().max(5_000).default(''),
   mediaAssetIds: facebookMediaIdsSchema,
   maxReplies: z.number().int().min(1).max(50),
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
 }).refine(input => input.text.length > 0 || input.mediaAssetIds.length > 0, {
   message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'],
 });
@@ -183,7 +183,7 @@ export const commentFacebookGroupPostsSchema = campaignBase.extend({
   minComments: z.number().int().min(0).max(10_000_000).default(0),
   maxComments: z.number().int().min(0).max(10_000_000).optional(),
   maxPosts: z.number().int().min(1).max(50).default(10),
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
 }).superRefine((input, context) => {
   if (!input.text.length && !input.mediaAssetIds.length) context.addIssue({ code: 'custom', message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'] });
   if (input.maxReactions != null && input.maxReactions < input.minReactions) context.addIssue({ code: 'custom', message: 'Số tim tối đa phải lớn hơn hoặc bằng số tim tối thiểu', path: ['maxReactions'] });

@@ -8,6 +8,7 @@ import {
   Card,
   Checkbox,
   Col,
+  Collapse,
   Divider,
   Empty,
   Flex,
@@ -70,8 +71,70 @@ interface Account {
   externalId?: string;
   platform: string;
   status: string;
-  browserProfile?: { hasCookies?: boolean; hasPassword?: boolean };
+  browserProfile?: { hasCookies?: boolean; hasPassword?: boolean; fingerprint?: BrowserFingerprintConfig };
   proxyBinding?: { proxy: { id: string; name: string; status: string } };
+}
+
+interface BrowserFingerprintConfig {
+  locale: string;
+  languages: string[];
+  timezoneId: string;
+  viewport: { width: number; height: number };
+  colorScheme: 'light' | 'dark' | 'no-preference';
+  deviceScaleFactor: number;
+  features?: {
+    canvas: boolean;
+    webgl: boolean;
+    gpu: boolean;
+    userAgent: boolean;
+    clientHints: boolean;
+  };
+  canvas: { signature: string; noise: [number, number, number] };
+  webgl: { vendor: string; renderer: string };
+  gpu: { vendor: string; architecture: string; device: string; description: string };
+  userAgent: string;
+  clientHints: {
+    brands: Array<{ brand: string; version: string }>;
+    fullVersionList: Array<{ brand: string; version: string }>;
+    mobile: boolean;
+    platform: string;
+    platformVersion: string;
+    architecture: string;
+    bitness: string;
+    model: string;
+    uaFullVersion: string;
+  };
+}
+
+interface FingerprintFormValue {
+  locale: string;
+  languages: string[];
+  timezoneId: string;
+  viewport: { width: number; height: number };
+  colorScheme: 'light' | 'dark' | 'no-preference';
+  deviceScaleFactor: number;
+  features: {
+    canvas: boolean;
+    webgl: boolean;
+    gpu: boolean;
+    userAgent: boolean;
+    clientHints: boolean;
+  };
+  canvas: { signature: string; noise: [number, number, number] };
+  webgl: { vendor: string; renderer: string };
+  gpu: { vendor: string; architecture: string; device: string; description: string };
+  userAgent: string;
+  clientHints: {
+    brands: string;
+    fullVersionList: string;
+    mobile: boolean;
+    platform: string;
+    platformVersion: string;
+    architecture: string;
+    bitness: string;
+    model: string;
+    uaFullVersion: string;
+  };
 }
 
 interface ProxyItem {
@@ -128,6 +191,7 @@ interface AccountFormValue {
   password?: string;
   cookies?: string;
   openAfterCreate?: boolean;
+  fingerprint: FingerprintFormValue;
 }
 
 interface ProxyFormValue {
@@ -138,6 +202,165 @@ interface ProxyFormValue {
   username?: string;
   password?: string;
   accountIds?: string[];
+}
+
+const fingerprintPresets: Record<string, { languages: string[]; timezones: string[] }> = {
+  'vi-VN': { languages: ['vi-VN', 'vi'], timezones: ['Asia/Ho_Chi_Minh'] },
+  'en-US': { languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'] },
+  'en-GB': { languages: ['en-GB', 'en'], timezones: ['Europe/London'] },
+  'ja-JP': { languages: ['ja-JP', 'ja', 'en-US'], timezones: ['Asia/Tokyo'] },
+  'ko-KR': { languages: ['ko-KR', 'ko', 'en-US'], timezones: ['Asia/Seoul'] },
+  'th-TH': { languages: ['th-TH', 'th', 'en-US'], timezones: ['Asia/Bangkok'] },
+  'id-ID': { languages: ['id-ID', 'id', 'en-US'], timezones: ['Asia/Jakarta', 'Asia/Makassar', 'Asia/Jayapura'] },
+  'zh-CN': { languages: ['zh-CN', 'zh', 'en-US'], timezones: ['Asia/Shanghai'] },
+  'zh-TW': { languages: ['zh-TW', 'zh', 'en-US'], timezones: ['Asia/Taipei'] },
+  'de-DE': { languages: ['de-DE', 'de', 'en-US'], timezones: ['Europe/Berlin'] },
+  'fr-FR': { languages: ['fr-FR', 'fr', 'en-US'], timezones: ['Europe/Paris'] },
+  'es-ES': { languages: ['es-ES', 'es', 'en-US'], timezones: ['Europe/Madrid'] },
+};
+
+function fingerprintPreset(locale: string) {
+  const base = locale.split('-')[0] ?? locale;
+  return fingerprintPresets[locale] ?? { languages: [locale, base], timezones: ['UTC'] };
+}
+
+function defaultFingerprintForm(locale = 'vi-VN'): FingerprintFormValue {
+  const preset = fingerprintPreset(locale);
+  // Patchright's bundled Chromium in this demo is Chrome 153; keep the
+  // dashboard's initial bundle coherent with the browser used by the worker.
+  const major = '153';
+  const version = `${major}.0.0.0`;
+  const brands = [
+    { brand: 'Not_A Brand', version: '24' },
+    { brand: 'Chromium', version: major },
+    { brand: 'Google Chrome', version: major },
+  ];
+  return {
+    locale,
+    languages: [...preset.languages],
+    timezoneId: preset.timezones[0] ?? 'UTC',
+    viewport: { width: 1440, height: 900 },
+    colorScheme: 'light',
+    deviceScaleFactor: 1,
+    features: { canvas: false, webgl: false, gpu: false, userAgent: false, clientHints: false },
+    canvas: { signature: 'profile-canvas-v1', noise: [0, 1, 0] },
+    webgl: { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)' },
+    gpu: { vendor: 'intel', architecture: 'gen-9', device: '0x3e92', description: 'Intel(R) UHD Graphics 630' },
+    userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`,
+    clientHints: {
+      brands: JSON.stringify(brands),
+      fullVersionList: JSON.stringify(brands.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : version }))),
+      mobile: false,
+      platform: 'Windows',
+      platformVersion: '15.0.0',
+      architecture: 'x86',
+      bitness: '64',
+      model: '',
+      uaFullVersion: version,
+    },
+  };
+}
+
+function fingerprintToForm(value?: BrowserFingerprintConfig): FingerprintFormValue {
+  if (!value) return defaultFingerprintForm();
+  const preset = fingerprintPreset(value.locale);
+  return {
+    ...value,
+    languages: value.languages.filter((language) => preset.languages.includes(language)).length
+      ? value.languages.filter((language) => preset.languages.includes(language))
+      : [...preset.languages],
+    timezoneId: preset.timezones.includes(value.timezoneId) ? value.timezoneId : preset.timezones[0] ?? 'UTC',
+    features: {
+      canvas: value.features?.canvas ?? false,
+      webgl: value.features?.webgl ?? false,
+      gpu: value.features?.gpu ?? false,
+      userAgent: value.features?.userAgent ?? false,
+      clientHints: value.features?.clientHints ?? false,
+    },
+    clientHints: {
+      ...value.clientHints,
+      brands: JSON.stringify(value.clientHints.brands),
+      fullVersionList: JSON.stringify(value.clientHints.fullVersionList),
+    },
+  };
+}
+
+function parseClientHintBrands(value: string, label: string): Array<{ brand: string; version: string }> {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); }
+  catch { throw new Error(`${label} phải là JSON hợp lệ`); }
+  if (!Array.isArray(parsed) || !parsed.every((item) => item && typeof item === 'object' && typeof (item as { brand?: unknown }).brand === 'string' && typeof (item as { version?: unknown }).version === 'string')) {
+    throw new Error(`${label} phải là mảng gồm brand và version`);
+  }
+  return parsed as Array<{ brand: string; version: string }>;
+}
+
+function normalizeFingerprintForm(value: Partial<FingerprintFormValue>): BrowserFingerprintConfig {
+  const defaults = defaultFingerprintForm(value.locale ?? 'vi-VN');
+  const merged: FingerprintFormValue = {
+    ...defaults,
+    ...value,
+    viewport: { ...defaults.viewport, ...(value.viewport ?? {}) },
+    features: { ...defaults.features, ...(value.features ?? {}) },
+    canvas: { ...defaults.canvas, ...(value.canvas ?? {}) },
+    webgl: { ...defaults.webgl, ...(value.webgl ?? {}) },
+    gpu: { ...defaults.gpu, ...(value.gpu ?? {}) },
+    clientHints: { ...defaults.clientHints, ...(value.clientHints ?? {}) },
+  } as FingerprintFormValue;
+  const preset = fingerprintPreset(merged.locale);
+  const languages = merged.languages.filter((language) => preset.languages.includes(language));
+  return {
+    ...merged,
+    languages: languages.length ? languages : [...preset.languages],
+    timezoneId: preset.timezones.includes(merged.timezoneId) ? merged.timezoneId : preset.timezones[0] ?? 'UTC',
+    features: { ...merged.features },
+    clientHints: {
+      ...merged.clientHints,
+      brands: parseClientHintBrands(merged.clientHints.brands, 'Client Hints brands'),
+      fullVersionList: parseClientHintBrands(merged.clientHints.fullVersionList, 'Client Hints fullVersionList'),
+    },
+  };
+}
+
+type FingerprintFeatureKey = keyof FingerprintFormValue['features'];
+
+function randomFingerprintId(size = 16): string {
+  const bytes = new Uint8Array(size);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+const realisticGpuPresets = [
+  { webglVendor: 'Google Inc. (Intel)', webglRenderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)', vendor: 'intel', architecture: 'gen-9', device: '0x3e92', description: 'Intel(R) UHD Graphics 630' },
+  { webglVendor: 'Google Inc. (NVIDIA)', webglRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)', vendor: 'nvidia', architecture: 'ampere', device: '0x2503', description: 'NVIDIA GeForce RTX 3060' },
+  { webglVendor: 'Google Inc. (AMD)', webglRenderer: 'ANGLE (AMD, AMD Radeon RX 6600 XT (0x000073FF) Direct3D11 vs_5_0 ps_5_0, D3D11)', vendor: 'amd', architecture: 'rdna-2', device: '0x73ff', description: 'AMD Radeon RX 6600 XT' },
+] as const;
+
+function randomizeFingerprintFeature(value: FingerprintFormValue, feature: FingerprintFeatureKey): FingerprintFormValue {
+  const next = { ...value, features: { ...value.features, [feature]: true } };
+  if (feature === 'canvas') {
+    next.canvas = { signature: `profile-canvas-${randomFingerprintId(16)}`, noise: [Math.floor(Math.random() * 2), Math.floor(Math.random() * 2), Math.floor(Math.random() * 2)] as [number, number, number] };
+    if (next.canvas.noise.every((item) => item === 0)) next.canvas.noise[2] = 1;
+  }
+  if (feature === 'webgl' || feature === 'gpu') {
+    const preset = realisticGpuPresets[Math.floor(Math.random() * realisticGpuPresets.length)]!;
+    next.webgl = { vendor: preset.webglVendor, renderer: preset.webglRenderer };
+    next.gpu = { vendor: preset.vendor, architecture: preset.architecture, device: preset.device, description: preset.description };
+  }
+  if (feature === 'userAgent' || feature === 'clientHints') {
+    const major = String(152 + Math.floor(Math.random() * 4));
+    const version = `${major}.0.0.0`;
+    const brands = [{ brand: 'Not_A Brand', version: '24' }, { brand: 'Chromium', version: major }, { brand: 'Google Chrome', version: major }];
+    next.userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
+    next.clientHints = {
+      ...next.clientHints,
+      brands: JSON.stringify(brands),
+      fullVersionList: JSON.stringify(brands.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : version }))),
+      platform: 'Windows', platformVersion: '15.0.0', architecture: 'x86', bitness: '64', model: '', uaFullVersion: version,
+    };
+  }
+  return next;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -190,6 +413,8 @@ export default function DashboardClient() {
   const cache = useQueryClient();
   const { modal } = AntApp.useApp();
   const message = useToast();
+  const [accountForm] = Form.useForm<AccountFormValue>();
+  const [proxyForm] = Form.useForm<ProxyFormValue>();
   const [accountModalOpen, setAccountModalOpen] = useState(false);
   const [proxyModalOpen, setProxyModalOpen] = useState(false);
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
@@ -197,6 +422,7 @@ export default function DashboardClient() {
     platform: 'FACEBOOK',
     label: '',
     openAfterCreate: true,
+    fingerprint: defaultFingerprintForm(),
   });
   const [proxyInitialValues, setProxyInitialValues] = useState<ProxyFormValue>({
     name: '',
@@ -234,6 +460,13 @@ export default function DashboardClient() {
   const [scheduleCron, setScheduleCron] = useState('0 * * * *');
   const [scheduleTimezone, setScheduleTimezone] = useState('Asia/Bangkok');
   const [scheduleAction, setScheduleAction] = useState('HEALTH_CHECK');
+  const setFingerprintFeature = (feature: FingerprintFeatureKey, enabled: boolean) => {
+    const current = (accountForm.getFieldValue('fingerprint') as FingerprintFormValue | undefined) ?? defaultFingerprintForm();
+    const next = enabled
+      ? randomizeFingerprintFeature(current, feature)
+      : { ...current, features: { ...current.features, [feature]: false } };
+    accountForm.setFieldsValue({ fingerprint: next });
+  };
 
   const accounts = useQuery({
     queryKey: ['accounts'],
@@ -326,7 +559,10 @@ export default function DashboardClient() {
       if (success) message.success(success);
       return result;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      const errorMessageText = caught instanceof Error ? caught.message : String(caught);
+      // Let the modal's loading transition finish before showing the toast so the
+      // dialog action is immediately usable again after a failed save.
+      window.setTimeout(() => setError(errorMessageText), 250);
       return undefined;
     } finally {
       setBusy(undefined);
@@ -340,6 +576,7 @@ export default function DashboardClient() {
       platform: 'FACEBOOK',
       label: '',
       openAfterCreate: true,
+      fingerprint: defaultFingerprintForm(),
     });
     setAccountModalOpen(true);
   };
@@ -360,6 +597,7 @@ export default function DashboardClient() {
       password: credentials.password,
       cookies: credentials.cookies,
       openAfterCreate: false,
+      fingerprint: fingerprintToForm(account.browserProfile?.fingerprint),
     });
     setAccountModalOpen(true);
   };
@@ -380,6 +618,7 @@ export default function DashboardClient() {
       externalId: values.externalId?.trim() || (editingAccount ? null : undefined),
       proxyId: values.proxyId || (editingAccount ? null : undefined),
       ...(authenticationChanged ? { authentication } : {}),
+      fingerprint: normalizeFingerprintForm(values.fingerprint),
     };
     const saved = await perform(
       editingAccount ? `account-edit-${editingAccount.id}` : 'account-create',
@@ -465,7 +704,7 @@ export default function DashboardClient() {
   const confirmDeleteAccount = (account: Account) => {
     modal.confirm({
       title: 'Xóa tài khoản và browser profile?',
-      content: `${account.username ?? account.id} sẽ bị xóa. Hãy đóng browser trước khi tiếp tục.`,
+      content: `${account.username ?? account.id} và toàn bộ tác vụ/lịch của profile sẽ bị xóa. Hãy đóng browser trước khi tiếp tục.`,
       okText: 'Xóa',
       okButtonProps: { danger: true },
       cancelText: 'Hủy',
@@ -530,6 +769,21 @@ export default function DashboardClient() {
       () => mutate(`/api/login-sessions/${session.id}${session.status === 'CLOSING' ? '?force=true' : ''}`, 'DELETE'),
       ['login-sessions', 'accounts'],
     );
+  };
+
+  const createSchedule = async () => {
+    const account = accountRows.find((item) => item.id === scheduleAccount);
+    if (!account) return;
+    const result = await perform('schedule-create', () => mutate('/api/control/schedules', 'POST', {
+      name: scheduleName,
+      cronExpression: scheduleCron,
+      timezone: scheduleTimezone,
+      action: { platform: account.platform, accountId: account.id, action: scheduleAction, payload: {} },
+    }), ['schedules']);
+    if (result !== undefined) {
+      setScheduleModalOpen(false);
+      setScheduleName('');
+    }
   };
 
   const testProxy = async (proxy: ProxyItem) => {
@@ -852,17 +1106,13 @@ export default function DashboardClient() {
         </Card> : null}
 
         {activeView === 'schedules' ? <Card id="schedules" className="dashboard-row resource-card" title={<SectionTitle title="Lịch chạy" description="Kiểm tra phiên và profile theo lịch định kỳ." />} extra={<Button type="primary" icon={<Icon name="plus" />} disabled={!canOperate} onClick={() => { setError(undefined); setScheduleModalOpen(true); }}>Tạo lịch</Button>}>
-          <Modal title="Tạo lịch tự động" open={scheduleModalOpen} onCancel={() => { if (!busy) setScheduleModalOpen(false); }} width={720} footer={null}>
+          <Modal title="Tạo lịch tự động" open={scheduleModalOpen} onCancel={() => { if (!busy) setScheduleModalOpen(false); }} width={720} footer={<Button className="schedule-submit" type="primary" disabled={!canOperate || !scheduleName.trim() || !scheduleAccount} loading={busy === 'schedule-create'} onClick={() => void createSchedule()}>Tạo lịch</Button>}>
           <div className="form-row">
             <div className="compact-field"><span>Tên lịch</span><Input aria-label="Tên lịch" value={scheduleName} placeholder="Ví dụ: Kiểm tra mỗi giờ" onChange={(event) => setScheduleName(event.target.value)} /></div>
             <div className="compact-field"><span>Profile</span><Select aria-label="Profile cho lịch" value={scheduleAccount} placeholder="Chọn profile" onChange={setScheduleAccount} options={accountRows.map((account) => ({ value: account.id, label: `${account.platform} · ${account.username ?? account.id}` }))} /></div>
             <div className="compact-field"><span>Biểu thức cron</span><Input aria-label="Biểu thức cron" value={scheduleCron} placeholder="0 * * * *" onChange={(event) => setScheduleCron(event.target.value)} /></div>
             <div className="compact-field"><span>Múi giờ</span><Input aria-label="Múi giờ" value={scheduleTimezone} placeholder="Asia/Bangkok" onChange={(event) => setScheduleTimezone(event.target.value)} /></div>
             <div className="compact-field"><span>Tác vụ</span><Select aria-label="Tác vụ cho lịch" value={scheduleAction} onChange={setScheduleAction} options={['HEALTH_CHECK', 'GET_PROFILE'].map((value) => ({ value, label: ACTION_LABELS[value] }))} /></div>
-            <Button className="schedule-submit" type="primary" disabled={!canOperate || !scheduleName.trim() || !scheduleAccount} loading={busy === 'schedule-create'} onClick={async () => { const result = await perform('schedule-create', () => {
-              const account = accountRows.find((item) => item.id === scheduleAccount)!;
-              return mutate('/api/control/schedules', 'POST', { name: scheduleName, cronExpression: scheduleCron, timezone: scheduleTimezone, action: { platform: account.platform, accountId: account.id, action: scheduleAction, payload: {} } });
-            }, ['schedules']); if (result !== undefined) { setScheduleModalOpen(false); setScheduleName(''); } }}>Tạo lịch</Button>
           </div>
           </Modal>
           <Table rowKey="id" dataSource={schedules.data ?? []} pagination={{ pageSize: 6, hideOnSinglePage: true }} scroll={{ x: 900 }} columns={[
@@ -919,13 +1169,15 @@ export default function DashboardClient() {
         destroyOnHidden
         confirmLoading={busy === (editingAccount ? `account-edit-${editingAccount.id}` : 'account-create')}
         okText={editingAccount ? 'Lưu thay đổi' : 'Tạo profile'}
-        okButtonProps={{ form: 'account-form', htmlType: 'submit' }}
+        okButtonProps={{ 'aria-label': editingAccount ? 'Lưu thay đổi' : 'Tạo profile' }}
         cancelText="Hủy"
+        onOk={() => accountForm.validateFields().then((values) => submitAccount(values)).catch(() => undefined)}
         onCancel={() => { if (!busy) setAccountModalOpen(false); }}
       >
         <Form<AccountFormValue>
           id="account-form"
           key={editingAccount?.id ?? 'new-account'}
+          form={accountForm}
           initialValues={accountInitialValues}
           preserve={false}
           layout="vertical"
@@ -956,6 +1208,93 @@ export default function DashboardClient() {
               </Form.Item>
             </Col>
           </Row>
+          <Divider titlePlacement="start">Môi trường trình duyệt theo profile</Divider>
+          <Alert type="info" showIcon title="Locale, ngôn ngữ và timezone được giữ cùng một vùng để cấu hình giống người dùng thật. URL mở platform cũng sẽ dùng locale này." />
+          <Form.Item noStyle dependencies={[[ 'fingerprint', 'locale' ]] as never}>
+            {({ getFieldValue }) => {
+              const locale = String(getFieldValue(['fingerprint', 'locale']) ?? 'vi-VN');
+              const preset = fingerprintPreset(locale);
+              return (
+                <>
+                  <Row gutter={16}>
+                    <Col xs={24} sm={8}>
+                      <Form.Item name={['fingerprint', 'locale']} label="Locale" rules={[{ required: true }]}>
+                        <Select
+                          options={Object.keys(fingerprintPresets).map((value) => ({ value, label: value }))}
+                          onChange={(nextLocale: string) => {
+                            const next = fingerprintPreset(nextLocale);
+                            accountForm.setFieldsValue({ fingerprint: { ...accountForm.getFieldValue('fingerprint'), locale: nextLocale, languages: [...next.languages], timezoneId: next.timezones[0] ?? 'UTC' } });
+                          }}
+                        />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} sm={8}>
+                      <Form.Item name={['fingerprint', 'languages']} label="Languages" rules={[{ required: true, type: 'array', min: 1 }]}>
+                        <Select mode="multiple" options={preset.languages.map((value) => ({ value, label: value }))} />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} sm={8}>
+                      <Form.Item name={['fingerprint', 'timezoneId']} label="Timezone" rules={[{ required: true }]}>
+                        <Select options={preset.timezones.map((value) => ({ value, label: value }))} />
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                </>
+              );
+            }}
+          </Form.Item>
+          <Row gutter={16}>
+            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'viewport', 'width']} label="Viewport rộng"><InputNumber min={320} max={7680} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'viewport', 'height']} label="Viewport cao"><InputNumber min={240} max={4320} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'deviceScaleFactor']} label="Device scale"><InputNumber min={0.5} max={3} step={0.25} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'colorScheme']} label="Color scheme"><Select options={['light', 'dark', 'no-preference'].map((value) => ({ value, label: value }))} /></Form.Item></Col>
+          </Row>
+          <Collapse
+            items={[{
+              key: 'advanced-fingerprint',
+              label: 'Canvas / WebGL / GPU / User-Agent / Client Hints',
+              children: <>
+                <Alert type="info" showIcon title="Mặc định các lớp nâng cao đều tắt. Khi bật, hệ thống tự sinh một bộ giá trị hợp lý và lưu cùng profile để các lần mở sau dùng lại; bạn vẫn có thể chỉnh tay bên dưới." />
+                <Row gutter={[12, 4]}>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'canvas']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('canvas', event.target.checked)}>Dùng Canvas emulation</Checkbox></Form.Item></Col>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'webgl']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('webgl', event.target.checked)}>Dùng WebGL emulation</Checkbox></Form.Item></Col>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'gpu']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('gpu', event.target.checked)}>Dùng GPU emulation</Checkbox></Form.Item></Col>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'userAgent']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('userAgent', event.target.checked)}>Dùng User-Agent emulation</Checkbox></Form.Item></Col>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'clientHints']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('clientHints', event.target.checked)}>Dùng Client Hints emulation</Checkbox></Form.Item></Col>
+                </Row>
+                <Row gutter={16}>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'canvas', 'signature']} label="Canvas signature"><Input /></Form.Item></Col>
+                  <Col xs={8} sm={4}><Form.Item name={['fingerprint', 'canvas', 'noise', 0]} label="Canvas R"><InputNumber min={0} max={255} style={{ width: '100%' }} /></Form.Item></Col>
+                  <Col xs={8} sm={4}><Form.Item name={['fingerprint', 'canvas', 'noise', 1]} label="Canvas G"><InputNumber min={0} max={255} style={{ width: '100%' }} /></Form.Item></Col>
+                  <Col xs={8} sm={4}><Form.Item name={['fingerprint', 'canvas', 'noise', 2]} label="Canvas B"><InputNumber min={0} max={255} style={{ width: '100%' }} /></Form.Item></Col>
+                </Row>
+                <Row gutter={16}>
+                  <Col xs={24} sm={8}><Form.Item name={['fingerprint', 'webgl', 'vendor']} label="WebGL vendor"><Input /></Form.Item></Col>
+                  <Col xs={24} sm={16}><Form.Item name={['fingerprint', 'webgl', 'renderer']} label="WebGL renderer"><Input /></Form.Item></Col>
+                </Row>
+                <Row gutter={16}>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'vendor']} label="GPU vendor"><Input /></Form.Item></Col>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'architecture']} label="GPU architecture"><Input /></Form.Item></Col>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'device']} label="GPU device"><Input /></Form.Item></Col>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'description']} label="GPU description"><Input /></Form.Item></Col>
+                </Row>
+                <Form.Item name={['fingerprint', 'userAgent']} label="User-Agent"><Input /></Form.Item>
+                <Row gutter={16}>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'platform']} label="CH platform"><Select options={['Windows', 'Linux', 'macOS', 'Android'].map((value) => ({ value }))} /></Form.Item></Col>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'platformVersion']} label="CH platform version"><Input /></Form.Item></Col>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'architecture']} label="CH architecture"><Input /></Form.Item></Col>
+                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'bitness']} label="CH bitness"><Input /></Form.Item></Col>
+                </Row>
+                <Row gutter={16}>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'clientHints', 'uaFullVersion']} label="CH UA full version"><Input /></Form.Item></Col>
+                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'clientHints', 'model']} label="CH model"><Input /></Form.Item></Col>
+                </Row>
+                <Form.Item name={['fingerprint', 'clientHints', 'brands']} label="CH brands (JSON)"><Input.TextArea rows={2} className="code-input" /></Form.Item>
+                <Form.Item name={['fingerprint', 'clientHints', 'fullVersionList']} label="CH fullVersionList (JSON)"><Input.TextArea rows={2} className="code-input" /></Form.Item>
+                <Form.Item name={['fingerprint', 'clientHints', 'mobile']} valuePropName="checked"><Checkbox>Client Hints mobile</Checkbox></Form.Item>
+              </>,
+            }]}
+          />
           <Divider titlePlacement="start">Thông tin đăng nhập</Divider>
           <Row gutter={16}>
             <Col xs={24} sm={12}>
@@ -1013,12 +1352,14 @@ export default function DashboardClient() {
         destroyOnHidden
         confirmLoading={busy === (editingProxy ? `proxy-edit-${editingProxy.id}` : 'proxy-create')}
         okText="Lưu proxy"
-        okButtonProps={{ form: 'proxy-form', htmlType: 'submit' }}
+        okButtonProps={{ 'aria-label': 'Lưu proxy' }}
         cancelText="Hủy"
+        onOk={() => proxyForm.validateFields().then((values) => submitProxy(values)).catch(() => undefined)}
         onCancel={() => { if (!busy) setProxyModalOpen(false); }}
       >
         <Form<ProxyFormValue>
           id="proxy-form"
+          form={proxyForm}
           key={editingProxy?.id ?? 'new-proxy'}
           initialValues={proxyInitialValues}
           preserve={false}

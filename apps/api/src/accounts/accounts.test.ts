@@ -56,9 +56,66 @@ test('changing platform requires login again, merely resending platform does not
   await context.service.update('org', 'account', { platform: 'INSTAGRAM' });
   assert.equal(context.account.status, 'LOGIN_REQUIRED');
 });
+test('editing a fingerprint persists it without changing credentials', async () => {
+  const context = setup();
+  const fingerprint = {
+    locale: 'vi-VN', languages: ['vi-VN', 'vi', 'en-US'], timezoneId: 'Asia/Ho_Chi_Minh',
+    viewport: { width: 1440, height: 900 }, colorScheme: 'light', deviceScaleFactor: 1,
+    canvas: { signature: 'fixture', noise: [0, 1, 0] },
+    webgl: { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel)' },
+    gpu: { vendor: 'intel', architecture: 'gen-9', device: '0x3e92', description: 'Intel UHD' },
+    userAgent: 'Mozilla/5.0 Chrome/155.0.0.0',
+    clientHints: {
+      brands: [{ brand: 'Chromium', version: '155' }], fullVersionList: [{ brand: 'Chromium', version: '155.0.0.0' }],
+      mobile: false, platform: 'Windows', platformVersion: '19.0.0', architecture: 'x86', bitness: '64', model: '', uaFullVersion: '155.0.0.0',
+    },
+  };
+  await context.service.update('org', 'account', { fingerprint });
+  assert.equal(context.profileWrites.length, 1);
+  assert.deepEqual(context.account.browserProfile.metadata.fingerprint, fingerprint);
+  assert.equal(context.account.status, 'READY');
+});
 test('editing with an active browser remains blocked without writes', async () => {
   const context = setup();
   context.account.browserProfile.sessions = [{ status: 'RUNNING' }];
   await assert.rejects(context.service.update('org', 'account', { username: 'New name' }), /Close the browser/);
   assert.equal(context.writes.length, 0);
+});
+
+test('deleting an account also removes its schedules, tasks, and browser sessions', async () => {
+  const calls: string[] = [];
+  const account: any = {
+    id: 'account',
+    organizationId: 'org',
+    browserProfile: { id: 'profile', sessions: [] },
+    tasks: [],
+  };
+  const transaction = {
+    schedule: { deleteMany: async ({ where }: any) => { calls.push(`schedules:${where.accountId}`); } },
+    task: { deleteMany: async ({ where }: any) => { calls.push(`tasks:${where.accountId}`); } },
+    browserSession: { deleteMany: async ({ where }: any) => { calls.push(`sessions:${where.profileId}`); } },
+    platformAccount: { delete: async ({ where }: any) => { calls.push(`account:${where.id}`); } },
+  };
+  const prisma = {
+    platformAccount: { findFirst: async () => account },
+    $transaction: async (callback: any) => callback(transaction),
+  };
+  const service = new AccountsService(prisma as never, {} as never);
+
+  assert.deepEqual(await service.remove('org', 'account'), { deleted: true });
+  assert.deepEqual(calls, ['schedules:account', 'tasks:account', 'sessions:profile', 'account:account']);
+});
+
+test('deleting an account remains blocked while one of its tasks is running', async () => {
+  const context = setup();
+  (context.account as any).tasks = [{ id: 'running-task' }];
+  const prisma = {
+    platformAccount: { findFirst: async () => context.account },
+  };
+  const service = new AccountsService(prisma as never, {} as never);
+
+  await assert.rejects(
+    service.remove('org', 'account'),
+    /running task/,
+  );
 });

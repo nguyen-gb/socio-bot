@@ -1,5 +1,5 @@
 import { normalizeFacebookGroupUrl, type ActionResult } from '@socio/contracts';
-import { LoginRequiredError, type PlatformSession } from '@socio/platform-core';
+import { gotoPlatformPage, LoginRequiredError, type PlatformSession } from '@socio/platform-core';
 import type { Locator, Page, Request, Response } from 'playwright';
 import { isTaskPostRequest, readPostConfirmation, type FacebookPostConfirmation } from './facebook-post-confirmation';
 import { attachFacebookImages } from './facebook-images';
@@ -273,7 +273,10 @@ async function joinState(page: Page, expected: string, data: Record<string, unkn
 }
 
 async function openGroupsPage(page: Page, url: string, mainTimeoutMs = 30_000): Promise<ActionResult | undefined> {
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  // Keep navigation's hard timeout independent from the shorter content
+  // readiness window below; a slow proxy must not abort the document before
+  // the group's <main> has had a chance to hydrate.
+  await gotoPlatformPage(page, url, undefined, { timeoutMs: 45_000 });
   const blocked = await guard(page);
   if (blocked) return blocked;
   // A welcome overlay hides the group's main from the accessibility tree.

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { BrowserContext, CDPSession, Page } from 'playwright';
 import { withDeadline } from '@socio/browser-runtime';
+import { clickPlatformReloadButton, gotoPlatformPage, hasPlatformErrorSurface, waitForPlatformPageReady } from '@socio/platform-core';
 
 /** One interactive browser context, never tabs from another profile/session. */
 export class RemoteBrowser {
@@ -106,12 +107,25 @@ export class RemoteBrowser {
         await target.close({ runBeforeUnload: false });
       }
     } else if (command.type === 'navigate' && page) {
-      await page.goto(command.url!, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await gotoPlatformPage(page, command.url!, undefined, { timeoutMs: 20000 });
+      await waitForPlatformPageReady(page, { timeoutMs: 20000, settleMs: 250 });
     } else if (command.type === 'navigation' && page) {
       const options = { waitUntil: 'domcontentloaded' as const, timeout: 20000 };
-      if (command.action === 'back') await page.goBack(options);
-      else if (command.action === 'forward') await page.goForward(options);
-      else await page.reload(options);
+      if (command.action === 'reload') {
+        if (!await clickPlatformReloadButton(page, { timeoutMs: 20000 })) throw new Error('Trang không tải được sau khi click Reload');
+      } else {
+        try {
+          if (command.action === 'back') await page.goBack(options);
+          else await page.goForward(options);
+          await waitForPlatformPageReady(page, { timeoutMs: 20000, settleMs: 250 });
+          if (await hasPlatformErrorSurface(page)
+            && !await clickPlatformReloadButton(page, { timeoutMs: 20000 })) {
+            throw new Error('Trang không tải được sau khi reload');
+          }
+        } catch (error) {
+          if (!await clickPlatformReloadButton(page, { timeoutMs: 20000 })) throw error;
+        }
+      }
     } else return false;
     await this.state(true); return true;
   }

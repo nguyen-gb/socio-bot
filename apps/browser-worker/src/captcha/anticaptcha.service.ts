@@ -38,11 +38,16 @@ export class AntiCaptchaService {
    * bodies to /in.php, then poll /res.php until it returns coordinates. The
    * current TikTok web response is `coordinates:x=0,y=170`.
    */
-  async solveTikTokRotate(imageBase64s: readonly [string, string]): Promise<number> {
+  async solveTikTokRotate(imageBase64s: readonly [string, string], budgetMs = this.timeoutMs): Promise<number> {
     this.logger.log('Submitting TikTok rotate CAPTCHA to AntiCaptcha.top');
     try {
-      const taskId = await this.submitTikTokRecognition(imageBase64s);
-      const result = await this.pollRecognitionResult(taskId);
+      // The configured timeout is a budget for the complete solve operation,
+      // not a separate budget for submit plus every result poll.
+      const deadline = Date.now() + Math.min(this.timeoutMs, Math.max(1_000, budgetMs));
+      const submitBudget = Math.max(1, deadline - Date.now());
+      const taskId = await this.submitTikTokRecognition(imageBase64s, submitBudget);
+      const pollBudget = Math.max(1, deadline - Date.now());
+      const result = await this.pollRecognitionResult(taskId, pollBudget);
       const ratio = normalizeTikTokRecognitionResult(result);
       return this.tikTokRotateInvert ? (ratio === 0 ? 0 : 1 - ratio) : ratio;
     } catch (error) {
@@ -152,7 +157,7 @@ export class AntiCaptchaService {
     }
   }
 
-  private async submitTikTokRecognition(imageBase64s: readonly [string, string]): Promise<string> {
+  private async submitTikTokRecognition(imageBase64s: readonly [string, string], timeoutMs = this.timeoutMs): Promise<string> {
     const response = await this.fetchJson(this.recognitionUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -165,7 +170,7 @@ export class AntiCaptchaService {
         body1: imageBase64s[1],
         json: 1,
       }),
-    });
+    }, timeoutMs);
     if (response.status !== 1 || typeof response.request !== 'string' || response.request.length === 0) {
       throw new Error(`AntiCaptcha.top submit failed: ${response.request ?? 'unknown error'}`);
     }
@@ -196,9 +201,11 @@ export class AntiCaptchaService {
     return response.request;
   }
 
-  private async pollRecognitionResult(taskId: string): Promise<string> {
-    const deadline = Date.now() + this.timeoutMs;
+  private async pollRecognitionResult(taskId: string, budgetMs = this.timeoutMs): Promise<string> {
+    const deadline = Date.now() + budgetMs;
     while (Date.now() <= deadline) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
       const url = new URL(this.resultUrl);
       url.searchParams.set('key', this.apiKey ?? '');
       url.searchParams.set('id', taskId);
@@ -206,7 +213,7 @@ export class AntiCaptchaService {
       const response = await this.fetchJson(url.toString(), {
         method: 'GET',
         headers: { Accept: 'application/json' },
-      });
+      }, Math.min(remainingMs, 10_000));
       if (response.status === 1 && typeof response.request === 'string' && response.request.length > 0) {
         return response.request;
       }
@@ -218,10 +225,10 @@ export class AntiCaptchaService {
     throw new Error('AntiCaptcha.top recognition timed out');
   }
 
-  private async fetchJson(url: string, init: RequestInit): Promise<Record<string, unknown>> {
+  private async fetchJson(url: string, init: RequestInit, timeoutMs = this.timeoutMs): Promise<Record<string, unknown>> {
     let response: Response;
     try {
-      response = await fetch(url, { ...init, signal: AbortSignal.timeout(this.timeoutMs) });
+      response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     } catch (error) {
       throw new Error(`AntiCaptcha.top request failed: ${error instanceof Error ? error.message : String(error)}`);
     }

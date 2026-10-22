@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { platformSchema } from './status';
+import { browserFingerprintSchema } from './fingerprint';
 
 export const accountAuthenticationSchema = z
   .object({
@@ -17,6 +18,7 @@ export const createAccountSchema = z.object({
   externalId: z.string().trim().min(1).max(255).nullish().transform(value => value ?? undefined),
   proxyId: z.uuid().nullish().transform(value => value ?? undefined),
   authentication: accountAuthenticationSchema.default({}),
+  fingerprint: browserFingerprintSchema.optional(),
 });
 export type CreateAccountInput = z.infer<typeof createAccountSchema>;
 
@@ -27,6 +29,7 @@ export const updateAccountSchema = z
     externalId: z.string().trim().min(1).max(255).nullable().optional(),
     proxyId: z.uuid().nullable().optional(),
     authentication: accountAuthenticationSchema.optional(),
+    fingerprint: browserFingerprintSchema.optional(),
   })
   .refine((value) => Object.keys(value).length > 0, {
     message: 'At least one account field is required',

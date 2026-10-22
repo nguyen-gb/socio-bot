@@ -1,5 +1,6 @@
 import {
   gotoPlatformPage,
+  waitForPlatformPageReady,
   type BrowserPage,
   type PlatformSession,
 } from '@socio/platform-core';
@@ -34,7 +35,9 @@ export interface TikTokSearchProvider {
  * AntiCaptcha.top implementation without creating a package dependency cycle. */
 export interface TikTokRotateCaptchaSolver {
   /** Returns the provider's normalized rotate ratio (0..1). */
-  solveRotate(imageBase64s: readonly [string, string]): Promise<number>;
+  solveRotate(imageBase64s: readonly [string, string], timeoutMs?: number): Promise<number>;
+  /** Total budget for the complete solve operation, including retries. */
+  timeoutMs?: number;
   report?: (message: string) => void;
 }
 
@@ -92,6 +95,7 @@ interface LocatorLike {
   setInputFiles?: (files: Array<{ name: string; mimeType: string; buffer: Buffer }>) => Promise<void>;
   screenshot?: () => Promise<Buffer>;
   boundingBox?: () => Promise<{ x: number; y: number; width: number; height: number } | null>;
+  evaluate?: <T>(pageFunction: (element: Element) => T) => Promise<T>;
 }
 
 interface FrameLike {
@@ -122,6 +126,9 @@ interface TikTokRotateChallengeSnapshot {
 const tikTokRotateSolveAttempts = new WeakMap<object, number>();
 
 const tiktokHomeUrl = 'https://www.tiktok.com/';
+const tikTokSearchResultsWaitMs = 30_000;
+const tikTokTopResultsWaitMs = 20_000;
+const tikTokResultHydrationWaitMs = 15_000;
 
 const tiktokCommentEditorSelectors = [
   '[data-e2e="comment-input"] [contenteditable="true"]',
@@ -150,6 +157,51 @@ const tiktokCommentPlaceholderSelectors = [
   '[data-placeholder*="Add comment" i]',
   '[aria-label*="Add comment" i]',
   '[aria-label*="comment" i]',
+];
+
+const tiktokReplyEditorSelectors = [
+  // Current desktop TikTok reply DOM. Keep this scope first: the page keeps
+  // old DraftEditor roots mounted while the comment drawer virtualizes rows.
+  '[data-e2e="comment-reply-text"] .public-DraftEditor-content[contenteditable="true"]',
+  '[data-e2e="comment-reply-input"] .public-DraftEditor-content[contenteditable="true"]',
+  '[data-e2e="comment-reply-text"] .DraftEditor-editorContainer [contenteditable="true"]',
+  '[data-e2e="comment-reply-input"] .DraftEditor-editorContainer [contenteditable="true"]',
+  '[data-socio-active-reply-editor="true"]',
+  '[data-socio-reply-active="true"] .public-DraftEditor-content[contenteditable="true"]',
+  '[data-socio-reply-active="true"] .DraftEditor-editorContainer [contenteditable="true"]',
+  '.DraftEditor-root:has(.public-DraftEditorPlaceholder-inner:has-text("Add a reply")) .public-DraftEditor-content[contenteditable="true"]',
+  '.DraftEditor-root:has(.public-DraftEditorPlaceholder-inner:has-text("Trả lời")) .public-DraftEditor-content[contenteditable="true"]',
+  '[data-e2e*="reply" i] [contenteditable="true"]',
+  '[data-e2e*="reply" i] [role="textbox"]',
+  '[contenteditable="true"][data-placeholder*="Add a reply" i]',
+  '[contenteditable="true"][data-placeholder*="reply" i]',
+  '[role="textbox"][data-placeholder*="Add a reply" i]',
+  '[role="textbox"][data-placeholder*="reply" i]',
+  '[contenteditable="true"][aria-label*="Add a reply" i]',
+  '[contenteditable="true"][aria-label*="reply" i]',
+  '[role="textbox"][aria-label*="Add a reply" i]',
+  '[role="textbox"][aria-label*="reply" i]',
+  'textarea[placeholder*="reply" i]',
+  'input[placeholder*="reply" i]',
+  'textarea[aria-label*="reply" i]',
+  'input[aria-label*="reply" i]',
+];
+
+const tiktokReplyPlaceholderSelectors = [
+  '[data-e2e="comment-reply-text"] .public-DraftEditorPlaceholder-inner',
+  '[data-e2e="comment-reply-input"] .public-DraftEditorPlaceholder-inner',
+  '[contenteditable="true"][data-placeholder*="Add a reply" i]',
+  '[contenteditable="true"][data-placeholder*="reply" i]',
+  '[role="textbox"][data-placeholder*="Add a reply" i]',
+  '[role="textbox"][data-placeholder*="reply" i]',
+  '[contenteditable="true"][aria-label*="Add a reply" i]',
+  '[contenteditable="true"][aria-label*="reply" i]',
+  '[role="textbox"][aria-label*="Add a reply" i]',
+  '[role="textbox"][aria-label*="reply" i]',
+  'textarea[placeholder*="reply" i]',
+  'input[placeholder*="reply" i]',
+  'textarea[aria-label*="reply" i]',
+  'input[aria-label*="reply" i]',
 ];
 
 const tiktokCommentTextSelectors = [
@@ -209,6 +261,7 @@ async function gotoTikTokSurface(page: EvaluatablePage, url: string): Promise<vo
   const currentUrl = page.url().split('?')[0];
   if (currentUrl === url.split('?')[0] && await hasTikTokProfileSurface(page)) return;
   let navigationError: unknown;
+  let reloadAttempted = false;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       // TikTok can replace the document while DOMContentLoaded is pending.
@@ -220,6 +273,16 @@ async function gotoTikTokSurface(page: EvaluatablePage, url: string): Promise<vo
     } catch (error) {
       navigationError = error;
       const message = error instanceof Error ? error.message : String(error);
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message) && !reloadAttempted) {
+        reloadAttempted = true;
+        if (await clickTikTokReloadButton(page)) {
+          navigationError = undefined;
+          break;
+        }
+      }
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message) && reloadAttempted) {
+        throw new Error(tikTokReloadFailureMessage(url));
+      }
       if (!isTikTokNavigationRace(message) && !/ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(message)) throw error;
       await page.waitForTimeout?.(650 + attempt * 450);
     }
@@ -228,9 +291,7 @@ async function gotoTikTokSurface(page: EvaluatablePage, url: string): Promise<vo
   await waitForTikTokPageReady(page);
   await dismissTikTokBlockingPopup(page);
   await dismissTikTokCloseablePopup(page);
-  if (await hasTikTokErrorSurface(page)) {
-    throw new Error('TikTok không hiển thị được trang profile trong browser automation');
-  }
+  await recoverTikTokErrorSurface(page, 'TikTok không hiển thị được trang profile trong browser automation');
   if (!(await hasTikTokProfileSurface(page))) {
     throw new Error('TikTok chưa hiển thị xong trang profile trong browser automation');
   }
@@ -238,6 +299,7 @@ async function gotoTikTokSurface(page: EvaluatablePage, url: string): Promise<vo
 
 async function gotoTikTokVideoPage(page: EvaluatablePage, url: string): Promise<void> {
   let lastError: unknown;
+  let reloadAttempted = false;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await page.goto(url, { waitUntil: 'commit', timeout: 45_000 });
@@ -246,6 +308,16 @@ async function gotoTikTokVideoPage(page: EvaluatablePage, url: string): Promise<
     } catch (error) {
       lastError = error;
       const message = error instanceof Error ? error.message : String(error);
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message) && !reloadAttempted) {
+        reloadAttempted = true;
+        if (await clickTikTokReloadButton(page) && isTikTokVideoPath(page.url(), url)) {
+          lastError = undefined;
+          break;
+        }
+      }
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message) && reloadAttempted) {
+        throw new Error(tikTokReloadFailureMessage(url));
+      }
       if (!isTikTokNavigationRace(message) && !/ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(message)) throw error;
       await page.waitForTimeout?.(650 + attempt * 450);
     }
@@ -256,9 +328,7 @@ async function gotoTikTokVideoPage(page: EvaluatablePage, url: string): Promise<
   await waitForTikTokPageReady(page);
   await dismissTikTokBlockingPopup(page);
   await dismissTikTokCloseablePopup(page);
-  if (await hasTikTokErrorSurface(page)) {
-    throw new Error('TikTok không hiển thị được trang video trong browser automation');
-  }
+  await recoverTikTokErrorSurface(page, 'TikTok không hiển thị được trang video trong browser automation');
 }
 
 /**
@@ -273,9 +343,7 @@ async function openTikTokVideoPage(page: EvaluatablePage, url: string): Promise<
     await waitForTikTokPageReady(page);
     await dismissTikTokBlockingPopup(page);
     await dismissTikTokCloseablePopup(page);
-    if (await hasTikTokErrorSurface(page)) {
-      throw new Error('TikTok không hiển thị được trang video trong browser automation');
-    }
+    await recoverTikTokErrorSurface(page, 'TikTok không hiển thị được trang video trong browser automation');
     if (isTikTokVideoPath(page.url(), url)) return;
   }
   await gotoTikTokVideoPage(page, url);
@@ -323,10 +391,14 @@ function isTikTokNavigationRace(message: string): boolean {
   return /ERR_ABORTED|interrupted by another navigation|chrome-error:\/\/chromewebdata/i.test(message);
 }
 
+function tikTokReloadFailureMessage(url: string): string {
+  return `TikTok không tải được trang sau khi đã thử Reload (HTTP 403 hoặc chrome-error): ${url}`;
+}
+
 async function hasTikTokErrorSurface(page: EvaluatablePage): Promise<boolean> {
   if (!page.evaluate) return false;
   try {
-    return await page.evaluate(() => {
+    const result = await page.evaluate(() => {
       const visible = (element: Element): boolean => {
         const style = window.getComputedStyle(element);
         return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
@@ -338,6 +410,7 @@ async function hasTikTokErrorSurface(page: EvaluatablePage): Promise<boolean> {
         .some((element) => /refresh|try again|tải lại|thử lại/i.test((element as HTMLElement).innerText || element.getAttribute('aria-label') || ''));
       return errorText && refresh;
     });
+    return result === true;
   } catch {
     return false;
   }
@@ -346,7 +419,7 @@ async function hasTikTokErrorSurface(page: EvaluatablePage): Promise<boolean> {
 async function hasTikTokDeniedDocument(page: EvaluatablePage): Promise<boolean> {
   if (!page.evaluate) return false;
   try {
-    return await page.evaluate(() => {
+    const result = await page.evaluate(() => {
       const bodyText = (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim();
       const title = document.title ?? '';
       const hardDenied = /access to (?:www\.)?tiktok\.com was denied|you don't have authorization to view this page|http error 403|err_http_response_code_failure/i.test(`${title} ${bodyText}`);
@@ -354,6 +427,7 @@ async function hasTikTokDeniedDocument(page: EvaluatablePage): Promise<boolean> 
         && !document.querySelector('[data-e2e], input, button, video');
       return hardDenied || waitingInterstitial;
     });
+    return result === true;
   } catch {
     return false;
   }
@@ -382,16 +456,27 @@ export async function searchTikTokVideos(
   const page = session.page as EvaluatablePage;
   let verificationSeenDuringNavigation = false;
   try {
-    // Search directly on the Videos surface. The previous flow opened For You,
-    // dismissed the onboarding UI, watched/scrolled several feed items, opened
-    // the search box, and only then navigated here. None of those steps are
-    // required once CAPTCHA solving is available and they add several seconds.
-    await gotoPlatformPage(page, buildTikTokVideoSearchUrl(query));
+    // Always let TikTok finish its ordinary home shell before entering Search.
+    // A direct cold navigation to /search/video is prone to ERR_ABORTED while
+    // TikTok is still replacing the root document with its feed route.
+    const homeReady = isTikTokHomeShellUrl(page.url())
+      && !(await hasTikTokDeniedDocument(page))
+      && !(await hasTikTokErrorSurface(page));
+    if (!homeReady) await enterTikTokRoot(page, session.platformHomeUrl);
+    await waitForTikTokPageReady(page);
+    await dismissTikTokBlockingPopup(page);
+    await dismissTikTokCloseablePopup(page);
+    await waitForTikTokUi(page, 900, 1_600);
+    await gotoTikTokSearchPage(page, buildTikTokVideoSearchUrl(query));
     // The first page visit is the most sensitive BDTuring window. Let the
     // route, challenge scripts, and result surface settle before inspecting
     // the DOM or performing the next action.
     await waitForTikTokUi(page, 1_200, 2_200);
     verificationSeenDuringNavigation = await waitForTikTokVideoResults(page, captchaSolver);
+    // A visible anchor can be committed before the card metadata and
+    // thumbnails hydrate. Wait for the result surface itself to settle before
+    // extracting videos, otherwise a slow session is reported as zero data.
+    await waitForTikTokResultsLoad(page, 0);
   } catch (error) {
     if (/ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(error instanceof Error ? error.message : String(error))) {
       throw new TikTokVerificationRequiredError(
@@ -408,7 +493,7 @@ export async function searchTikTokVideos(
   // newly visible cards are expected per pass, with a hard safety cap for a
   // malformed page.
   const requestedVideoCount = Math.max(0, Math.floor(maxVideos));
-  const maxScrollPasses = Math.min(30, Math.max(1, Math.ceil(requestedVideoCount / 6)));
+  const maxScrollPasses = Math.min(30, Math.max(3, Math.ceil(requestedVideoCount / 6)));
   for (let pass = 0; pass < maxScrollPasses && videos.size < maxVideos; pass += 1) {
     const batch = await extractVisibleVideos(page);
     const before = videos.size;
@@ -436,18 +521,73 @@ export async function searchTikTokVideos(
 
   if (videos.size === 0) {
     const state = await inspectTikTokSearchState(page);
-    if (state.verificationRequired || verificationSeenDuringNavigation || !state.explicitEmpty) {
+    const visibleCaptcha = state.verificationRequired && await hasVisibleTikTokCaptcha(page);
+    if (visibleCaptcha || verificationSeenDuringNavigation || !state.explicitEmpty) {
+      const reason = visibleCaptcha
+        ? undefined
+        : verificationSeenDuringNavigation
+          ? 'TikTok đã hiển thị challenge/CAPTCHA trong lúc chuyển sang tab Videos; không ghi nhận kết quả rỗng là thành công. Hãy xử lý xác minh thủ công trên browser rồi chạy lại campaign.'
+          : 'TikTok chưa trả dữ liệu search video. Có thể phiên tạm đang bị BDTuring yêu cầu xác minh; hãy xử lý xác minh thủ công trên browser rồi chạy lại campaign.';
       throw new TikTokVerificationRequiredError(
-        state.verificationRequired
-          ? undefined
-          : verificationSeenDuringNavigation
-            ? 'TikTok đã hiển thị challenge/CAPTCHA trong lúc chuyển sang tab Videos; không ghi nhận kết quả rỗng là thành công. Hãy xử lý xác minh thủ công trên browser rồi chạy lại campaign.'
-            : 'TikTok chưa trả dữ liệu search video. Có thể phiên tạm đang bị BDTuring yêu cầu xác minh; hãy xử lý xác minh thủ công trên browser rồi chạy lại campaign.',
+        reason,
       );
     }
   }
 
   return [...videos.values()].slice(0, maxVideos);
+}
+
+async function gotoTikTokSearchPage(page: EvaluatablePage, url: string): Promise<void> {
+  let lastError: unknown;
+  let reloadAttempted = false;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      // DOMContentLoaded is racy on TikTok Search: the app can replace the
+      // document after the response commits and Playwright then reports
+      // ERR_ABORTED. The commit milestone is enough; result readiness is
+      // checked by waitForTikTokVideoResults below.
+      await page.goto(url, { waitUntil: 'commit', timeout: 45_000 });
+      await waitForTikTokPageReady(page);
+      await recoverTikTokErrorSurface(page, 'TikTok không hiển thị được trang Search video trong browser automation');
+      return;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message) && !reloadAttempted) {
+        reloadAttempted = true;
+        if (await clickTikTokReloadButton(page) && isTikTokSearchSurfaceUrl(page.url(), url)) {
+          lastError = undefined;
+          return;
+        }
+      }
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message) && reloadAttempted) {
+        throw new Error(tikTokReloadFailureMessage(url));
+      }
+      if (isTikTokSearchSurfaceUrl(page.url(), url)) {
+        await waitForTikTokPageReady(page);
+        await recoverTikTokErrorSurface(page, 'TikTok không hiển thị được trang Search video trong browser automation');
+        return;
+      }
+      const retryable = isTikTokNavigationRace(message)
+        || /ERR_HTTP_RESPONSE_CODE_FAILURE|Timeout \d+ms exceeded/i.test(message);
+      if (!retryable) throw error;
+      await waitForTikTokUi(page, 650 + attempt * 350, 1_050 + attempt * 450);
+    }
+  }
+  if (lastError) throw lastError;
+  throw new Error('TikTok không mở được trang Search video');
+}
+
+function isTikTokSearchSurfaceUrl(currentUrl: string, expectedUrl: string): boolean {
+  try {
+    const current = new URL(currentUrl);
+    const expected = new URL(expectedUrl);
+    return current.hostname === expected.hostname
+      && current.pathname.replace(/\/$/, '') === expected.pathname.replace(/\/$/, '')
+      && current.searchParams.get('q') === expected.searchParams.get('q');
+  } catch {
+    return false;
+  }
 }
 
 function buildTikTokVideoSearchUrl(query: string): string {
@@ -550,7 +690,7 @@ function isTikTokHomeShellUrl(value: string): boolean {
   try {
     const url = new URL(value);
     return /^(?:www\.)?tiktok\.com$/i.test(url.hostname)
-      && (url.pathname === '/' || url.pathname === '/foryou' || url.pathname === '/foryou/');
+      && (url.pathname === '/' || url.pathname === '/en' || url.pathname === '/en/' || url.pathname === '/foryou' || url.pathname === '/foryou/');
   } catch {
     return false;
   }
@@ -558,6 +698,10 @@ function isTikTokHomeShellUrl(value: string): boolean {
 
 /** Wait for the current TikTok document to finish loading before interacting. */
 async function waitForTikTokPageReady(page: EvaluatablePage): Promise<void> {
+  // The generic guard waits for the browser's real `load` milestone. TikTok's
+  // React shell still hydrates after that milestone, so the bounded UI loop
+  // below remains necessary for controls/results that are mounted lazily.
+  await waitForPlatformPageReady(page, { timeoutMs: 20_000, settleMs: 0 });
   if (!page.evaluate) {
     await waitForTikTokUi(page, 1_200, 2_200);
     return;
@@ -566,11 +710,20 @@ async function waitForTikTokPageReady(page: EvaluatablePage): Promise<void> {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     let readyState: string | undefined;
+    let readSucceeded = false;
     try {
       readyState = await page.evaluate(() => document.readyState);
+      readSucceeded = true;
     } catch {
       // A route transition can briefly detach the document. Keep waiting for
       // the replacement document instead of starting another navigation.
+    }
+    // Lightweight test/remote page shims may not implement document state
+    // faithfully. Do not burn the complete 20s readiness budget when the
+    // evaluation succeeded with a non-browser value.
+    if (readSucceeded && typeof readyState !== 'string') {
+      await waitForTikTokUi(page, 350, 700);
+      return;
     }
     if (readyState === 'complete') {
       // DOM complete does not mean TikTok's React shell has finished hydrating.
@@ -587,6 +740,49 @@ async function waitForTikTokPageReady(page: EvaluatablePage): Promise<void> {
 }
 
 /**
+ * Treat Chromium's 403/chrome-error surface as recoverable once. This is the
+ * programmatic equivalent of clicking the visible Reload button in the
+ * screenshot; the action is allowed to continue only when the reloaded
+ * document no longer presents the same error surface.
+ */
+async function clickTikTokReloadButton(page: EvaluatablePage): Promise<boolean> {
+  const selectors = [
+    '#reload-button',
+    'button#reload-button',
+    'button:has-text("Reload")',
+    '[role="button"]:has-text("Reload")',
+    'button:has-text("Tải lại")',
+    '[role="button"]:has-text("Tải lại")',
+  ];
+  try {
+    for (const selector of selectors) {
+      const locator = page.locator(selector) as unknown as LocatorLike;
+      const count = await locator.count();
+      for (let index = 0; index < count; index += 1) {
+        const candidate = locator.nth ? locator.nth(index) : locator;
+        if (candidate.isVisible && !await candidate.isVisible()) continue;
+        if (candidate.isEnabled && !await candidate.isEnabled()) continue;
+        if (!candidate.click) continue;
+        await candidate.click();
+        await waitForTikTokPageReady(page);
+        await dismissTikTokBlockingPopup(page);
+        await dismissTikTokCloseablePopup(page);
+        return !(await hasTikTokDeniedDocument(page)) && !(await hasTikTokErrorSurface(page));
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function recoverTikTokErrorSurface(page: EvaluatablePage, message: string): Promise<void> {
+  if (!(await hasTikTokDeniedDocument(page)) && !(await hasTikTokErrorSurface(page))) return;
+  if (await clickTikTokReloadButton(page)) return;
+  throw new Error(message);
+}
+
+/**
  * Enter TikTok through the requested root URL without treating TikTok's own
  * client-side handoff to its feed as a failed campaign navigation. Waiting for
  * `domcontentloaded` on this route is racy: TikTok can replace the document
@@ -595,34 +791,63 @@ async function waitForTikTokPageReady(page: EvaluatablePage): Promise<void> {
  * final document is still on TikTok. We never retry by navigating to
  * `/foryou`; the rest of the flow observes whichever document TikTok mounted.
  */
-export async function enterTikTokRoot(page: EvaluatablePage): Promise<void> {
-  // Browser sessions are created with TikTok's ordinary root already open.
-  // Re-navigating a healthy root immediately after Chromium startup can turn
-  // a usable document into TikTok's transient 403 error page. Reuse that
-  // document and let the caller wait for hydration instead of reloading it.
-  if (isTikTokHomeShellUrl(page.url())
+export async function enterTikTokRoot(page: EvaluatablePage, requestedHomeUrl?: string): Promise<void> {
+  void requestedHomeUrl;
+  const entryUrls = [tiktokHomeUrl, 'https://www.tiktok.com/en'] as const;
+  // Browser sessions are normally created with TikTok's ordinary root already
+  // open. Reuse that healthy root only; `/en` is a fallback result and a
+  // localized route such as `/vn` is never used as a campaign entry point.
+  if ((isTikTokCanonicalHomeUrl(page.url()))
     && !(await hasTikTokDeniedDocument(page))
-    && !(await hasTikTokErrorSurface(page))) return;
-
-  try {
-    await page.goto(tiktokHomeUrl, { waitUntil: 'commit', timeout: 45_000 });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const isOwnNavigationRace = /ERR_ABORTED|interrupted by another navigation|chrome-error:\/\/chromewebdata/i.test(message);
-    if (!isOwnNavigationRace) throw error;
+    && !(await hasTikTokErrorSurface(page))) {
+    await waitForTikTokPageReady(page);
+    return;
   }
 
-  // A cold profile can receive a transient 403 on the first root request.
-  // Retry the same requested root once after the document has settled; never
-  // substitute /foryou here.
-  if (await hasTikTokDeniedDocument(page)) {
-    await waitForTikTokUi(page, 1_200, 2_200);
+  let lastError: unknown;
+  let reloadAttempted = false;
+  for (const homeUrl of entryUrls) {
     try {
-      await page.goto(tiktokHomeUrl, { waitUntil: 'commit', timeout: 45_000 });
+      await page.goto(homeUrl, { waitUntil: 'commit', timeout: 45_000 });
+      await waitForTikTokPageReady(page);
+      if (!(await hasTikTokDeniedDocument(page)) && !(await hasTikTokErrorSurface(page))) return;
+      if (await clickTikTokReloadButton(page)
+        && !(await hasTikTokDeniedDocument(page))
+        && !(await hasTikTokErrorSurface(page))) return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!isTikTokNavigationRace(message) && !/ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(message)) throw error;
+      lastError = error;
+      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message) && !reloadAttempted) {
+        reloadAttempted = true;
+        if (await clickTikTokReloadButton(page)
+          && !(await hasTikTokDeniedDocument(page))
+          && !(await hasTikTokErrorSurface(page))) return;
+      }
+      // TikTok may replace the root document with /foryou while the commit
+      // navigation is still settling. Reuse that usable shell; otherwise try
+      // the English fallback before surfacing the navigation error.
+      if (isTikTokNavigationRace(message)
+        && isTikTokHomeShellUrl(page.url())
+        && !(await hasTikTokDeniedDocument(page))
+        && !(await hasTikTokErrorSurface(page))) {
+        await waitForTikTokPageReady(page);
+        return;
+      }
     }
+    await waitForTikTokUi(page, 350, 700);
+  }
+  if (lastError) throw lastError;
+  throw new Error('TikTok không mở được trang bắt đầu');
+}
+
+function isTikTokCanonicalHomeUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    // `/en` is a fallback result, not the canonical cold-start route. On the
+    // next campaign we deliberately try the root again before falling back.
+    return url.hostname === 'www.tiktok.com' && url.pathname === '/';
+  } catch {
+    return false;
   }
 }
 
@@ -783,6 +1008,7 @@ async function searchTikTokProfileFromHome(
     await submit.click();
   }
 
+  await waitForTikTokPageReady(page);
   await waitForTikTokActionDelay(page);
   let usersTabClicked = false;
   let videoTabTried = false;
@@ -811,6 +1037,7 @@ async function searchTikTokProfileFromHome(
     if (recoveryAttempt === 0 && !usersTabClicked) {
       usersTabClicked = await clickTikTokUsersTab(page);
       if (usersTabClicked) {
+        await waitForTikTokPageReady(page);
         await waitForTikTokActionDelay(page);
         continue;
       }
@@ -824,6 +1051,7 @@ async function searchTikTokProfileFromHome(
       try {
         await clickTikTokVideoTab(page, searchQuery);
         videoTabTried = true;
+        await waitForTikTokPageReady(page);
         await waitForTikTokActionDelay(page);
         continue;
       } catch {
@@ -839,6 +1067,7 @@ async function searchTikTokProfileFromHome(
       try {
         await clickTikTokVideoTab(page, `@${targetUsername}`);
         videoTabTried = true;
+        await waitForTikTokPageReady(page);
         await waitForTikTokActionDelay(page);
         continue;
       } catch {
@@ -856,6 +1085,7 @@ async function searchTikTokProfileFromHome(
         if (fallbackTab && await clickTikTokSearchTab(page, fallbackTab)) {
           errorRetryCount = 0;
           usersTabClicked = true;
+          await waitForTikTokPageReady(page);
           await waitForTikTokActionDelay(page);
           continue;
         }
@@ -866,6 +1096,7 @@ async function searchTikTokProfileFromHome(
       if (!retry?.click) break;
       errorRetryCount += 1;
       await retry.click();
+      await waitForTikTokPageReady(page);
       await waitForTikTokActionDelay(page);
       continue;
     }
@@ -1099,7 +1330,8 @@ async function waitForTikTokTopResults(
   page: EvaluatablePage,
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<boolean> {
-  const deadline = Date.now() + 8_000;
+  await waitForTikTokPageReady(page);
+  const deadline = Date.now() + tikTokTopResultsWaitMs;
   const canWait = Boolean(page.waitForTimeout);
   let verificationSeen = false;
   while (Date.now() < deadline) {
@@ -1136,7 +1368,8 @@ async function waitForTikTokVideoResults(
   page: EvaluatablePage,
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<boolean> {
-  const deadline = Date.now() + 6_000;
+  await waitForTikTokPageReady(page);
+  const deadline = Date.now() + tikTokSearchResultsWaitMs;
   const canWait = Boolean(page.waitForTimeout);
   let verificationSeen = false;
   while (Date.now() < deadline) {
@@ -1214,7 +1447,7 @@ async function clickTikTokVideoTab(page: EvaluatablePage, query: string): Promis
   if (tab?.click) {
     try {
       await tab.click();
-      await waitForTikTokUi(page, 250, 500);
+      await waitForTikTokPageReady(page);
       if (isTikTokVideoSearchForQuery(page.url(), query)) return;
     } catch {
       await dismissTikTokCloseablePopup(page);
@@ -1222,7 +1455,7 @@ async function clickTikTokVideoTab(page: EvaluatablePage, query: string): Promis
       const refreshed = await firstTikTokVideoTabForQuery(page, tabSelectors, query);
       if (refreshed?.click) {
         await refreshed.click();
-        await waitForTikTokUi(page, 250, 500);
+        await waitForTikTokPageReady(page);
         if (isTikTokVideoSearchForQuery(page.url(), query)) return;
       }
     }
@@ -1643,7 +1876,7 @@ async function hasVisibleTikTokCaptcha(page: EvaluatablePage): Promise<boolean> 
         '[role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="verify" i], [class*="captcha" i], canvas, iframe',
       )].some(isVisible);
     }, TIKTOK_CAPTCHA_ROOT_SELECTOR);
-    if (mainFrameHasChallenge) return true;
+    if (mainFrameHasChallenge === true) return true;
 
     // BDTuring sometimes puts the entire visible puzzle in a generic
     // cross-origin iframe. The parent document then contains neither the
@@ -1667,7 +1900,7 @@ async function hasVisibleTikTokCaptcha(page: EvaluatablePage): Promise<boolean> 
             '[class*="captcha" i], [class*="verify" i], [class*="slide" i], [id*="captcha" i], [id*="verify" i], canvas, img',
           )].some(isVisible);
         });
-        if (frameHasChallenge) return true;
+        if (frameHasChallenge === true) return true;
       } catch {
         // The frame may detach while TikTok refreshes the challenge.
       }
@@ -1802,6 +2035,56 @@ async function isLocatorVisible(locator: LocatorLike): Promise<boolean> {
   }
 }
 
+async function isLocatorInViewport(page: EvaluatablePage, locator: LocatorLike): Promise<boolean> {
+  if (!await isLocatorVisible(locator)) return false;
+  // Playwright's isVisible() does not account for clipping by a scrollable
+  // ancestor. Use the real element rect when available so a reply button that
+  // exists below the comment drawer's fold is not treated as clickable.
+  if (locator.evaluate) {
+    try {
+      return await locator.evaluate((element) => {
+        const intersects = (left: number, top: number, right: number, bottom: number) => {
+          const rect = element.getBoundingClientRect();
+          return rect.right > left && rect.left < right && rect.bottom > top && rect.top < bottom;
+        };
+        let clip = { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+        let ancestor = element.parentElement;
+        while (ancestor) {
+          const style = window.getComputedStyle(ancestor);
+          if (/(auto|scroll|overlay)/i.test(`${style.overflowX} ${style.overflowY}`)) {
+            const rect = ancestor.getBoundingClientRect();
+            clip = {
+              left: Math.max(clip.left, rect.left),
+              top: Math.max(clip.top, rect.top),
+              right: Math.min(clip.right, rect.right),
+              bottom: Math.min(clip.bottom, rect.bottom),
+            };
+          }
+          ancestor = ancestor.parentElement;
+        }
+        return intersects(clip.left, clip.top, clip.right, clip.bottom);
+      });
+    } catch {
+      // Fall through to the bounding-box check for a recycled/detached node.
+    }
+  }
+  if (!locator.boundingBox) return true;
+  try {
+    const box = await locator.boundingBox();
+    if (!box) return false;
+    const viewport = page.evaluate
+      ? await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight })).catch(() => ({ width: 0, height: 0 }))
+      : { width: 0, height: 0 };
+    if (!viewport.width || !viewport.height) return true;
+    return box.x + box.width > 0
+      && box.y + box.height > 0
+      && box.x < viewport.width
+      && box.y < viewport.height;
+  } catch {
+    return false;
+  }
+}
+
 async function scrollTikTokFeed(page: EvaluatablePage): Promise<void> {
   await scrollSearchResults(page);
 }
@@ -1812,7 +2095,8 @@ async function waitForTikTokResultsLoad(page: EvaluatablePage, previousVideoCoun
     await waitForTikTokUi(page, 500, 900);
     return;
   }
-  const deadline = Date.now() + 3_500;
+  const canWait = Boolean(page.waitForTimeout);
+  const deadline = Date.now() + tikTokResultHydrationWaitMs;
   let settledPasses = 0;
   while (Date.now() < deadline) {
     const snapshot = await page.evaluate(() => {
@@ -1826,8 +2110,24 @@ async function waitForTikTokResultsLoad(page: EvaluatablePage, previousVideoCoun
         return [...card.querySelectorAll<HTMLImageElement>('img')];
       }).filter(visible);
       const mediaLoading = images.some(image => !image.complete || image.naturalWidth === 0);
-      return { videoCount: links.length, mediaLoading };
-    }).catch(() => ({ videoCount: 0, mediaLoading: false }));
+      const bodyText = document.body?.innerText ?? '';
+      const explicitEmpty = /no results|no videos|didn't find|nothing found|không tìm thấy|không có kết quả|không có video/i.test(bodyText);
+      return { videoCount: links.length, mediaLoading, explicitEmpty };
+    }).catch(() => ({ videoCount: 0, mediaLoading: false, explicitEmpty: false }));
+    if (!canWait) return;
+    if (snapshot.explicitEmpty) return;
+    if (typeof snapshot.videoCount !== 'number' || typeof snapshot.mediaLoading !== 'boolean') {
+      await waitForTikTokUi(page, 250, 450);
+      continue;
+    }
+    // An empty result list is not "settled" while the first cards are still
+    // being mounted. Keep waiting instead of letting the campaign conclude
+    // with a false zero-result/BDTuring diagnosis.
+    if (snapshot.videoCount === 0 && previousVideoCount === 0) {
+      settledPasses = 0;
+      await waitForTikTokUi(page, 300, 550);
+      continue;
+    }
     if (snapshot.videoCount > previousVideoCount && !snapshot.mediaLoading) return;
     if (snapshot.videoCount >= previousVideoCount && !snapshot.mediaLoading) settledPasses += 1;
     else settledPasses = 0;
@@ -1861,13 +2161,22 @@ function randomInteger(min: number, max: number): number {
 export async function solveVisibleTikTokRotateCaptcha(
   page: EvaluatablePage,
   captchaSolver?: TikTokRotateCaptchaSolver,
+  timeoutMs?: number,
 ): Promise<TikTokRotateCaptchaSolveResult> {
+  // CAPTCHA is optional. TikTok often leaves verification-related text in the
+  // page shell even when no challenge widget was mounted. Wait briefly for a
+  // real visible widget; if it never appears, let the action continue instead
+  // of reporting a misleading missing-image/slider error.
+  if (!await waitForVisibleTikTokCaptcha(page, 1_500)) {
+    return { attempted: false, solved: true, reason: 'TikTok CAPTCHA không xuất hiện; tiếp tục action' };
+  }
   if (!captchaSolver) return { attempted: false, solved: false, reason: 'disabled' };
   if (!page.evaluate || !page.mouse) {
     return { attempted: false, solved: false, reason: 'browser page does not expose evaluate/mouse controls' };
   }
 
   const maxAttempts = 5;
+  const solveDeadline = Date.now() + Math.max(1_000, timeoutMs ?? captchaSolver.timeoutMs ?? 30_000);
   const previousAttempts = tikTokRotateSolveAttempts.get(page) ?? 0;
   if (previousAttempts >= maxAttempts) return { attempted: true, solved: false, reason: 'solve attempt limit reached' };
 
@@ -1879,9 +2188,9 @@ export async function solveVisibleTikTokRotateCaptcha(
 
   // A rejected drag causes TikTok to issue a fresh challenge. Retry against
   // the fresh image pair instead of reusing a stale provider answer.
-  for (let attemptIndex = previousAttempts; attemptIndex < maxAttempts; attemptIndex += 1) {
+  for (let attemptIndex = previousAttempts; attemptIndex < maxAttempts && Date.now() < solveDeadline; attemptIndex += 1) {
     let challenge: TikTokRotateChallengeSnapshot | undefined;
-    for (let waitAttempt = 0; waitAttempt < 8 && !challenge; waitAttempt += 1) {
+    for (let waitAttempt = 0; waitAttempt < 8 && !challenge && Date.now() < solveDeadline; waitAttempt += 1) {
       challenge = await inspectTikTokRotateChallenge(page);
       if (!challenge) await page.waitForTimeout?.(250);
     }
@@ -1897,7 +2206,13 @@ export async function solveVisibleTikTokRotateCaptcha(
     tikTokRotateSolveAttempts.set(page, attemptIndex + 1);
 
     try {
-      const rotate = await captchaSolver.solveRotate(challenge.imageBase64s);
+      const remainingMs = solveDeadline - Date.now();
+      if (remainingMs <= 0) break;
+      const rotate = await captchaSolver.solveRotate(challenge.imageBase64s, remainingMs);
+      if (Date.now() >= solveDeadline) {
+        lastReason = 'TikTok rotate CAPTCHA solve budget expired';
+        break;
+      }
       if (!Number.isFinite(rotate) || rotate < 0 || rotate > 1) {
         lastReason = 'solver returned an invalid rotate ratio';
         captchaSolver.report?.(lastReason);
@@ -1907,7 +2222,7 @@ export async function solveVisibleTikTokRotateCaptcha(
 
       // TikTok verifies asynchronously after mouseup. Poll briefly instead of
       // immediately classifying the still-mounted widget as an unsolved CAPTCHA.
-      for (let pollAttempt = 0; pollAttempt < 8; pollAttempt += 1) {
+      for (let pollAttempt = 0; pollAttempt < 8 && Date.now() < solveDeadline; pollAttempt += 1) {
         await page.waitForTimeout?.(300 + pollAttempt * 100);
         const state = await inspectTikTokSearchState(page);
         if (!state.verificationRequired) return { attempted: true, solved: true };
@@ -1923,6 +2238,17 @@ export async function solveVisibleTikTokRotateCaptcha(
   }
 
   return { attempted, solved: false, reason: lastReason };
+}
+
+async function waitForVisibleTikTokCaptcha(page: EvaluatablePage, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  do {
+    if (await hasVisibleTikTokCaptcha(page)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0 || !page.waitForTimeout) break;
+    await page.waitForTimeout(Math.min(250, remaining));
+  } while (Date.now() < deadline);
+  return false;
 }
 
 async function inspectTikTokRotateChallenge(
@@ -2272,7 +2598,6 @@ async function inspectTikTokSearchState(page: EvaluatablePage): Promise<{ verifi
       return { verificationRequired: false, explicitEmpty: false };
     }
     const bodyText = snapshot.bodyText.toLowerCase();
-    const signalText = snapshot.bodyText.toLowerCase();
     let nestedFrameChallenge: boolean | undefined;
     if (snapshot.challengeIframe && page.frames) {
       const childFrames = page.frames().slice(1);
@@ -2308,9 +2633,13 @@ async function inspectTikTokSearchState(page: EvaluatablePage): Promise<{ verifi
       }
       if (!inspectedFrame) nestedFrameChallenge = true;
     }
+    // Text such as "captcha" or "verify" can remain in TikTok's hidden
+    // application shell even when no challenge is mounted. Only treat it as
+    // verification when a visible challenge node/frame/widget is present.
+    const visibleCaptcha = await hasVisibleTikTokCaptcha(page);
     const verificationRequired = snapshot.challengeNode
       || nestedFrameChallenge === true
-      || /bdturing|bdturing-verify|whirl|verify to continue|security verification|captcha|unusual traffic|too many requests|anti.?bot|robot|xác minh|bất thường/.test(signalText);
+      || visibleCaptcha;
     const explicitEmpty = /no results|no videos|didn't find|nothing found|không tìm thấy|không có kết quả|không có video/.test(bodyText);
     return { verificationRequired, explicitEmpty };
   } catch {
@@ -2343,6 +2672,8 @@ export async function autoCommentTikTokHome(
     minLikes: number;
     maxLikes?: number;
     intervalSeconds: number;
+    excludeVideoUrls?: string[];
+    resumeCompletedCount?: number;
   },
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<Record<string, unknown>> {
@@ -2362,7 +2693,8 @@ export async function autoCommentTikTokHome(
   // `/video/` anchor; scrolling before acting would make that item disappear
   // and force an unsafe direct navigation to the video URL.
   const hasLikeFilter = input.minLikes > 0 || input.maxLikes != null;
-  const discoveryTarget = hasLikeFilter ? input.maxVideos * 3 : input.maxVideos;
+  const excludedVideoCount = input.excludeVideoUrls?.length ?? 0;
+  const discoveryTarget = hasLikeFilter ? (input.maxVideos + excludedVideoCount) * 3 : input.maxVideos + excludedVideoCount;
   for (let pass = 0; pass < 10 && visible.size < discoveryTarget; pass += 1) {
     for (const video of await extractVisibleVideos(page)) visible.set(video.videoUrl, video);
     if (visible.size >= discoveryTarget) break;
@@ -2373,7 +2705,7 @@ export async function autoCommentTikTokHome(
 
   if (visible.size === 0) {
     const state = await inspectTikTokSearchState(page);
-    if (state.verificationRequired) {
+    if (state.verificationRequired && await hasVisibleTikTokCaptcha(page)) {
       throw new TikTokVerificationRequiredError(
         'TikTok For You đang yêu cầu xác minh anti-bot. Hãy hoàn tất xác minh thủ công trên browser rồi chạy lại campaign.',
       );
@@ -2394,6 +2726,7 @@ export async function autoCommentTikTokHome(
   // valid target; only discard unknown counts when the user explicitly asked
   // for a like range.
   const candidates = [...visible.values()].filter((video) => {
+    if (input.excludeVideoUrls?.includes(video.videoUrl)) return false;
     if (video.likes == null) return !hasLikeFilter;
     if (video.likes < input.minLikes) return false;
     return input.maxLikes == null || video.likes <= input.maxLikes;
@@ -2411,18 +2744,22 @@ export async function autoCommentTikTokHome(
     mediaAssetIds: input.mediaAssetIds,
     maxVideos: candidates.length,
     intervalSeconds: input.intervalSeconds,
+    excludeVideoUrls: input.excludeVideoUrls,
+    resumeCompletedCount: input.resumeCompletedCount,
   }, captchaSolver);
   return { ...result, discovered: visible.size, candidates: candidates.length };
 }
 
 export async function commentTikTokVideos(
   session: PlatformSession,
-  input: { videoUrls: string[]; text: string; mediaAssetIds: string[]; maxVideos: number; intervalSeconds?: number },
+  input: { videoUrls: string[]; text: string; mediaAssetIds: string[]; maxVideos: number; intervalSeconds?: number; excludeVideoUrls?: string[]; resumeCompletedCount?: number },
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<Record<string, unknown>> {
-  const videos = input.videoUrls.slice(0, input.maxVideos);
+  const excluded = new Set(input.excludeVideoUrls ?? []);
+  const videos = input.videoUrls.filter((videoUrl) => !excluded.has(videoUrl)).slice(0, input.maxVideos);
   let sent = 0;
   const failures: Array<{ videoUrl: string; reason: string }> = [];
+  const reportEntries: Array<Record<string, unknown>> = [];
 
   for (const [index, videoUrl] of videos.entries()) {
     try {
@@ -2446,19 +2783,33 @@ export async function commentTikTokVideos(
       // reading the editor. This mirrors Search's paced navigation and avoids
       // clicking the first card while TikTok is still switching routes.
       await waitForTikTokActionDelay(page);
-      await sendComment(session, input.text, input.mediaAssetIds, captchaSolver);
+      await recordTikTokActionProgress(session, { action: 'COMMENT', status: 'IN_PROGRESS', videoUrl, startedAt: new Date().toISOString() });
+      const captchaTimeoutMs = index === 0
+        ? 30_000
+        : randomInteger(5_000, 10_000);
+      await sendComment(session, input.text, input.mediaAssetIds, captchaSolver, captchaTimeoutMs);
       sent += 1;
+      const entry = { action: 'COMMENT', status: 'SENT', videoUrl, completedAt: new Date().toISOString() };
+      reportEntries.push(entry);
+      await recordTikTokActionProgress(session, entry);
       if (input.intervalSeconds && index < videos.length - 1) {
         await page.waitForTimeout?.(input.intervalSeconds * 1_000);
       }
     } catch (error) {
-      failures.push({ videoUrl, reason: error instanceof Error ? error.message : String(error) });
+      const reason = error instanceof Error ? error.message : String(error);
+      failures.push({ videoUrl, reason });
+      const entry = { action: 'COMMENT', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+      reportEntries.push(entry);
+      await recordTikTokActionProgress(session, entry);
     }
   }
   return {
     requested: videos.length,
     sent,
+    totalSent: (input.resumeCompletedCount ?? 0) + sent,
+    totalRequested: (input.resumeCompletedCount ?? 0) + videos.length,
     failures,
+    report: { action: 'COMMENT', entries: reportEntries },
     ...(sent === 0 && videos.length > 0 ? { reason: 'Không gửi được bình luận TikTok nào.' } : {}),
   };
 }
@@ -2469,41 +2820,151 @@ export async function replyTikTokComments(
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<Record<string, unknown>> {
   const page = session.page as EvaluatablePage;
-  let requested = 0;
+  const repliesPerVideo = Math.max(0, Math.floor(input.maxReplies));
+  const requested = input.videoUrls.length * repliesPerVideo;
   let sent = 0;
   const failures: string[] = [];
+  const reportEntries: Array<Record<string, unknown>> = [];
+  let firstFailureReason: string | undefined;
   for (let videoIndex = 0; videoIndex < input.videoUrls.length; videoIndex += 1) {
     const videoUrl = input.videoUrls[videoIndex]!;
     try {
-      await gotoPlatformPage(session.page, videoUrl);
+      await gotoTikTokVideoPage(page, videoUrl);
       await waitForTikTokActionDelay(page);
-      const replyButtons = await findLocators(page, [
-        '[data-e2e*="comment-reply"]',
-        'button[aria-label*="Reply"]',
-        'button:has-text("Reply")',
-      ]);
-      const count = Math.min(replyButtons.length, input.maxReplies);
-      requested += count;
-      for (let index = 0; index < count; index += 1) {
+      // Direct video routes do not always mount the comment drawer. Reply
+      // controls only exist after the drawer is opened and its lazy content
+      // has hydrated, so never treat the initial video shell as an empty
+      // comment list.
+      const commentsOpened = await openTikTokCommentDrawer(page);
+      if (!commentsOpened) throw new Error('Không mở được danh sách comment TikTok');
+      const firstReplyButtons = await waitForTikTokCommentReplyButtons(page);
+      if (firstReplyButtons.length === 0) {
+        const reason = 'Không tìm thấy comment TikTok có thể reply.';
+        firstFailureReason ??= reason;
+        failures.push(`${videoUrl}: ${reason}`);
+        const entry = { action: 'REPLY', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+        reportEntries.push(entry);
+        await recordTikTokActionProgress(session, entry);
+        continue;
+      }
+
+      // Reply buttons are virtualized inside TikTok's comment drawer. Claim a
+      // row before clicking it and exhaust the currently visible unprocessed
+      // rows before scrolling. This prevents the loop from clicking every
+      // Reply control and then returning to a previously handled comment.
+      let repliedForVideo = 0;
+      let pendingInitialButtons: LocatorLike[] | undefined = firstReplyButtons;
+      let fallbackVisibleIndex = 0;
+      // TikTok can recycle a comment row and recreate its Reply button after
+      // every successful submit. DOM attributes alone are therefore not
+      // durable: the same logical comment may come back as a fresh element.
+      // Keep a per-video identity set so a rerender cannot send the next
+      // reply to the comment that was just handled.
+      const processedReplyTargetKeys = new Set<string>();
+      while (repliedForVideo < repliesPerVideo) {
+        const replyButtons = pendingInitialButtons
+          ?? await waitForTikTokCommentReplyButtons(page, 2_000);
+        pendingInitialButtons = undefined;
+
+        let replyButton: LocatorLike | undefined;
+        let usedFallbackIndex = false;
+        for (const [candidateIndex, candidate] of replyButtons.entries()) {
+          const targetKey = await getTikTokCommentReplyTargetKey(candidate);
+          if (targetKey && processedReplyTargetKeys.has(targetKey)) continue;
+          const claim = await claimTikTokCommentReplyTarget(candidate);
+          if (claim === 'claimed') {
+            replyButton = candidate;
+            if (targetKey) processedReplyTargetKeys.add(targetKey);
+            break;
+          }
+          if (claim === 'unsupported' && !replyButton) {
+            if (candidateIndex >= fallbackVisibleIndex) {
+              replyButton = candidate;
+              usedFallbackIndex = true;
+              break;
+            }
+          }
+        }
+
+        if (!replyButton) {
+          const moved = await scrollTikTokCommentList(page);
+          if (!moved) break;
+          fallbackVisibleIndex = 0;
+          await waitForTikTokUi(page, 450, 850);
+          continue;
+        }
+        if (usedFallbackIndex) fallbackVisibleIndex += 1;
+
         try {
           await waitForTikTokActionDelay(page);
-          await replyButtons[index]!.click?.();
+          await replyButton.click?.();
           await waitForTikTokUi(page, 350, 700);
           await ensureTikTokCommentCaptchaSolved(page, captchaSolver);
-          const editor = await fillTikTokCommentEditor(page, input.text, tiktokCommentEditorSelectors);
-          if (!editor) throw new Error('Không thể nhập nội dung vào ô reply TikTok');
-          await submitComment(page, input.text, input.mediaAssetIds, session, captchaSolver);
+          const replyEditor = await waitForTikTokReplyEditor(page);
+          if (!replyEditor) throw new Error('Không tìm thấy DraftEditor của ô reply TikTok sau khi đã mở Reply');
+          const filled = await fillTikTokCommentEditor(page, input.text, tiktokReplyEditorSelectors, replyEditor);
+          if (!filled) throw new Error('Không thể nhập nội dung vào DraftEditor reply TikTok');
+          await recordTikTokActionProgress(session, { action: 'REPLY', status: 'IN_PROGRESS', videoUrl, startedAt: new Date().toISOString() });
+          await submitComment(
+            page,
+            input.text,
+            input.mediaAssetIds,
+            session,
+            captchaSolver,
+            undefined,
+            tiktokReplyEditorSelectors,
+            tiktokReplyPlaceholderSelectors,
+            replyEditor,
+          );
           sent += 1;
-          if (input.intervalSeconds && (index < count - 1 || videoIndex < input.videoUrls.length - 1)) await page.waitForTimeout?.(input.intervalSeconds * 1_000);
+          const entry = { action: 'REPLY', status: 'SENT', videoUrl, completedAt: new Date().toISOString() };
+          reportEntries.push(entry);
+          await recordTikTokActionProgress(session, entry);
+          repliedForVideo += 1;
+          if (input.intervalSeconds && (repliedForVideo < repliesPerVideo || videoIndex < input.videoUrls.length - 1)) await page.waitForTimeout?.(input.intervalSeconds * 1_000);
         } catch (error) {
-          failures.push(`${videoUrl}: ${error instanceof Error ? error.message : String(error)}`);
+          const reason = error instanceof Error ? error.message : String(error);
+          firstFailureReason ??= reason;
+          failures.push(`${videoUrl}: ${reason}`);
+          const entry = { action: 'REPLY', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+          reportEntries.push(entry);
+          await recordTikTokActionProgress(session, entry);
+          if (/DraftEditor|ô reply TikTok/i.test(reason)) {
+            // A structural editor failure affects every row on this TikTok
+            // layout. Stop immediately instead of clicking/scrolling through
+            // the whole comment list and repeating the same failed sequence.
+            break;
+          }
         }
       }
+
+      if (repliedForVideo < repliesPerVideo) {
+        const reason = repliedForVideo === 0
+          ? 'Không tìm thấy comment TikTok có thể reply.'
+          : `Chỉ reply được ${repliedForVideo}/${repliesPerVideo} comment TikTok.`;
+        firstFailureReason ??= reason;
+        failures.push(`${videoUrl}: ${reason}`);
+        const entry = { action: 'REPLY', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+        reportEntries.push(entry);
+        await recordTikTokActionProgress(session, entry);
+      }
     } catch (error) {
-      failures.push(`${videoUrl}: ${error instanceof Error ? error.message : String(error)}`);
+      const reason = error instanceof Error ? error.message : String(error);
+      firstFailureReason ??= reason;
+      failures.push(`${videoUrl}: ${reason}`);
+      const entry = { action: 'REPLY', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+      reportEntries.push(entry);
+      await recordTikTokActionProgress(session, entry);
     }
   }
-  return { requested, sent, videos: input.videoUrls.length, failures };
+  return {
+    requested,
+    sent,
+    videos: input.videoUrls.length,
+    failures,
+    report: { action: 'REPLY', entries: reportEntries },
+    ...(firstFailureReason ? { reason: firstFailureReason } : {}),
+  };
 }
 
 export async function likeTikTokComments(
@@ -2511,41 +2972,497 @@ export async function likeTikTokComments(
   input: { videoUrls: string[]; maxLikes: number; intervalSeconds?: number },
 ): Promise<Record<string, unknown>> {
   const page = session.page as EvaluatablePage;
-  let requested = 0;
+  const likesPerVideo = Math.max(0, Math.floor(input.maxLikes));
+  const requested = input.videoUrls.length * likesPerVideo;
   let liked = 0;
   const failures: string[] = [];
+  const reportEntries: Array<Record<string, unknown>> = [];
+  let firstFailureReason: string | undefined;
   for (let videoIndex = 0; videoIndex < input.videoUrls.length; videoIndex += 1) {
     const videoUrl = input.videoUrls[videoIndex]!;
     try {
-      await gotoPlatformPage(session.page, videoUrl);
+      await gotoTikTokVideoPage(page, videoUrl);
       await waitForTikTokActionDelay(page);
-      const likeButtons = await findLocators(page, [
-        '[data-e2e*="comment-like"]',
-        'button[aria-label*="Like"]',
-      ]);
-      const count = Math.min(likeButtons.length, input.maxLikes);
-      requested += count;
+      // A direct video route does not necessarily mount the comment drawer.
+      // The old flow looked for like controls immediately and therefore saw
+      // only the video player, counted zero buttons, and never opened the
+      // comment list. Open the drawer and wait for its lazy content first.
+      const commentsOpened = await openTikTokCommentDrawer(page);
+      if (!commentsOpened) throw new Error('Không mở được danh sách comment TikTok');
+      const likeButtons = await waitForTikTokCommentLikeButtons(page);
+      const count = Math.min(likeButtons.length, likesPerVideo);
+      if (count < likesPerVideo) {
+        const reason = count === 0
+          ? 'Danh sách comment TikTok không có nút tim khả dụng.'
+          : `Chỉ tìm thấy ${count}/${likesPerVideo} comment TikTok có nút tim khả dụng.`;
+        firstFailureReason ??= reason;
+        failures.push(`${videoUrl}: ${reason}`);
+        const entry = { action: 'LIKE', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+        reportEntries.push(entry);
+        await recordTikTokActionProgress(session, entry);
+        if (count === 0) continue;
+      }
       for (let index = 0; index < count; index += 1) {
         try {
           await waitForTikTokActionDelay(page);
+          // Re-resolve after every click because TikTok recycles comment rows
+          // while the drawer updates. Never silently treat an absent click
+          // handler as a successful like.
+          const currentButtons = await findVisibleTikTokCommentLikeButtons(page);
+          const button = currentButtons[0];
+          if (!button?.click) throw new Error('Nút tim comment TikTok không còn khả dụng');
           await beginExternalAction(session);
-          await likeButtons[index]!.click?.();
+          await recordTikTokActionProgress(session, { action: 'LIKE', status: 'IN_PROGRESS', videoUrl, startedAt: new Date().toISOString() });
+          await button.click();
+          await waitForTikTokUi(page, 300, 650);
           liked += 1;
+          const entry = { action: 'LIKE', status: 'LIKED', videoUrl, completedAt: new Date().toISOString() };
+          reportEntries.push(entry);
+          await recordTikTokActionProgress(session, entry);
           if (input.intervalSeconds && (index < count - 1 || videoIndex < input.videoUrls.length - 1)) await page.waitForTimeout?.(input.intervalSeconds * 1_000);
         } catch (error) {
-          failures.push(`${videoUrl}: ${error instanceof Error ? error.message : String(error)}`);
+          const reason = error instanceof Error ? error.message : String(error);
+          firstFailureReason ??= reason;
+          failures.push(`${videoUrl}: ${reason}`);
+          const entry = { action: 'LIKE', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+          reportEntries.push(entry);
+          await recordTikTokActionProgress(session, entry);
         }
       }
     } catch (error) {
-      failures.push(`${videoUrl}: ${error instanceof Error ? error.message : String(error)}`);
+      const reason = error instanceof Error ? error.message : String(error);
+      firstFailureReason ??= reason;
+      failures.push(`${videoUrl}: ${reason}`);
+      const entry = { action: 'LIKE', status: 'FAILED', videoUrl, reason, completedAt: new Date().toISOString() };
+      reportEntries.push(entry);
+      await recordTikTokActionProgress(session, entry);
     }
   }
-  return { requested, liked, videos: input.videoUrls.length, failures };
+  return {
+    requested,
+    liked,
+    videos: input.videoUrls.length,
+    failures,
+    report: { action: 'LIKE', entries: reportEntries },
+    ...(firstFailureReason ? { reason: firstFailureReason } : {}),
+  };
+}
+
+const tiktokCommentLikeSelectors = [
+  '[data-key-interaction="comment_like"]',
+  '[data-key-interaction*="comment_like" i]',
+  '[data-e2e*="comment-like" i]',
+  'button[aria-label*="like comment" i]',
+  '[role="button"][aria-label*="like comment" i]',
+  'button[aria-label*="thích" i][data-e2e*="comment" i]',
+  '[role="button"][aria-label*="thích" i][data-e2e*="comment" i]',
+] as const;
+
+const tiktokCommentReplySelectors = [
+  '[data-e2e="comment-reply-1"]',
+  '[data-e2e="comment-reply"]',
+  '[data-e2e*="comment-reply" i]:not([data-e2e*="post" i]):not([data-key-interaction="comment_submit"])',
+  '[data-e2e*="reply" i][data-e2e*="comment" i]:not([data-e2e*="post" i]):not([data-key-interaction="comment_submit"])',
+  'button[aria-label*="Reply" i]',
+  'button[aria-label*="Trả lời" i]',
+  '[role="button"][aria-label*="Reply" i]',
+  '[role="button"][aria-label*="Trả lời" i]',
+  'button:has-text("Reply")',
+  'button:has-text("Trả lời")',
+] as const;
+
+const tiktokCommentDrawerSelectors = [
+  '[data-e2e*="comment-list" i]',
+  '[data-e2e*="comment-container" i]',
+  '[data-e2e*="comment-panel" i]',
+  '[data-e2e="comment-input"]',
+  '[role="dialog"][aria-label*="comment" i]',
+  '[role="dialog"][aria-label*="bình luận" i]',
+] as const;
+
+const tiktokCommentOpenSelectors = [
+  '[data-e2e="comment-icon"]',
+  '[data-e2e*="comment-icon" i]',
+  'button[aria-label*="comment" i]',
+  'button[aria-label*="bình luận" i]',
+  '[role="button"][aria-label*="comment" i]',
+  '[role="button"][aria-label*="bình luận" i]',
+] as const;
+
+async function openTikTokCommentDrawer(page: EvaluatablePage): Promise<boolean> {
+  if ((await findVisibleTikTokCommentLikeButtons(page)).length > 0) return true;
+  if ((await findVisibleTikTokCommentReplyButtons(page)).length > 0) return true;
+  if (await firstVisibleLocator(page, [...tiktokCommentDrawerSelectors])) return true;
+
+  let opener = await firstVisibleLocator(page, [...tiktokCommentOpenSelectors]);
+  if (!opener?.click) return false;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await opener.click();
+    } catch {
+      // TikTok can recycle the right-rail control while the video route is
+      // hydrating. Resolve it again instead of proceeding against a stale
+      // locator.
+      opener = await firstVisibleLocator(page, [...tiktokCommentOpenSelectors]);
+      if (!opener?.click) return false;
+      continue;
+    }
+    await waitForTikTokPageReady(page);
+    await waitForTikTokUi(page, 450, 850);
+    if ((await findVisibleTikTokCommentLikeButtons(page)).length > 0
+      || await firstVisibleLocator(page, [...tiktokCommentDrawerSelectors])) return true;
+    opener = await firstVisibleLocator(page, [...tiktokCommentOpenSelectors]);
+    if (!opener?.click) break;
+  }
+  return false;
+}
+
+async function waitForTikTokCommentReplyButtons(page: EvaluatablePage, timeoutMs = 15_000): Promise<LocatorLike[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const buttons = await findVisibleTikTokCommentReplyButtons(page);
+    if (buttons.length > 0) return buttons;
+    await waitForTikTokUi(page, 300, 550);
+  }
+  return [];
+}
+
+async function findVisibleTikTokCommentReplyButtons(page: EvaluatablePage): Promise<LocatorLike[]> {
+  for (const selector of tiktokCommentReplySelectors) {
+    const locator = page.locator(selector) as unknown as LocatorLike;
+    const count = await locator.count();
+    const visible: LocatorLike[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const candidate = locator.nth ? locator.nth(index) : locator;
+      if (!await isLocatorInViewport(page, candidate)) continue;
+      if (candidate.isEnabled && !await candidate.isEnabled().catch(() => false)) continue;
+      // A successful reply inserts a new nested comment with its own Reply
+      // button. Do not treat that child button as the next top-level target,
+      // otherwise consecutive replies stay attached to the same parent.
+      if (!await isTopLevelTikTokCommentReplyButton(candidate)) continue;
+      const dataE2e = candidate.getAttribute ? await candidate.getAttribute('data-e2e').catch(() => null) : null;
+      const interaction = candidate.getAttribute ? await candidate.getAttribute('data-key-interaction').catch(() => null) : null;
+      if (/post|submit/i.test(`${dataE2e ?? ''} ${interaction ?? ''}`)) continue;
+      visible.push(candidate);
+    }
+    if (visible.length > 0) return visible;
+  }
+  return [];
+}
+
+async function isTopLevelTikTokCommentReplyButton(replyButton: LocatorLike): Promise<boolean> {
+  if (!replyButton.evaluate) return true;
+  try {
+    return await replyButton.evaluate((element) => {
+      const row = element.closest<HTMLElement>(
+        '[class*="DivCommentItemWrapper" i], [data-e2e^="comment-level" i], [data-e2e*="comment-item" i], [data-testid*="comment-item" i], li, [role="listitem"]',
+      );
+      if (!row) return true;
+
+      const marker = [
+        row.getAttribute('data-e2e') ?? '',
+        row.getAttribute('data-testid') ?? '',
+        String(row.className ?? ''),
+      ].join(' ');
+      const level = marker.match(/comment[-_ ]?level[-_ ]?(\d+)/i)?.[1]
+        ?? row.querySelector<HTMLElement>('[data-e2e^="comment-level" i]')?.getAttribute('data-e2e')?.match(/comment[-_ ]?level[-_ ]?(\d+)/i)?.[1];
+      if (level) return Number(level) <= 1;
+
+      // Some builds omit the numeric level but nest the child item inside a
+      // second comment-item/list-item wrapper. In that case the closest outer
+      // comment container identifies this as a reply to another comment.
+      let ancestor = row.parentElement;
+      while (ancestor) {
+        if (ancestor.matches('[class*="DivCommentItemWrapper" i], [data-e2e^="comment-level" i], [data-e2e*="comment-item" i], [data-testid*="comment-item" i], li, [role="listitem"]')) {
+          return false;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      return true;
+    });
+  } catch {
+    // A row can be recycled while it is being inspected. Keep the candidate
+    // available; the durable target key/processed set still prevents repeats.
+    return true;
+  }
+}
+
+async function claimTikTokCommentReplyTarget(replyButton: LocatorLike): Promise<'claimed' | 'processed' | 'unsupported'> {
+  if (!replyButton.evaluate) return 'unsupported';
+  try {
+    return await replyButton.evaluate((element) => {
+      document.querySelectorAll<HTMLElement>('[data-socio-reply-active="true"]')
+        .forEach(candidate => candidate.removeAttribute('data-socio-reply-active'));
+      document.querySelectorAll<HTMLElement>('[data-socio-active-reply-editor="true"]')
+        .forEach(candidate => candidate.removeAttribute('data-socio-active-reply-editor'));
+      const row = element.closest<HTMLElement>(
+        '[class*="DivCommentItemWrapper" i], [data-e2e^="comment-level" i], [data-e2e*="comment-item" i], [data-testid*="comment-item" i], li',
+      );
+      const target = row ?? element as HTMLElement;
+      if (target.getAttribute('data-socio-reply-processed') === 'true') return 'processed';
+      target.setAttribute('data-socio-reply-processed', 'true');
+      target.setAttribute('data-socio-reply-active', 'true');
+      return 'claimed';
+    });
+  } catch {
+    // The row can be recycled between a viewport scan and the claim. Treat it
+    // as already processed so the caller resolves a fresh live row.
+    return 'processed';
+  }
+}
+
+/**
+ * Return an identity for the logical comment owning a Reply control. TikTok's
+ * comment list is virtualized, so the DOM element identity and any marker
+ * written on it disappear when the row is recycled. Prefer platform IDs, but
+ * include author/link/text fallbacks because some desktop builds expose no
+ * comment id at all.
+ */
+async function getTikTokCommentReplyTargetKey(replyButton: LocatorLike): Promise<string | undefined> {
+  if (!replyButton.evaluate) return undefined;
+  try {
+    return await replyButton.evaluate((element) => {
+      const button = element as HTMLElement;
+      let row = button.closest<HTMLElement>(
+        '[class*="DivCommentItemWrapper" i], [data-e2e^="comment-level" i], [data-e2e*="comment-item" i], [data-testid*="comment-item" i], li, [role="listitem"]',
+      );
+      if (!row) {
+        let current = button.parentElement;
+        for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+          const candidateText = (current.innerText || current.textContent || '').replace(/\s+/g, ' ').trim();
+          if (candidateText.length >= 12 && /reply|trả lời/i.test(candidateText)) {
+            row = current;
+            break;
+          }
+        }
+      }
+      if (!row) return undefined;
+
+      const readAttribute = (names: string[]): string => {
+        for (const name of names) {
+          const value = row.getAttribute(name)?.trim();
+          if (value) return value;
+        }
+        return '';
+      };
+      const stableId = readAttribute([
+        'data-comment-id',
+        'data-commentid',
+        'data-id',
+        'data-item-id',
+      ]) || (() => {
+        const testId = row.getAttribute('data-testid')?.trim() ?? '';
+        return /comment|reply/i.test(testId) ? testId : '';
+      })();
+      const authorHref = row.querySelector<HTMLAnchorElement>('a[href*="/@"], a[href*="/user/"]')?.getAttribute('href') ?? '';
+      // The row can contain replies that were inserted after the previous
+      // submit. Do not fingerprint the whole row: that makes the same parent
+      // look like a new target on every reply. Strip nested comment rows and
+      // action/meta controls before using the remaining top-level text.
+      const nestedRowSelector = '[class*="DivCommentItemWrapper" i], [data-e2e^="comment-level" i], [data-e2e*="comment-item" i], [data-testid*="comment-item" i], li, [role="listitem"]';
+      const nestedRows = [...row.querySelectorAll<HTMLElement>(nestedRowSelector)];
+      const directTextNode = [...row.querySelectorAll<HTMLElement>(
+        '[data-e2e^="comment-level" i], [data-e2e*="comment-text" i], [data-e2e*="comment-content" i], [data-testid*="comment-text" i], [data-testid*="comment-content" i]',
+      )].find(candidate => !nestedRows.some(nested => nested !== candidate && nested.contains(candidate)));
+      const snapshot = row.cloneNode(true) as HTMLElement;
+      snapshot.querySelectorAll(nestedRowSelector).forEach(candidate => candidate.remove());
+      snapshot.querySelectorAll('button, [role="button"], a, time, [data-e2e*="reply" i], [data-e2e*="like" i]').forEach(candidate => candidate.remove());
+      const authorName = row.querySelector<HTMLElement>('[data-e2e*="comment-username" i], [data-e2e*="comment-author" i]')?.innerText?.trim() ?? '';
+      const text = (directTextNode?.innerText || directTextNode?.textContent || snapshot.innerText || snapshot.textContent || '')
+        .split(/\r?\n/)
+        .map(line => line.replace(/\s+/g, ' ').trim())
+        .filter(line => Boolean(line) && line !== authorName)
+        .filter(line => !/^(reply|trả lời|view\s+\d+\s+repl(?:y|ies)|\d+\s*(?:s|m|h|d|w|y)\s*ago|\d{1,2}[-/]\d{1,2})$/i.test(line))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const identity = [stableId, authorHref.trim(), text].filter(Boolean).join('|').slice(0, 800);
+      return identity || undefined;
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+async function markActiveTikTokReplyEditor(page: EvaluatablePage): Promise<boolean> {
+  if (!page.evaluate) return false;
+  try {
+    return await page.evaluate(() => {
+      document.querySelectorAll<HTMLElement>('[data-socio-active-reply-editor="true"]')
+        .forEach(candidate => candidate.removeAttribute('data-socio-active-reply-editor'));
+
+      const visible = (element: Element): element is HTMLElement => {
+        const node = element as HTMLElement;
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && style.opacity !== '0'
+          && rect.width > 0
+          && rect.height > 0
+          && rect.right > 0
+          && rect.left < window.innerWidth
+          && rect.bottom > 0
+          && rect.top < window.innerHeight;
+      };
+      const editorIn = (root: ParentNode | null): HTMLElement | null => root?.querySelector<HTMLElement>(
+        '.public-DraftEditor-content[contenteditable="true"], .DraftEditor-editorContainer [contenteditable="true"], [role="textbox"][contenteditable="true"]',
+      ) ?? null;
+
+      const activeTarget = document.querySelector<HTMLElement>('[data-socio-reply-active="true"]');
+      let editor = editorIn(activeTarget);
+
+      // TikTok's reply composer is a Draft.js editor. Its placeholder is a
+      // sibling of the real contenteditable node and carries no placeholder,
+      // aria-label, or data-e2e attribute, so ordinary input selectors cannot
+      // resolve it. Use the visible "Add a reply" DraftEditor only to locate
+      // the corresponding contenteditable element.
+      if (!editor || !visible(editor)) {
+        const roots = [...document.querySelectorAll<HTMLElement>('.DraftEditor-root')];
+        const replyRoot = roots.find((root) => {
+          if (!visible(root)) return false;
+          const placeholder = root.querySelector<HTMLElement>('.public-DraftEditorPlaceholder-inner');
+          const label = (placeholder?.innerText ?? placeholder?.textContent ?? '').replace(/\s+/g, ' ').trim();
+          return /add a reply|reply to|trả lời|thêm câu trả lời/i.test(label);
+        });
+        editor = editorIn(replyRoot ?? null);
+      }
+
+      if (!editor || !visible(editor)) return false;
+      editor.setAttribute('data-socio-active-reply-editor', 'true');
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function waitForTikTokReplyEditor(page: EvaluatablePage, timeoutMs = 4_000): Promise<LocatorLike | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // The reply composer is a separate, fixed input surface in the current
+    // TikTok desktop DOM. Resolve it directly before touching row markers or
+    // document-wide DraftEditor selectors; those older roots remain mounted
+    // during virtualization and cause Playwright to auto-scroll to the wrong
+    // comment.
+    const scopedEditor = await findLocatorInViewport(page, [
+      '[data-e2e="comment-reply-text"] .public-DraftEditor-content[contenteditable="true"]',
+      '[data-e2e="comment-reply-input"] .public-DraftEditor-content[contenteditable="true"]',
+      '[data-e2e="comment-reply-text"] .DraftEditor-editorContainer [contenteditable="true"]',
+      '[data-e2e="comment-reply-input"] .DraftEditor-editorContainer [contenteditable="true"]',
+    ]);
+    if (scopedEditor) return scopedEditor;
+    await markActiveTikTokReplyEditor(page);
+    const editor = await findLocatorInViewport(page, tiktokReplyEditorSelectors);
+    if (editor) return editor;
+    await waitForTikTokUi(page, 120, 240);
+  }
+  return undefined;
+}
+
+async function scrollTikTokCommentList(page: EvaluatablePage): Promise<boolean> {
+  if (!page.evaluate) return false;
+  try {
+    return await page.evaluate(() => {
+      // TikTok renders the video feed and the comment drawer as two separate
+      // scroll surfaces. The feed container (currently #column-list-container)
+      // is also scrollable, so never fall back to main/section/document-level
+      // containers when looking for the next comment.
+      const commentRowSelector = [
+        '[class*="DivCommentItemWrapper" i]',
+        '[data-e2e^="comment-level" i]',
+        '[data-e2e*="comment-item" i]',
+        '[data-testid*="comment-item" i]',
+      ].join(', ');
+      const commentPaneSelector = [
+        '[class*="DivCommentMain" i]',
+        '[data-e2e*="comment-main" i]',
+        '[class*="DivCommentListContainer" i]',
+      ].join(', ');
+      const visible = (element: Element): element is HTMLElement => {
+        const node = element as HTMLElement;
+        const style = window.getComputedStyle(node);
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && style.opacity !== '0'
+          && node.getClientRects().length > 0;
+      };
+      const scrollable = (element: HTMLElement | null): boolean => Boolean(
+        element
+          && element.scrollHeight > element.clientHeight + 8
+          && /(auto|scroll|overlay)/i.test(window.getComputedStyle(element).overflowY),
+      );
+      const containsCommentRows = (element: HTMLElement): boolean => Boolean(
+        element.querySelector(commentRowSelector),
+      );
+      const isReplyButton = (element: HTMLElement): boolean => {
+        const label = `${element.getAttribute('aria-label') ?? ''} ${element.getAttribute('data-e2e') ?? ''} ${(element.innerText ?? '').trim()}`;
+        return /reply|trả lời/i.test(label);
+      };
+      const reply = [...document.querySelectorAll<HTMLElement>('button, [role="button"], [data-e2e*="reply" i]')]
+        .find(element => visible(element) && isReplyButton(element));
+      const candidates: HTMLElement[] = [];
+      let current = reply ?? null;
+      while (current) {
+        if (scrollable(current) && containsCommentRows(current)) candidates.push(current);
+        current = current.parentElement;
+      }
+      if (candidates.length === 0) {
+        // If no Reply control is currently mounted (virtualization can briefly
+        // remove it), resolve the known comment pane directly. These selectors
+        // are intentionally comment-specific and cannot match the video feed.
+        const candidate = [...document.querySelectorAll<HTMLElement>(commentPaneSelector)]
+          .find(element => visible(element) && scrollable(element) && containsCommentRows(element));
+        if (candidate) candidates.push(candidate);
+      }
+      const target = candidates[0];
+      if (!target) return false;
+      const before = target.scrollTop;
+      const step = Math.max(260, Math.floor(target.clientHeight * 0.82));
+      target.scrollBy({ top: step, behavior: 'auto' });
+      return target.scrollTop > before + 1;
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function waitForTikTokCommentLikeButtons(page: EvaluatablePage): Promise<LocatorLike[]> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const buttons = await findVisibleTikTokCommentLikeButtons(page);
+    if (buttons.length > 0) return buttons;
+    await waitForTikTokUi(page, 300, 550);
+  }
+  return [];
+}
+
+async function findVisibleTikTokCommentLikeButtons(page: EvaluatablePage): Promise<LocatorLike[]> {
+  for (const selector of tiktokCommentLikeSelectors) {
+    const locator = page.locator(selector) as unknown as LocatorLike;
+    const count = await locator.count();
+    const visible: LocatorLike[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const candidate = locator.nth ? locator.nth(index) : locator;
+      if (!await isLocatorInViewport(page, candidate)) continue;
+      if (await isTikTokCommentLikeActive(candidate)) continue;
+      visible.push(candidate);
+    }
+    if (visible.length > 0) return visible;
+  }
+  return [];
+}
+
+async function isTikTokCommentLikeActive(button: LocatorLike): Promise<boolean> {
+  const pressed = await button.getAttribute?.('aria-pressed');
+  if (pressed === 'true') return true;
+  const label = `${await button.getAttribute?.('aria-label') ?? ''} ${await button.getAttribute?.('title') ?? ''}`.toLocaleLowerCase();
+  return /unlike|liked|đã thích|bỏ thích/.test(label);
 }
 
 export async function messageTikTokFollowers(
   session: PlatformSession,
-  input: { username: string; text: string; mediaAssetIds: string[]; maxFollowers: number; intervalSeconds?: number },
+  input: { username: string; text: string; mediaAssetIds: string[]; maxFollowers: number; intervalSeconds?: number; excludeUsernames?: string[]; resumeCompletedCount?: number },
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<Record<string, unknown>> {
   let page = session.page as EvaluatablePage;
@@ -2603,28 +3520,50 @@ export async function messageTikTokFollowers(
   }
   await waitForTikTokActionDelay(page);
   await followersButton.click();
+  // The followers route is a client-side dialog transition. Do not start
+  // collecting anchors from the old profile shell while the dialog/list is
+  // still being mounted; wait for the replacement document and then its
+  // normal human-paced settle window.
+  await waitForTikTokPageReady(page);
   await waitForTikTokActionDelay(page);
   await session.captureStepScreenshot?.('tiktok-message-followers-list');
 
   const followers = new Map<string, string>();
   let unchangedPasses = 0;
-  for (let pass = 0; pass < 10 && followers.size < input.maxFollowers; pass += 1) {
+  const excluded = new Set((input.excludeUsernames ?? []).map(normalizeTikTokUsername));
+  const followerCollectionTarget = input.maxFollowers + excluded.size;
+  for (let pass = 0; pass < 10 && followers.size < followerCollectionTarget; pass += 1) {
     const before = followers.size;
     for (const follower of await extractVisibleFollowerProfiles(page)) {
-      if (followers.size >= input.maxFollowers) break;
+      if (followers.size >= followerCollectionTarget) break;
       if (ownUsernames.has(normalizeTikTokUsername(follower.username))) continue;
       followers.set(follower.username, follower.profileUrl);
     }
     unchangedPasses = followers.size === before ? unchangedPasses + 1 : 0;
-    if (unchangedPasses >= 2 || followers.size >= input.maxFollowers) break;
+    if (unchangedPasses >= 2 || followers.size >= followerCollectionTarget) break;
     await scrollFollowerList(page);
     await waitForTikTokActionDelay(page);
   }
 
-  const targets = [...followers.entries()].slice(0, input.maxFollowers);
+  const targets = [...followers.entries()]
+    .filter(([targetUsername]) => !excluded.has(normalizeTikTokUsername(targetUsername)))
+    .slice(0, input.maxFollowers);
   await session.captureStepScreenshot?.('tiktok-message-followers-collected');
   let sent = 0;
   const failures: Array<{ username: string; reason: string }> = [];
+  const reportEntries: Array<Record<string, unknown>> = [];
+  const requested = Math.max(0, Math.floor(input.maxFollowers));
+  let firstFailureReason: string | undefined;
+  if (targets.length < requested) {
+    const reason = targets.length === 0
+      ? 'Không tìm thấy follower khả dụng để gửi tin nhắn TikTok.'
+      : `Chỉ tìm thấy ${targets.length}/${requested} follower khả dụng để gửi tin nhắn TikTok.`;
+    firstFailureReason = reason;
+    failures.push({ username, reason });
+    const entry = { action: 'MESSAGE', status: 'FAILED', username, profileUrl: buildTikTokProfileUrl(username), reason, completedAt: new Date().toISOString() };
+    reportEntries.push(entry);
+    await recordTikTokActionProgress(session, entry);
+  }
   for (const [targetUsername, targetProfileUrl] of targets) {
     try {
       // Keep each recipient on the same protected route: search from home and
@@ -2655,24 +3594,38 @@ export async function messageTikTokFollowers(
       if (!messageButton?.click) throw new Error('Không tìm thấy nút nhắn tin cho follower');
       await waitForTikTokActionDelay(page);
       await messageButton.click();
+      await waitForTikTokPageReady(page);
       await waitForTikTokActionDelay(page);
       await session.captureStepScreenshot?.('tiktok-message-composer-route');
+      await recordTikTokActionProgress(session, { action: 'MESSAGE', status: 'IN_PROGRESS', username: targetUsername, profileUrl: targetProfileUrl, startedAt: new Date().toISOString() });
       await sendTikTokMessage(session, input.text, input.mediaAssetIds, captchaSolver, targetUsername, targetProfileUrl);
       await session.captureStepScreenshot?.('tiktok-message-sent');
       sent += 1;
+      const entry = { action: 'MESSAGE', status: 'SENT', username: targetUsername, profileUrl: targetProfileUrl, completedAt: new Date().toISOString() };
+      reportEntries.push(entry);
+      await recordTikTokActionProgress(session, entry);
       if (input.intervalSeconds && targetUsername !== targets[targets.length - 1]?.[0]) {
         await page.waitForTimeout?.(input.intervalSeconds * 1_000);
       }
     } catch (error) {
-      failures.push({ username: targetUsername, reason: error instanceof Error ? error.message : String(error) });
+      const reason = error instanceof Error ? error.message : String(error);
+      firstFailureReason ??= reason;
+      failures.push({ username: targetUsername, reason });
+      const entry = { action: 'MESSAGE', status: 'FAILED', username: targetUsername, profileUrl: targetProfileUrl, reason, completedAt: new Date().toISOString() };
+      reportEntries.push(entry);
+      await recordTikTokActionProgress(session, entry);
     }
   }
   return {
     channelUsername: `@${username}`,
     discovered: followers.size,
-    requested: targets.length,
+    requested,
     sent,
+    totalSent: (input.resumeCompletedCount ?? 0) + sent,
+    totalRequested: (input.resumeCompletedCount ?? 0) + requested,
     failures,
+    report: { action: 'MESSAGE', entries: reportEntries },
+    ...(firstFailureReason ? { reason: firstFailureReason } : {}),
   };
 }
 
@@ -2713,13 +3666,16 @@ async function sendComment(
   text: string,
   mediaAssetIds: string[],
   captchaSolver?: TikTokRotateCaptchaSolver,
+  captchaTimeoutMs?: number,
 ): Promise<void> {
   const page = session.page as EvaluatablePage;
+  const captchaDeadline = captchaTimeoutMs == null ? undefined : Date.now() + captchaTimeoutMs;
+  const remainingCaptchaMs = () => captchaDeadline == null ? undefined : Math.max(1, captchaDeadline - Date.now());
   // TikTok can place the rotate challenge over the freshly opened comment
   // drawer. Resolve it before looking for an editor; otherwise the overlay
   // makes every editor candidate invisible and the task incorrectly reports
   // that the comment text was not accepted.
-  await ensureTikTokCommentCaptchaSolved(page, captchaSolver);
+  await ensureTikTokCommentCaptchaSolved(page, captchaSolver, remainingCaptchaMs());
   let editor: LocatorLike | undefined;
   for (let attempt = 0; attempt < 10 && !editor; attempt += 1) {
     editor = await findVisibleLocator(page, tiktokCommentEditorSelectors);
@@ -2744,13 +3700,13 @@ async function sendComment(
     // desktop builds. Solve it here before trying the editor again; waiting
     // until submit would leave the overlay covering the editor and produce a
     // misleading "text was not accepted" error.
-    await ensureTikTokCommentCaptchaSolved(page, captchaSolver);
+    await ensureTikTokCommentCaptchaSolved(page, captchaSolver, remainingCaptchaMs());
     editor = await findVisibleLocator(page, tiktokCommentEditorSelectors);
   }
   // A challenge can be mounted just after the final editor scan. Give the
   // solver one last chance, then re-scan the live drawer before failing.
   if (!editor) {
-    await ensureTikTokCommentCaptchaSolved(page, captchaSolver);
+    await ensureTikTokCommentCaptchaSolved(page, captchaSolver, remainingCaptchaMs());
     editor = await findVisibleLocator(page, tiktokCommentEditorSelectors);
   }
   let filled = editor
@@ -2764,7 +3720,7 @@ async function sendComment(
     throw new Error(`${editor ? 'TikTok không nhận nội dung trong ô nhập bình luận' : 'Không tìm thấy ô nhập bình luận TikTok'}${diagnostics ? ` (${diagnostics})` : ''}`);
   }
   await waitForTikTokActionDelay(page);
-  await submitComment(page, text, mediaAssetIds, session, captchaSolver);
+  await submitComment(page, text, mediaAssetIds, session, captchaSolver, remainingCaptchaMs());
 }
 
 async function findVisibleLocator(page: EvaluatablePage, selectors: string[]): Promise<LocatorLike | undefined> {
@@ -2775,6 +3731,35 @@ async function findVisibleLocator(page: EvaluatablePage, selectors: string[]): P
       const candidate = locator.nth ? locator.nth(index) : locator;
       if (await isLocatorVisible(candidate)) return candidate;
     }
+  }
+  return undefined;
+}
+
+async function findLocatorInViewport(page: EvaluatablePage, selectors: string[]): Promise<LocatorLike | undefined> {
+  for (const selector of selectors) {
+    const locator = page.locator(selector) as unknown as LocatorLike;
+    const count = await locator.count();
+    for (let index = 0; index < count; index += 1) {
+      const candidate = locator.nth ? locator.nth(index) : locator;
+      if (await isLocatorInViewport(page, candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+async function waitForTikTokEditor(
+  page: EvaluatablePage,
+  selectors: string[],
+  timeoutMs = 8_000,
+  requireInViewport = false,
+): Promise<LocatorLike | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const editor = requireInViewport
+      ? await findLocatorInViewport(page, selectors)
+      : await findVisibleLocator(page, selectors);
+    if (editor) return editor;
+    await waitForTikTokUi(page, 180, 360);
   }
   return undefined;
 }
@@ -2794,43 +3779,84 @@ async function fillTikTokCommentEditor(
   page: EvaluatablePage,
   text: string,
   selectors: string[],
+  preferredEditor?: LocatorLike,
 ): Promise<boolean> {
   const normalizedText = text.replace(/\s+/g, ' ').trim();
+  const focusWithoutScroll = async (editor: LocatorLike): Promise<boolean> => {
+    if (!editor.evaluate) return false;
+    try {
+      return await editor.evaluate((element) => {
+        const target = element as HTMLElement;
+        if (document.activeElement !== target) target.focus({ preventScroll: true });
+        return document.activeElement === target;
+      });
+    } catch {
+      return false;
+    }
+  };
+  const fillEditor = async (editor: LocatorLike): Promise<boolean> => {
+    try {
+      let actual = (await readTikTokEditorValue(editor)).replace(/\s+/g, ' ').trim();
+      if (actual === normalizedText || actual.includes(normalizedText)) return true;
+
+      // Reply click already focuses the DraftEditor. Keep that focus and type
+      // through the page keyboard so Chromium never performs locator-action
+      // auto-scroll while the drawer is virtualizing its rows.
+      const focused = await focusWithoutScroll(editor);
+      if (focused && page.keyboard?.type && !actual) {
+        await page.keyboard.type(text);
+        await waitForTikTokUi(page, 180, 420);
+        actual = (await readTikTokEditorValue(editor)).replace(/\s+/g, ' ').trim();
+        if (actual === normalizedText || actual.includes(normalizedText)) return true;
+      }
+
+      // Lightweight test/browser implementations may not expose page.keyboard.
+      // Keep the locator fallback, but only use it after the no-scroll path.
+      if (!editor.fill) return false;
+      if (!focused) await editor.click?.();
+      await editor.fill(text);
+      await waitForTikTokUi(page, 180, 420);
+      actual = (await readTikTokEditorValue(editor)).replace(/\s+/g, ' ').trim();
+      if (actual === normalizedText || actual.includes(normalizedText)) return true;
+
+      // Some TikTok editor builds swallow Playwright's fill event while the
+      // comment drawer is hydrating. Re-focus the same live control and use
+      // native keyboard input as a fallback, then verify the rendered value.
+      await editor.fill('');
+      if (editor.pressSequentially) await editor.pressSequentially(text);
+      else if (editor.type) await editor.type(text);
+      await waitForTikTokUi(page, 180, 420);
+      actual = (await readTikTokEditorValue(editor)).replace(/\s+/g, ' ').trim();
+      return actual === normalizedText || actual.includes(normalizedText);
+    } catch {
+      return false;
+    }
+  };
+
+  // A reply editor is tied to one specific comment row. Never discard that
+  // locator and restart a document-wide scan: TikTok keeps older reply boxes
+  // mounted outside the drawer viewport, which makes Playwright auto-scroll
+  // back to the wrong comment when those stale controls are clicked.
+  if (preferredEditor) return fillEditor(preferredEditor);
+
   for (const selector of selectors) {
     const locator = page.locator(selector) as unknown as LocatorLike;
     const count = await locator.count();
     for (let index = 0; index < count; index += 1) {
       const editor = locator.nth ? locator.nth(index) : locator;
       if (!await isLocatorVisible(editor) || !editor.fill) continue;
-      try {
-        await editor.click?.();
-        await editor.fill(text);
-        await waitForTikTokUi(page, 180, 420);
-        let actual = (await readTikTokEditorValue(editor)).replace(/\s+/g, ' ').trim();
-        if (actual === normalizedText || actual.includes(normalizedText)) return true;
-
-        // Some TikTok editor builds swallow Playwright's fill event while the
-        // comment drawer is hydrating. Re-focus the same live control and use
-        // native keyboard input as a fallback, then verify the rendered value
-        // before allowing the Post action.
-        if (editor.fill) await editor.fill('');
-        if (editor.pressSequentially) await editor.pressSequentially(text);
-        else if (editor.type) await editor.type(text);
-        await waitForTikTokUi(page, 180, 420);
-        actual = (await readTikTokEditorValue(editor)).replace(/\s+/g, ' ').trim();
-        if (actual === normalizedText || actual.includes(normalizedText)) return true;
-      } catch {
-        // A recycled TikTok comment drawer can detach the candidate while it
-        // is being hydrated. Try the next live editor instead of submitting
-        // against a disabled/stale Post button.
-      }
+      if (await fillEditor(editor)) return true;
     }
   }
   return false;
 }
 
-async function fillTikTokCommentByVisiblePlaceholder(page: EvaluatablePage, text: string): Promise<boolean> {
-  const placeholder = await firstVisibleLocator(page, tiktokCommentPlaceholderSelectors);
+async function fillTikTokCommentByVisiblePlaceholder(
+  page: EvaluatablePage,
+  text: string,
+  selectors: string[] = tiktokCommentPlaceholderSelectors,
+): Promise<boolean> {
+  const placeholder = await findLocatorInViewport(page, selectors);
   if (!placeholder?.click) return false;
   try {
     await placeholder.click();
@@ -3307,6 +4333,10 @@ async function submitComment(
   mediaAssetIds: string[],
   session: PlatformSession,
   captchaSolver?: TikTokRotateCaptchaSolver,
+  captchaTimeoutMs?: number,
+  editorSelectors: string[] = tiktokCommentEditorSelectors,
+  placeholderSelectors: string[] = tiktokCommentPlaceholderSelectors,
+  preferredEditor?: LocatorLike,
 ): Promise<void> {
   if (mediaAssetIds.length > 0) {
     if (!session.resolveMediaAssets) throw new Error('Chưa có bộ giải media cho TikTok');
@@ -3316,15 +4346,27 @@ async function submitComment(
     await input.setInputFiles(files);
   }
   await waitForTikTokActionDelay(page);
-  await ensureTikTokCommentCaptchaSolved(page, captchaSolver);
+  // Reply already verified the visible challenge immediately after opening
+  // its composer. Running the broad CAPTCHA wait again after typing can race
+  // TikTok's virtualized drawer and move focus away from the active editor.
+  if (!preferredEditor) await ensureTikTokCommentCaptchaSolved(page, captchaSolver, captchaTimeoutMs);
   // TikTok's desktop comment surface accepts Enter from the focused editor.
   // Re-focus the live editor after CAPTCHA/media handling because solving the
   // challenge can leave focus on the slider instead of the comment field.
-  const editor = await firstVisibleLocator(page, tiktokCommentEditorSelectors);
-  if (editor?.click) {
+  let editor = preferredEditor;
+  if (editor && !await isLocatorInViewport(page, editor)) editor = undefined;
+  editor ??= await findLocatorInViewport(page, editorSelectors);
+  if (editor?.evaluate) {
+    // DraftEditor is focus-sensitive. Focus without scrolling if a page
+    // update moved focus, but never invoke locator.click() on the reply input.
+    await editor.evaluate((element) => {
+      const target = element as HTMLElement;
+      if (document.activeElement !== target) target.focus({ preventScroll: true });
+    }).catch(() => undefined);
+  } else if (editor?.click) {
     try { await editor.click(); } catch { /* The drawer may recycle the editor while hydrating. */ }
   } else {
-    const placeholder = await firstVisibleLocator(page, tiktokCommentPlaceholderSelectors);
+    const placeholder = await findLocatorInViewport(page, placeholderSelectors);
     if (placeholder?.click) {
       try { await placeholder.click(); } catch { /* Let the keyboard fallback report the real failure. */ }
     }
@@ -3333,9 +4375,18 @@ async function submitComment(
   // Do not mark the task as having started an external side effect until the
   // final Enter is about to be dispatched. The verification below only
   // returns after TikTok renders the submitted comment in the comment list.
+  const beforeComments = await readVisibleTikTokCommentTexts(page);
   await beginExternalAction(session);
   let pressed = false;
-  if (editor?.press) {
+  if (preferredEditor && page.keyboard?.press) {
+    try {
+      await page.keyboard.press('Enter');
+      pressed = true;
+    } catch {
+      // Fall through to the editor-specific keyboard path.
+    }
+  }
+  if (!pressed && editor?.press) {
     try {
       await editor.press('Enter');
       pressed = true;
@@ -3349,12 +4400,13 @@ async function submitComment(
     pressed = true;
   }
   if (!pressed) throw new Error('TikTok không hỗ trợ nhấn Enter để gửi bình luận');
-  await waitForTikTokCommentPosted(page, text);
+  await waitForTikTokCommentPosted(page, text, beforeComments);
 }
 
-async function waitForTikTokCommentPosted(page: EvaluatablePage, text: string): Promise<void> {
+async function waitForTikTokCommentPosted(page: EvaluatablePage, text: string, beforeComments: string[] = []): Promise<void> {
   const expected = normalizeTikTokUiText(text);
   if (!expected) throw new Error('Nội dung bình luận TikTok rỗng sau khi nhập');
+  const beforeMatchingCount = beforeComments.filter(comment => normalizeTikTokUiText(comment).includes(expected)).length;
 
   // Give TikTok time to dispatch the comment request and update the drawer.
   // This delay is intentionally longer than the ordinary UI pacing delay so
@@ -3363,7 +4415,12 @@ async function waitForTikTokCommentPosted(page: EvaluatablePage, text: string): 
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     const comments = await readVisibleTikTokCommentTexts(page);
-    if (comments.some((comment) => normalizeTikTokUiText(comment).includes(expected))) return;
+    const matchingCount = comments.filter(comment => normalizeTikTokUiText(comment).includes(expected)).length;
+    // Do not accept a pre-existing comment with identical text as proof that
+    // Enter submitted a new reply. TikTok keeps the drawer mounted after a
+    // failed submit, so a new matching row (or a larger visible comment set)
+    // is the minimum positive evidence we can safely use.
+    if (matchingCount > beforeMatchingCount || (beforeComments.length === 0 && matchingCount > 0)) return;
     await waitForTikTokUi(page, 450, 750);
   }
   throw new Error(`TikTok chưa hiển thị bình luận sau khi nhấn Enter: ${text}`);
@@ -3415,14 +4472,20 @@ async function firstVisibleEnabledLocator(
 async function ensureTikTokCommentCaptchaSolved(
   page: EvaluatablePage,
   captchaSolver?: TikTokRotateCaptchaSolver,
+  timeoutMs?: number,
 ): Promise<void> {
-  const captchaVisible = await hasVisibleTikTokCaptcha(page);
-  // The challenge may be inside a generic iframe whose root is invisible to
-  // the parent document. Reuse the same verification-state probe used by the
-  // search flow before deciding that no challenge exists.
-  const verificationState = captchaVisible ? undefined : await inspectTikTokSearchState(page);
-  if (!captchaVisible && !verificationState?.verificationRequired) return;
-  const solved = await solveVisibleTikTokRotateCaptcha(page, captchaSolver);
+  // Do not use the broad search-state text probe here. The normal TikTok
+  // comment surface can contain words such as "verify" in hidden/help copy,
+  // which would incorrectly start the remote solver after every comment
+  // button click. hasVisibleTikTokCaptcha already checks the visible widget,
+  // generic portals and child frames, so only a real rendered challenge may
+  // enter the bounded 30s/5-10s AntiCaptcha path.
+  // A comment can mount the challenge a moment after the drawer opens. Use
+  // the caller's per-comment budget (30s for the first comment, 5-10s later)
+  // as the appearance window too; if no widget appears by then, continue.
+  const captchaVisible = await waitForVisibleTikTokCaptcha(page, timeoutMs ?? 1_500);
+  if (!captchaVisible) return;
+  const solved = await solveVisibleTikTokRotateCaptcha(page, captchaSolver, timeoutMs);
   if (!solved.solved) {
     throw new TikTokVerificationRequiredError(
       `TikTok CAPTCHA chưa được giải${solved.reason ? `: ${solved.reason}` : '.'}`,
@@ -3782,4 +4845,19 @@ async function beginExternalAction(session: PlatformSession): Promise<void> {
     throw new Error('TikTok external action requires an approved task execution context');
   }
   await session.beforeExternalAction();
+}
+
+async function recordTikTokActionProgress(
+  session: PlatformSession,
+  entry: Record<string, unknown>,
+): Promise<void> {
+  // Progress is diagnostic durability, not a reason to fail the browser
+  // action. If the worker is already tearing down, the last checkpoint still
+  // remains available in TaskRun and the caller will classify the outcome.
+  try {
+    await session.recordActionProgress?.(entry);
+  } catch {
+    // Keep the action result authoritative when persistence races browser
+    // teardown or a transient database connection loss.
+  }
 }

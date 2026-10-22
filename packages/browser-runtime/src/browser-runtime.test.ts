@@ -7,6 +7,134 @@ import test from 'node:test';
 import { BrowserRuntime } from './browser-runtime';
 import { LocalObjectStorage, ProfileSnapshotStore } from '@socio/object-storage';
 import { BrowserProcessRegistry } from './browser-process';
+import { loadFingerprintEmulation } from './fingerprint-emulation';
+
+test('fingerprint bundle is complete, coherent and stable for each profile', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-fingerprint-'));
+  try {
+    const firstProfile = join(root, 'first');
+    const secondProfile = join(root, 'second');
+    await Promise.all([
+      import('node:fs/promises').then(({ mkdir }) => mkdir(firstProfile, { recursive: true })),
+      import('node:fs/promises').then(({ mkdir }) => mkdir(secondProfile, { recursive: true })),
+    ]);
+    const defaults = {
+      locale: 'vi-VN',
+      timezoneId: 'Asia/Ho_Chi_Minh',
+      viewport: { width: 1536, height: 864 },
+      colorScheme: 'light' as const,
+    };
+    const first = await loadFingerprintEmulation(firstProfile, defaults);
+    const reopened = await loadFingerprintEmulation(firstProfile, {
+      locale: 'en-US',
+      timezoneId: 'UTC',
+    });
+    const second = await loadFingerprintEmulation(secondProfile, defaults);
+
+    assert.deepEqual(reopened, first, 'A profile must reuse its original bundle');
+    assert.notEqual(second.seed, first.seed, 'Profiles must have independent bundles');
+    assert.equal(first.locale, 'vi-VN');
+    assert.deepEqual(first.languages, ['vi-VN', 'vi']);
+    assert.deepEqual(first.features, { canvas: false, webgl: false, gpu: false, userAgent: false, clientHints: false });
+    assert.equal(first.timezoneId, 'Asia/Ho_Chi_Minh');
+    assert.deepEqual(first.viewport, { width: 1536, height: 864 });
+    assert.match(first.userAgent, /Chrome\/\d+\.0\.0\.0/);
+    assert.equal(first.clientHints.platform, process.platform === 'win32' ? 'Windows' : 'Linux');
+    assert.equal(first.clientHints.brands.find(brand => brand.brand === 'Google Chrome')?.version,
+      /Chrome\/(\d+)/.exec(first.userAgent)?.[1]);
+    assert.ok(first.canvas.signature.length >= 24);
+    assert.match(first.webgl.renderer, /ANGLE/);
+    assert.ok(first.gpu.vendor.length > 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Patchright applies the saved fingerprint bundle before page scripts run', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-fingerprint-browser-'));
+  const profileId = 'fingerprint-runtime';
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7));
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html' });
+    response.end('<!doctype html><html><head><title>fingerprint</title></head><body></body></html>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    const session = await runtime.openProfile({
+      profileId,
+      headless: true,
+      emulateFingerprint: true,
+      locale: 'vi-VN',
+      timezoneId: 'Asia/Bangkok',
+      viewport: { width: 1280, height: 720 },
+      colorScheme: 'dark',
+      fingerprint: {
+        features: { canvas: true, webgl: true, gpu: true, userAgent: true, clientHints: true },
+      },
+    });
+    const config = JSON.parse(await readFile(join(root, profileId, 'fingerprint-emulation.json'), 'utf8'));
+    await session.page.goto(`http://127.0.0.1:${address.port.toString()}/`);
+    const mainWorldPage = session.page as unknown as {
+      evaluate<R>(fn: () => Promise<R>, arg: undefined, options: undefined, isolatedContext: false): Promise<R>;
+    };
+    const observed = await mainWorldPage.evaluate(async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext('2d')!;
+      context.fillStyle = 'rgb(10, 20, 30)';
+      context.fillRect(0, 0, 1, 1);
+      const pixels = context.getImageData(0, 0, 1, 1).data;
+      const canvasDataUrl = canvas.toDataURL();
+      const gl = document.createElement('canvas').getContext('webgl');
+      const hints = await (navigator as Navigator & { userAgentData?: { brands: unknown; platform: string; getHighEntropyValues(values: string[]): Promise<unknown> } }).userAgentData?.getHighEntropyValues(['architecture', 'bitness', 'fullVersionList', 'platformVersion']);
+      return {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        timezoneId: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        viewport: { width: innerWidth, height: innerHeight },
+        dark: matchMedia('(prefers-color-scheme: dark)').matches,
+        brands: (navigator as Navigator & { userAgentData?: { brands: unknown } }).userAgentData?.brands,
+        hints,
+        canvas: [...pixels],
+        canvasDataUrl,
+        webglVendor: gl?.getParameter(0x9245),
+        webglRenderer: gl?.getParameter(0x9246),
+      };
+    }, undefined, undefined, false);
+    const nativeCanvasDataUrl = await session.page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext('2d')!;
+      context.fillStyle = 'rgb(10, 20, 30)';
+      context.fillRect(0, 0, 1, 1);
+      return canvas.toDataURL();
+    });
+    assert.equal(observed.userAgent, config.userAgent);
+    assert.equal(observed.language, config.locale);
+    assert.equal(observed.timezoneId, config.timezoneId);
+    assert.deepEqual(observed.viewport, config.viewport);
+    assert.equal(observed.dark, true);
+    assert.deepEqual(observed.brands, config.clientHints.brands);
+    if (observed.webglVendor !== null) {
+      assert.equal(observed.webglVendor, config.webgl.vendor);
+      assert.equal(observed.webglRenderer, config.webgl.renderer);
+    }
+    assert.deepEqual(observed.canvas.slice(0, 3), config.canvas.noise.map((value: number, index: number) => value + ([10, 20, 30][index] ?? 0)));
+    assert.notEqual(observed.canvasDataUrl, nativeCanvasDataUrl);
+    await session.close();
+  } finally {
+    await runtime.closeAll();
+    await rm(root, { recursive: true, force: true });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 test('hung cookie save is force-closed by verified PID while another browser stays alive', async () => {
   const root = await mkdtemp(join(tmpdir(), 'socio-hung-browser-'));
@@ -46,6 +174,34 @@ test('force close interrupts a pending task and persisted identity rejects a reu
     assert.equal(runtime.activeSessionCount, 0);
     assert.throws(() => process.kill(session.processId!, 0));
   } finally { await runtime.closeAll(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('force close releases the runtime even when process termination is already unavailable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-force-unavailable-'));
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7), 100);
+  let originalTerminate: BrowserProcessRegistry['terminate'] | undefined;
+  try {
+    const session = await runtime.openProfile({ profileId: 'fixture' });
+    const registry = (runtime as unknown as { processes: BrowserProcessRegistry }).processes;
+    originalTerminate = registry.terminate.bind(registry);
+    registry.terminate = (async () => { throw new Error('process inspection unavailable'); }) as BrowserProcessRegistry['terminate'];
+
+    await assert.doesNotReject(runtime.forceCloseProfile('fixture'));
+    assert.equal(runtime.activeSessionCount, 0);
+
+    // The force request must not lose the process marker. A later recovery
+    // pass can still terminate the exact token after inspection returns.
+    registry.terminate = originalTerminate;
+    await new BrowserProcessRegistry(root).recover('fixture');
+    assert.throws(() => process.kill(session.processId!, 0));
+  } finally {
+    if (originalTerminate) {
+      const registry = (runtime as unknown as { processes: BrowserProcessRegistry }).processes;
+      registry.terminate = originalTerminate;
+    }
+    await runtime.closeAll();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('profile recovery removes stale Chrome Singleton locks when no process owns the profile', async () => {

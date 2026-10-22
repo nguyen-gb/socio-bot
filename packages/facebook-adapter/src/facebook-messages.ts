@@ -1,5 +1,5 @@
 import { normalizeFacebookGroupUrl, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, type ActionResult, type FacebookPostRecipientSource } from '@socio/contracts';
-import { type PlatformSession } from '@socio/platform-core';
+import { gotoPlatformPage, type PlatformSession } from '@socio/platform-core';
 import type { Locator, Page } from 'playwright';
 import { attachFacebookImages } from './facebook-images';
 
@@ -18,7 +18,7 @@ export class FacebookMessagesAutomation {
   async messageRandomGroupMember(session: PlatformSession, inputGroupUrl: string, text: string, mediaAssetIds: string[] = [], excludedProfileUrls: string[] = []): Promise<ActionResult> {
     const page = automationPage(session);
     const groupUrl = normalizeFacebookGroupUrl(inputGroupUrl);
-    try { await page.goto(`${groupUrl.replace(/\/$/, '')}/members`, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 }); }
+    try { await gotoPlatformPage(page, `${groupUrl.replace(/\/$/, '')}/members`, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 }); }
     catch { return manual('Không tải được danh sách thành viên nhóm; chưa gửi tin nhắn.', { groupUrl }); }
     const interrupted = await guard(page);
     if (interrupted) return interrupted;
@@ -53,7 +53,7 @@ export class FacebookMessagesAutomation {
   async messageRandomPostReactor(session: PlatformSession, inputPostUrl: string, text: string, mediaAssetIds: string[] = [], excludedProfileUrls: string[] = [], recipientSource: FacebookPostRecipientSource = 'REACTORS'): Promise<ActionResult> {
     const page = automationPage(session);
     const postUrl = normalizeFacebookPostUrl(inputPostUrl);
-    try { await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 }); }
+    try { await gotoPlatformPage(page, postUrl, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 }); }
     catch { return manual('Không tải được bài viết; chưa gửi tin nhắn.', { postUrl }); }
     const interrupted = await guard(page);
     if (interrupted) return interrupted;
@@ -84,7 +84,7 @@ export class FacebookMessagesAutomation {
   async message(session: PlatformSession, inputProfileUrl: string, text: string, mediaAssetIds: string[] = []): Promise<ActionResult> {
     const page = automationPage(session);
     const profileUrl = normalizeFacebookProfileUrl(inputProfileUrl);
-    try { await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 }); }
+    try { await gotoPlatformPage(page, profileUrl, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 }); }
     catch { return manual('Không tải được profile người nhận; chưa gửi tin nhắn.', { profileUrl }); }
     const interrupted = await guard(page);
     if (interrupted) return interrupted;

@@ -14,10 +14,14 @@ export interface WorkerEnvironment {
   browserHeadless: boolean;
   /** Time to leave Chromium open after an action result before closing it. */
   browserCloseDelayMs: number;
+  /** Maximum time a single browser action may run before a safe teardown. */
+  browserTaskTimeoutMs: number;
   browserChannel?: string;
-  browserAutomationMode: 'playwright' | 'chrome';
   browserLocale?: string;
   browserTimezoneId?: string;
+  browserColorScheme?: 'light' | 'dark' | 'no-preference';
+  browserViewport?: { width: number; height: number } | null;
+  browserFingerprintEmulation: boolean;
   /** Diagnostic screenshots are opt-in and should remain disabled in production. */
   captureStepScreenshots: boolean;
   anticaptchaApiKey?: string;
@@ -107,14 +111,19 @@ export function loadEnvironment(): WorkerEnvironment {
     // and before profile teardown. Override per deployment when a slower
     // connection needs more time (for example BROWSER_CLOSE_DELAY_MS=10000).
     browserCloseDelayMs: positiveInteger(process.env.BROWSER_CLOSE_DELAY_MS, 5_000),
-    browserChannel: optionalString(process.env.BROWSER_CHANNEL),
-    browserAutomationMode: enumValue(
-      process.env.BROWSER_AUTOMATION_MODE,
-      ['playwright', 'chrome'] as const,
-      'playwright',
-    ),
+    browserTaskTimeoutMs: browserTaskTimeout(process.env.BROWSER_TASK_TIMEOUT_MS),
+    browserChannel: optionalString(process.env.BROWSER_CHANNEL) ?? 'chrome',
     browserLocale: browserLocale(process.env.BROWSER_LOCALE),
     browserTimezoneId: browserTimezone(process.env.BROWSER_TIMEZONE_ID),
+    browserColorScheme: optionalEnumValue(
+      process.env.BROWSER_COLOR_SCHEME,
+      ['light', 'dark', 'no-preference'] as const,
+    ),
+    browserViewport: browserViewport(process.env.BROWSER_VIEWPORT),
+    browserFingerprintEmulation: booleanValue(
+      process.env.BROWSER_FINGERPRINT_EMULATION,
+      true,
+    ),
     captureStepScreenshots: booleanValue(process.env.CAPTURE_STEP_SCREENSHOTS, false),
     anticaptchaApiKey: optionalString(process.env.ANTICAPTCHA_API_KEY),
     anticaptchaApiUrl: anticaptchaApiUrl(process.env.ANTICAPTCHA_API_URL),
@@ -139,7 +148,7 @@ export function loadEnvironment(): WorkerEnvironment {
     ),
     anticaptchaTimeoutMs: positiveInteger(
       process.env.ANTICAPTCHA_TIMEOUT_MS,
-      120_000,
+      30_000,
     ),
     anticaptchaTikTokRotateInvert: booleanValue(
       process.env.ANTICAPTCHA_TIKTOK_ROTATE_INVERT,
@@ -187,6 +196,17 @@ function positiveInteger(value: string | undefined, fallback: number): number {
     throw new Error(`Expected a positive integer, received ${value}`);
   }
   return parsed;
+}
+
+function browserTaskTimeout(value: string | undefined): number {
+  const timeoutMs = positiveInteger(value, 15 * 60_000);
+  // Keep the configurable task deadline aligned with the Temporal activity
+  // budget. Browser teardown is separately bounded and always runs in the
+  // deadline's finally path.
+  if (timeoutMs < 30_000 || timeoutMs > 15 * 60_000) {
+    throw new Error('BROWSER_TASK_TIMEOUT_MS must be between 30000 and 900000');
+  }
+  return timeoutMs;
 }
 
 function booleanValue(value: string | undefined, fallback: boolean): boolean {
@@ -237,6 +257,18 @@ function enumValue<const T extends readonly string[]>(
   return resolved as T[number];
 }
 
+function optionalEnumValue<const T extends readonly string[]>(
+  value: string | undefined,
+  allowed: T,
+): T[number] | undefined {
+  const normalized = optionalString(value);
+  if (!normalized) return undefined;
+  if (!allowed.includes(normalized)) {
+    throw new Error(`Expected one of ${allowed.join(', ')}, received ${normalized}`);
+  }
+  return normalized as T[number];
+}
+
 /** Fail fast on invalid standard browser settings instead of repeatedly
  * failing task launches and retrying a broken configuration. */
 function browserLocale(value: string | undefined): string | undefined {
@@ -252,4 +284,20 @@ function browserTimezone(value: string | undefined): string | undefined {
   try { new Intl.DateTimeFormat('en-US', { timeZone: timezone }); }
   catch { throw new Error(`Invalid BROWSER_TIMEZONE_ID: ${timezone}`); }
   return timezone;
+}
+
+function browserViewport(
+  value: string | undefined,
+): { width: number; height: number } | null | undefined {
+  const viewport = optionalString(value);
+  if (!viewport) return undefined;
+  if (viewport === 'auto') return null;
+  const match = /^(\d{3,4})x(\d{3,4})$/.exec(viewport);
+  if (!match) throw new Error('Invalid BROWSER_VIEWPORT: expected auto or WIDTHxHEIGHT');
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (width < 640 || width > 3840 || height < 480 || height > 2160) {
+    throw new Error('Invalid BROWSER_VIEWPORT: width must be 640..3840 and height 480..2160');
+  }
+  return { width, height };
 }

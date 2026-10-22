@@ -211,7 +211,6 @@ test('challenge appearing after an adapter result becomes manual action and mark
     );
 
     const result = await service.executeBrowserTask({ taskId: id });
-
     assert.equal(result.ok, false);
     assert.equal(result.data?.requiresAction, true);
     assert.equal(result.data?.accountChallenged, true);

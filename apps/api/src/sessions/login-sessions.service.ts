@@ -35,6 +35,42 @@ export class LoginSessionsService {
     if (!account?.browserProfile) {
       throw new NotFoundException('Account or browser profile not found');
     }
+
+    const activeSession = await this.prisma.browserSession.findFirst({
+      where: {
+        profileId: account.browserProfile.id,
+        status: { in: ['STARTING', 'RUNNING', 'IDLE', 'CLOSING'] },
+      },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true, status: true },
+    });
+    if (activeSession) {
+      throw new ConflictException({
+        message: 'This account already has an active browser session',
+        sessionId: activeSession.id,
+      });
+    }
+
+    // A worker crash can leave BrowserProfile.LEASED/SNAPSHOTTING behind
+    // even though its BrowserSession is already terminal. Reclaim only old
+    // rows with no active session; fresh rows remain protected while the
+    // normal activity finally block is still saving the profile.
+    if (['LEASED', 'SNAPSHOTTING'].includes(account.browserProfile.status)) {
+      const staleAfterMs = account.browserProfile.status === 'LEASED'
+        ? 2 * 60_000
+        : 10 * 60_000;
+      const recovered = await this.prisma.browserProfile.updateMany({
+        where: {
+          id: account.browserProfile.id,
+          status: account.browserProfile.status,
+          updatedAt: { lt: new Date(Date.now() - staleAfterMs) },
+        },
+        data: { status: account.browserProfile.status === 'LEASED' ? 'AVAILABLE' : 'ERROR' },
+      });
+      if (recovered.count === 1) {
+        account.browserProfile.status = account.browserProfile.status === 'LEASED' ? 'AVAILABLE' : 'ERROR';
+      }
+    }
     if (['LEASED', 'SNAPSHOTTING'].includes(account.browserProfile.status)) {
       throw new ConflictException('Profile đang được sử dụng hoặc đang lưu dữ liệu. Đóng browser hiện tại và chờ hoàn tất.');
     }
@@ -44,20 +80,6 @@ export class LoginSessionsService {
         message: `Proxy "${assignedProxy.name}" chưa kết nối được. Hãy kiểm tra proxy trước khi mở browser.`,
         proxyId: assignedProxy.id,
         proxyStatus: assignedProxy.status,
-      });
-    }
-
-    const existing = await this.prisma.browserSession.findFirst({
-      where: {
-        profileId: account.browserProfile.id,
-        status: { in: ['STARTING', 'RUNNING', 'CLOSING'] },
-      },
-      orderBy: { startedAt: 'desc' },
-    });
-    if (existing) {
-      throw new ConflictException({
-        message: 'This account already has an active browser session',
-        sessionId: existing.id,
       });
     }
 

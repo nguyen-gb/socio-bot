@@ -38,6 +38,19 @@ export class TemporalClientService implements OnModuleDestroy {
     });
   }
 
+  async cancelTask(workflowId: string): Promise<boolean> {
+    try {
+      const client = await this.getClient();
+      await client.workflow.getHandle(workflowId).cancel();
+      return true;
+    } catch {
+      // Database/browser cancellation remains authoritative when the workflow
+      // already completed, was never dispatched, or Temporal is temporarily
+      // unavailable. The API must still release a stuck campaign immediately.
+      return false;
+    }
+  }
+
   async startLoginSession(
     sessionId: string,
     workflowId: string,

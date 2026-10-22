@@ -107,6 +107,8 @@ try {
   await dialog.getByLabel('Tên lịch', { exact: true }).fill('Kiểm tra mỗi giờ');
   await dialog.getByLabel('Profile cho lịch').click();
   await page.locator('.ant-select-dropdown:visible').getByText(/Mai Nguyễn cập nhật/).click();
+  assert.equal(await dialog.locator('.ant-modal-footer .schedule-submit').count(), 1);
+  assert.ok(await dialog.locator('.ant-modal-footer .schedule-submit').isVisible());
   await dialog.getByRole('button', { name: 'Tạo lịch', exact: true }).click();
   await dialog.waitFor({ state: 'hidden' });
   await page.getByRole('button', { name: 'Xóa lịch', exact: true }).click();

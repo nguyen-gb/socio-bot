@@ -183,6 +183,9 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .ant-modal-header, .ant-modal-footer { flex-shrink: 0; }
 .ant-modal-header { margin-bottom: 22px !important; }
 .ant-modal-footer { padding-top: 18px; margin-top: 16px !important; border-top: 1px solid var(--line); }
+.tiktok-result-modal .ant-modal-footer { position: sticky; bottom: 0; z-index: 2; display: flex; justify-content: stretch; background: #fff; box-shadow: 0 -8px 18px #ffffff; }
+.tiktok-selection-toolbar { width: 100%; }
+.tiktok-selection-toolbar .ant-btn { flex: 0 0 auto; }
 .ant-form-item-label > label { font-size: 13px !important; color: #4b584c !important; }
 .ant-form-item-extra { margin-top: 7px; font-size: 11px; line-height: 1.65; color: var(--muted); }
 .ant-form-item { margin-bottom: 20px; }
@@ -217,7 +220,7 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .tiktok-form-grid { display: grid; gap: 16px; }
 .tiktok-form-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .tiktok-field { display: grid; gap: 7px; min-width: 0; }
-.tiktok-field > .ant-typography { color: #58645a; font-size: 12px; line-height: 1.35; }
+.tiktok-field > label { color: #58645a; font-size: 12px; font-weight: 600; line-height: 1.35; }
 .tiktok-field > .ant-input,
 .tiktok-field > .ant-input-affix-wrapper,
 .tiktok-field > .ant-input-number,
@@ -386,6 +389,8 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
   .ant-modal-wrap { padding: 12px 10px; }
   .ant-modal-container, .ant-modal-content { max-height: calc(100vh - 24px); padding: 20px !important; }
   .ant-modal { max-width: calc(100vw - 20px); top: 0 !important; }
+  .tiktok-selection-toolbar { align-items: stretch !important; flex-direction: column !important; }
+  .tiktok-selection-toolbar .ant-btn { width: 100%; }
   .login-page { display: block; }
   .login-story { display: none; }
   .login-form-side { min-height: 100vh; padding: 24px; }

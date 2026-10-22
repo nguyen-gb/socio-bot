@@ -70,9 +70,10 @@ export class TasksController {
   retryAction(
     @OrganizationId() organizationId: string,
     @Param('id') id: string,
+    @Body() body: { confirmResultChecked?: boolean } | undefined,
     @CurrentPrincipal() principal: AuthPrincipal,
   ) {
-    return this.tasks.retryAction(organizationId, id, principal.userId);
+    return this.tasks.retryAction(organizationId, id, principal.userId, body?.confirmResultChecked === true);
   }
 
   @Post(':id/cancel')

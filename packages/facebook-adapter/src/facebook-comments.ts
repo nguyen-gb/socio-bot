@@ -1,5 +1,5 @@
 import { normalizeFacebookGroupUrl, normalizeFacebookPostUrl, type ActionResult } from '@socio/contracts';
-import type { PlatformSession } from '@socio/platform-core';
+import { gotoPlatformPage, type PlatformSession } from '@socio/platform-core';
 import type { Locator, Page } from 'playwright';
 import { attachFacebookImages } from './facebook-images';
 
@@ -26,7 +26,7 @@ export class FacebookCommentsAutomation {
     const page = session.page as Page;
     const postUrl = normalizeFacebookPostUrl(inputPostUrl);
     try {
-      await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 });
+      await gotoPlatformPage(page, postUrl, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 });
     } catch {
       return manual('Không tải được bài viết Facebook; chưa quét bình luận.', { postUrl });
     }
@@ -74,7 +74,7 @@ export class FacebookCommentsAutomation {
   async commentGroupPosts(session: PlatformSession, inputGroupUrl: string, text: string, mediaAssetIds: string[] = [], filters: FacebookGroupPostCommentFilters): Promise<ActionResult> {
     const page = session.page as Page;
     const groupUrl = normalizeFacebookGroupUrl(inputGroupUrl);
-    try { await page.goto(groupUrl, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 }); }
+    try { await gotoPlatformPage(page, groupUrl, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 }); }
     catch { return manual('Không tải được nhóm Facebook; chưa bình luận bài viết.', { groupUrl, postsFound: 0, postsCommented: 0 }); }
     const blocked = await guard(page);
     if (blocked) return blocked;
@@ -103,7 +103,7 @@ export class FacebookCommentsAutomation {
   private async commentSinglePost(session: PlatformSession, inputPostUrl: string, text: string, mediaAssetIds: string[]): Promise<ActionResult> {
     const page = session.page as Page;
     const postUrl = normalizeFacebookPostUrl(inputPostUrl);
-    try { await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 }); }
+    try { await gotoPlatformPage(page, postUrl, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 }); }
     catch { return manual('Không tải được bài viết Facebook; chưa bình luận.', { postUrl }); }
     const blocked = await guard(page);
     if (blocked) return blocked;
@@ -156,7 +156,7 @@ export class FacebookCommentsAutomation {
     const page = session.page as Page;
     const postUrl = normalizeFacebookPostUrl(inputPostUrl);
     try {
-      await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: this.timing.mainTimeoutMs ?? 45_000 });
+      await gotoPlatformPage(page, postUrl, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 });
     } catch {
       return manual('Không tải được bài viết Facebook; chưa trả lời bình luận.', { postUrl, repliesRequested: maxReplies, repliesSent: 0 });
     }

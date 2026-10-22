@@ -9,7 +9,10 @@ export interface BrowserTaskActivities {
 }
 
 const { executeBrowserTask } = proxyActivities<BrowserTaskActivities>({
-  startToCloseTimeout: '15 minutes',
+  // Leave teardown/persistence headroom after the browser's own 15-minute
+  // deadline so the activity can checkpoint the timeout instead of Temporal
+  // cutting it off while the task is still RUNNING.
+  startToCloseTimeout: '17 minutes',
   // Keep task execution on the task queue's active worker pool. The local
   // Temporal server may expose SDK build capabilities while no compatible
   // version set is configured; the default intent would otherwise leave the

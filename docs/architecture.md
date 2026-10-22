@@ -24,6 +24,6 @@ Temporal Schedule owns recurring timing. Each occurrence materializes an idempot
 
 ## V1 boundaries
 
-Facebook, Instagram, X and TikTok implement the same adapter contract for health/profile checks. Facebook additionally supports joined-group inventory, reviewed group-join campaigns and reviewed text-post campaigns with account selection and fixed destinations. Generic `PUBLISH_POST` remains disabled. Future platform actions belong in their platform adapter and workspace feature module. Anti-detection, fingerprint spoofing and CAPTCHA bypass are out of scope. See [facebook.md](facebook.md).
+Facebook, Instagram, X and TikTok implement the same adapter contract for health/profile checks. Facebook additionally supports joined-group inventory, reviewed group-join campaigns and reviewed text-post campaigns with account selection and fixed destinations. Generic `PUBLISH_POST` remains disabled. Future platform actions belong in their platform adapter and workspace feature module. Browser-environment emulation is centralized in `@socio/browser-runtime` and persisted with each profile; CAPTCHA bypass remains out of scope. See [facebook.md](facebook.md).
 
 See [workflows.md](./workflows.md), [security.md](./security.md), [api.md](./api.md) and [operations.md](./operations.md).

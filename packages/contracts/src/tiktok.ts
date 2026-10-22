@@ -46,12 +46,17 @@ const tiktokContentFields = {
   name: tiktokCampaignNameSchema,
   text: z.string().trim().max(5_000).default(''),
   mediaAssetIds: facebookMediaIdsSchema,
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
 };
 
 const tiktokVideoTargetFields = {
   ...tiktokContentFields,
   videoUrls: z.array(tiktokVideoUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]),
+  // Internal continuation state. The UI does not expose these fields; they
+  // are populated when a timed-out run is resumed so completed targets are
+  // never submitted a second time.
+  excludeVideoUrls: z.array(tiktokVideoUrlSchema).max(100).optional(),
+  resumeCompletedCount: z.number().int().min(0).max(100).optional(),
 };
 
 function refineTikTokContent(input: { text: string; mediaAssetIds: string[] }, context: z.RefinementCtx) {
@@ -71,10 +76,12 @@ export type CommentTikTokVideosInput = z.infer<typeof commentTikTokVideosSchema>
 const replyTikTokCommentsPayloadShape = {
   name: tiktokCampaignNameSchema,
   videoUrls: z.array(tiktokVideoUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]),
+  excludeVideoUrls: z.array(tiktokVideoUrlSchema).max(100).optional(),
+  resumeCompletedCount: z.number().int().min(0).max(100).optional(),
   text: z.string().trim().max(5_000).default(''),
   mediaAssetIds: facebookMediaIdsSchema,
   maxReplies: z.number().int().min(1).max(50).default(10),
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
 };
 export const replyTikTokCommentsPayloadSchema = z.object(replyTikTokCommentsPayloadShape).superRefine(refineTikTokContent);
 export const replyTikTokCommentsSchema = z.object({ accountId: z.uuid(), ...replyTikTokCommentsPayloadShape }).superRefine(refineTikTokContent);
@@ -83,8 +90,10 @@ export type ReplyTikTokCommentsInput = z.infer<typeof replyTikTokCommentsSchema>
 const likeTikTokCommentsPayloadShape = {
   name: tiktokCampaignNameSchema,
   videoUrls: z.array(tiktokVideoUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]),
+  excludeVideoUrls: z.array(tiktokVideoUrlSchema).max(100).optional(),
+  resumeCompletedCount: z.number().int().min(0).max(100).optional(),
   maxLikes: z.number().int().min(1).max(50).default(10),
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
 };
 export const likeTikTokCommentsPayloadSchema = z.object(likeTikTokCommentsPayloadShape);
 export const likeTikTokCommentsSchema = z.object({ accountId: z.uuid(), ...likeTikTokCommentsPayloadShape });
@@ -95,6 +104,8 @@ const autoCommentTikTokHomePayloadShape = {
   maxVideos: z.number().int().min(1).max(100).default(10),
   minLikes: z.number().int().min(0).max(2_000_000_000).default(0),
   maxLikes: z.number().int().min(0).max(2_000_000_000).optional(),
+  excludeVideoUrls: z.array(tiktokVideoUrlSchema).max(100).optional(),
+  resumeCompletedCount: z.number().int().min(0).max(100).optional(),
 };
 const refineHomeComment = (input: { text: string; mediaAssetIds: string[]; minLikes: number; maxLikes?: number }, context: z.RefinementCtx) => {
   refineTikTokContent(input, context);
@@ -112,7 +123,9 @@ const messageTikTokFollowersPayloadShape = {
   text: z.string().trim().max(5_000).default(''),
   mediaAssetIds: facebookMediaIdsSchema,
   maxFollowers: z.number().int().min(1).max(100).default(20),
-  intervalSeconds: z.number().int().min(60).max(86_400).default(120),
+  intervalSeconds: z.number().int().min(5).max(86_400).default(120),
+  excludeUsernames: z.array(tiktokUsernameSchema).max(100).optional(),
+  resumeCompletedCount: z.number().int().min(0).max(100).optional(),
 };
 
 const refineFollowerMessage = (input: { text: string; mediaAssetIds: string[] }, context: z.RefinementCtx) => {

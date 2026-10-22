@@ -80,7 +80,8 @@ test('message campaign bounds random-member attempts per group and pacing', () =
   assert.equal(parsed.intervalSeconds, 120);
   assert.deepEqual(messageFacebookRecipientsSchema.parse({ ...base, text: 'Tin nhắn', maxRecipientsPerGroup: 10 }).groupUrls, []);
   assert.equal(messageFacebookRecipientsSchema.safeParse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 51 }).success, false);
-  assert.equal(messageFacebookRecipientsSchema.safeParse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 10, intervalSeconds: 30 }).success, false);
+  assert.equal(messageFacebookRecipientsSchema.safeParse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 10, intervalSeconds: 4 }).success, false);
+  assert.equal(messageFacebookRecipientsSchema.safeParse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 10, intervalSeconds: 5 }).success, true);
 });
 
 test('reactor message campaigns accept one post and split the total by profile', () => {

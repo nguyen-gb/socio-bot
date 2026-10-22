@@ -16,7 +16,9 @@ interface ScheduledTaskActivities {
 
 const { materializeScheduledTask, executeBrowserTask } =
   proxyActivities<ScheduledTaskActivities>({
-    startToCloseTimeout: '15 minutes',
+    // The browser deadline is 15 minutes; keep two minutes for teardown and
+    // durable TaskRun/report persistence before Temporal stops the activity.
+    startToCloseTimeout: '17 minutes',
     versioningIntent: 'DEFAULT',
     heartbeatTimeout: '2 minutes',
     retry: {
