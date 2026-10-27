@@ -136,7 +136,7 @@ try {
   await page.getByRole('button', { name: 'Thêm proxy', exact: true }).count();
   for (const width of [768, 390, 360]) {
     await page.setViewportSize({ width, height: 844 });
-    for (const view of ['overview', 'accounts', 'proxies', 'facebook', 'schedules', 'media', 'tasks']) {
+    for (const view of ['overview', 'accounts', 'proxies', 'facebook', 'schedules', 'tasks']) {
       await page.getByLabel('Chọn khu vực quản trị').selectOption(view);
       await fits();
     }
@@ -158,7 +158,7 @@ try {
   assert.ok(await page.getByRole('button', { name: 'Thêm profile', exact: true }).isDisabled());
   assert.ok(await page.getByRole('button', { name: 'Mở browser', exact: true }).first().isDisabled());
   await nav('Facebook');
-  assert.ok(await page.getByRole('button', { name: 'Soạn bài nhóm' }).isDisabled());
+  assert.ok(await page.getByRole('button', { name: 'Tạo chiến dịch', exact: true }).isDisabled());
   role = 'OWNER'; failRead = true;
   await page.reload();
   await page.getByText('Không thể kết nối API thử nghiệm.', { exact: true }).waitFor({ timeout: 15000 });

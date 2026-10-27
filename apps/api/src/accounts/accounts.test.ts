@@ -59,7 +59,7 @@ test('changing platform requires login again, merely resending platform does not
 test('editing a fingerprint persists it without changing credentials', async () => {
   const context = setup();
   const fingerprint = {
-    locale: 'vi-VN', languages: ['vi-VN', 'vi', 'en-US'], timezoneId: 'Asia/Ho_Chi_Minh',
+    locale: 'vi-VN', languages: ['vi-VN', 'vi'], timezoneId: 'Asia/Ho_Chi_Minh',
     viewport: { width: 1440, height: 900 }, colorScheme: 'light', deviceScaleFactor: 1,
     canvas: { signature: 'fixture', noise: [0, 1, 0] },
     webgl: { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel)' },

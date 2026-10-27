@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,7 +7,7 @@ import test from 'node:test';
 import { BrowserRuntime } from './browser-runtime';
 import { LocalObjectStorage, ProfileSnapshotStore } from '@socio/object-storage';
 import { BrowserProcessRegistry } from './browser-process';
-import { loadFingerprintEmulation } from './fingerprint-emulation';
+import { fingerprintLaunchOptions, loadFingerprintEmulation } from './fingerprint-emulation';
 
 test('fingerprint bundle is complete, coherent and stable for each profile', async () => {
   const root = await mkdtemp(join(tmpdir(), 'socio-fingerprint-'));
@@ -35,7 +35,7 @@ test('fingerprint bundle is complete, coherent and stable for each profile', asy
     assert.notEqual(second.seed, first.seed, 'Profiles must have independent bundles');
     assert.equal(first.locale, 'vi-VN');
     assert.deepEqual(first.languages, ['vi-VN', 'vi']);
-    assert.deepEqual(first.features, { canvas: false, webgl: false, gpu: false, userAgent: false, clientHints: false });
+    assert.deepEqual(first.features, { canvas: true, webgl: true, gpu: true, userAgent: false, clientHints: false });
     assert.equal(first.timezoneId, 'Asia/Ho_Chi_Minh');
     assert.deepEqual(first.viewport, { width: 1536, height: 864 });
     assert.match(first.userAgent, /Chrome\/\d+\.0\.0\.0/);
@@ -45,6 +45,116 @@ test('fingerprint bundle is complete, coherent and stable for each profile', asy
     assert.ok(first.canvas.signature.length >= 24);
     assert.match(first.webgl.renderer, /ANGLE/);
     assert.ok(first.gpu.vendor.length > 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('language fallback follows the selected locale without synthetic English', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-language-bundle-'));
+  try {
+    await Promise.all(['german', 'japanese', 'traditional-chinese', 'english'].map((profile) => mkdir(join(root, profile), { recursive: true })));
+    const german = await loadFingerprintEmulation(join(root, 'german'), {
+      locale: 'de-DE',
+      timezoneId: 'Europe/Berlin',
+    });
+    const japanese = await loadFingerprintEmulation(join(root, 'japanese'), {
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+    });
+    const traditionalChinese = await loadFingerprintEmulation(join(root, 'traditional-chinese'), {
+      locale: 'zh-Hant-TW',
+      timezoneId: 'Asia/Taipei',
+    });
+    const english = await loadFingerprintEmulation(join(root, 'english'), {
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+    });
+
+    assert.deepEqual(german.languages, ['de-DE', 'de']);
+    assert.deepEqual(japanese.languages, ['ja-JP', 'ja']);
+    assert.deepEqual(traditionalChinese.languages, ['zh-Hant-TW', 'zh-Hant', 'zh']);
+    assert.deepEqual(english.languages, ['en-US', 'en']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('auto profile settings keep a desktop bundle and refresh Chrome version fields', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-auto-profile-'));
+  const profile = join(root, 'profile');
+  try {
+    await mkdir(profile, { recursive: true });
+    const first = await loadFingerprintEmulation(profile, {
+      locale: 'vi-VN',
+      timezoneId: 'Asia/Ho_Chi_Minh',
+    }, {
+      mode: 'auto',
+      locale: 'vi-VN',
+      languages: ['vi-VN', 'vi'],
+      timezoneId: 'Asia/Ho_Chi_Minh',
+    });
+    assert.equal(first.clientHints.mobile, false);
+    assert.equal(first.features.canvas, true);
+    assert.equal(first.features.webgl, true);
+    assert.equal(first.features.gpu, true);
+    assert.equal(first.features.userAgent, false);
+    assert.equal(first.features.clientHints, false);
+    assert.ok(first.viewport.width >= 1_000);
+    assert.ok(first.viewport.height >= 700);
+
+    const stale = {
+      ...first,
+      userAgent: first.userAgent.replace(/Chrome\/\d+\.0\.0\.0/, 'Chrome/1.0.0.0'),
+      clientHints: {
+        ...first.clientHints,
+        brands: first.clientHints.brands.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24' : '1' })),
+        fullVersionList: first.clientHints.fullVersionList.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : '1.0.0.0' })),
+        uaFullVersion: '1.0.0.0',
+      },
+    };
+    await writeFile(join(profile, 'fingerprint-emulation.json'), `${JSON.stringify(stale)}\n`);
+    const refreshed = await loadFingerprintEmulation(profile, {
+      locale: 'vi-VN',
+      timezoneId: 'Asia/Ho_Chi_Minh',
+    }, {
+      mode: 'auto',
+      locale: 'vi-VN',
+      languages: ['vi-VN', 'vi'],
+      timezoneId: 'Asia/Ho_Chi_Minh',
+    });
+    const major = /Chrome\/(\d+)\.0\.0\.0/.exec(refreshed.userAgent)?.[1];
+    assert.ok(major && major !== '1');
+    assert.equal(refreshed.clientHints.uaFullVersion, `${major}.0.0.0`);
+    assert.equal(refreshed.clientHints.mobile, false);
+    assert.deepEqual(refreshed.viewport, first.viewport);
+    assert.deepEqual(refreshed.gpu, first.gpu);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native profile settings do not override locale or mobile surfaces', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-native-profile-'));
+  try {
+    const profile = join(root, 'profile');
+    await mkdir(profile, { recursive: true });
+    const native = await loadFingerprintEmulation(profile, {
+      locale: 'vi-VN',
+      timezoneId: 'Asia/Ho_Chi_Minh',
+    }, {
+      mode: 'native',
+      localeMode: 'native',
+      locale: 'vi-VN',
+      languages: ['vi-VN', 'vi'],
+      timezoneId: 'Asia/Ho_Chi_Minh',
+    });
+    const options = fingerprintLaunchOptions(native);
+    assert.equal(native.localeMode, 'native');
+    assert.equal('locale' in options, false);
+    assert.equal('timezoneId' in options, false);
+    assert.equal(options.isMobile, false);
+    assert.equal(options.hasTouch, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -69,7 +69,11 @@ export class LoginSessionActivities {
         if (claimed.count !== 1) return complete('CLOSED');
         const platform = requestedSession.profile.account.platform as SupportedPlatform;
         const emulateFingerprint = this.config.get('browserFingerprintEmulation', { infer: true });
-        const fingerprint = emulateFingerprint ? profileFingerprintSettings(requestedSession.profile.metadata) : undefined;
+        const profileFingerprint = emulateFingerprint ? profileFingerprintSettings(requestedSession.profile.metadata) : undefined;
+        const profileControlsBrowser = Boolean(profileFingerprint);
+        const useFingerprint = Boolean(emulateFingerprint && (!profileControlsBrowser || profileFingerprint?.mode !== 'native'));
+        const profileLocale = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.locale;
+        const profileTimezoneId = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.timezoneId;
         const localizedHomeUrl = platformHomeUrlForProfile(platform, requestedSession.profile.metadata);
         Context.current().heartbeat({ stage: 'restoring_profile_snapshot' });
         await this.snapshots.restore(requestedSession.profile);
@@ -87,12 +91,12 @@ export class LoginSessionActivities {
           // uses the same headless policy as campaign execution.
           headless: this.config.get('browserHeadless', { infer: true }),
           channel: this.config.get('browserChannel', { infer: true }),
-          locale: fingerprint?.locale ?? this.config.get('browserLocale', { infer: true }),
-          timezoneId: fingerprint?.timezoneId ?? this.config.get('browserTimezoneId', { infer: true }),
-          colorScheme: fingerprint?.colorScheme ?? this.config.get('browserColorScheme', { infer: true }),
-          viewport: fingerprint?.viewport ?? this.config.get('browserViewport', { infer: true }),
-          emulateFingerprint,
-          fingerprint,
+          locale: profileControlsBrowser ? profileLocale : this.config.get('browserLocale', { infer: true }),
+          timezoneId: profileControlsBrowser ? profileTimezoneId : this.config.get('browserTimezoneId', { infer: true }),
+          colorScheme: profileControlsBrowser ? undefined : this.config.get('browserColorScheme', { infer: true }),
+          viewport: profileControlsBrowser ? undefined : this.config.get('browserViewport', { infer: true }),
+          emulateFingerprint: useFingerprint,
+          fingerprint: useFingerprint ? profileFingerprint : undefined,
           sessionStateOrigins: platformSessionStateOrigins(platform),
         });
         const loginSettings = profileLoginSettings(
@@ -143,7 +147,7 @@ export class LoginSessionActivities {
         const openedState = await this.prisma.browserSession.findUnique({ where: { id: requestedSession.id } });
         if (openedState?.status !== 'RUNNING') return complete('CLOSED');
         await withDeadline(this.gateway.register(requestedSession.id, managed.page), 10_000, 'Remote browser startup timed out');
-        await withDeadline(initializePlatformSession(managed, platform, credentials, { locale: fingerprint?.locale, entryUrl: localizedHomeUrl }), 150_000, 'Login browser initialization timed out');
+        await withDeadline(initializePlatformSession(managed, platform, credentials, { locale: profileLocale, entryUrl: localizedHomeUrl }), 150_000, 'Login browser initialization timed out');
         if (await isPlatformChallenged(managed, platform)) {
           const captcha = await this.anticaptcha?.trySolveVisibleRecaptcha(managed.page);
           if (captcha?.solved) await cancellableDelay(750);

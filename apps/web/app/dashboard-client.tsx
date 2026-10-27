@@ -8,8 +8,8 @@ import {
   Card,
   Checkbox,
   Col,
-  Collapse,
   Divider,
+  Drawer,
   Empty,
   Flex,
   Form,
@@ -22,24 +22,22 @@ import {
   Select,
   Space,
   Statistic,
+  Switch,
   Table,
   Tag,
-  Tooltip,
   Typography,
-  Upload,
-  type ButtonProps,
-  type UploadProps,
 } from 'antd';
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
 import FacebookWorkspace from './facebook-workspace';
 import TikTokWorkspace from './tiktok-workspace';
+import { ActionButton, PageSectionTitle, StatusTag, tablePagination } from './admin-ui';
 import { Icon, STATUS_LABELS, ACTION_LABELS } from './ui';
 import { useToast, useToastError, useToastNotice } from './toast';
 import { ContextNote as Alert } from './context-note';
 
 type Role = 'OWNER' | 'ADMIN' | 'OPERATOR' | 'VIEWER';
-type DashboardView = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'tiktok' | 'schedules' | 'media' | 'tasks';
+type DashboardView = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'tiktok' | 'schedules' | 'tasks';
 
 const NAV_ITEMS: Array<{
   key: DashboardView;
@@ -52,7 +50,6 @@ const NAV_ITEMS: Array<{
   { key: 'facebook', label: 'Facebook', description: 'Nhóm & chiến dịch' },
   { key: 'tiktok', label: 'TikTok', description: 'Search & hành động có duyệt' },
   { key: 'schedules', label: 'Lịch chạy', description: 'Tự động hóa định kỳ' },
-  { key: 'media', label: 'Nội dung', description: 'Thư viện ảnh & video' },
   { key: 'tasks', label: 'Tác vụ', description: 'Theo dõi thực thi' },
 ];
 
@@ -76,65 +73,19 @@ interface Account {
 }
 
 interface BrowserFingerprintConfig {
+  mode?: 'auto' | 'native' | 'custom';
+  localeMode?: 'configured' | 'native';
   locale: string;
   languages: string[];
   timezoneId: string;
-  viewport: { width: number; height: number };
-  colorScheme: 'light' | 'dark' | 'no-preference';
-  deviceScaleFactor: number;
-  features?: {
-    canvas: boolean;
-    webgl: boolean;
-    gpu: boolean;
-    userAgent: boolean;
-    clientHints: boolean;
-  };
-  canvas: { signature: string; noise: [number, number, number] };
-  webgl: { vendor: string; renderer: string };
-  gpu: { vendor: string; architecture: string; device: string; description: string };
-  userAgent: string;
-  clientHints: {
-    brands: Array<{ brand: string; version: string }>;
-    fullVersionList: Array<{ brand: string; version: string }>;
-    mobile: boolean;
-    platform: string;
-    platformVersion: string;
-    architecture: string;
-    bitness: string;
-    model: string;
-    uaFullVersion: string;
-  };
 }
 
 interface FingerprintFormValue {
+  mode: 'auto' | 'native';
+  configureLocale: boolean;
   locale: string;
   languages: string[];
   timezoneId: string;
-  viewport: { width: number; height: number };
-  colorScheme: 'light' | 'dark' | 'no-preference';
-  deviceScaleFactor: number;
-  features: {
-    canvas: boolean;
-    webgl: boolean;
-    gpu: boolean;
-    userAgent: boolean;
-    clientHints: boolean;
-  };
-  canvas: { signature: string; noise: [number, number, number] };
-  webgl: { vendor: string; renderer: string };
-  gpu: { vendor: string; architecture: string; device: string; description: string };
-  userAgent: string;
-  clientHints: {
-    brands: string;
-    fullVersionList: string;
-    mobile: boolean;
-    platform: string;
-    platformVersion: string;
-    architecture: string;
-    bitness: string;
-    model: string;
-    uaFullVersion: string;
-  };
 }
 
 interface ProxyItem {
@@ -170,16 +121,8 @@ interface TaskItem {
   approvalStatus?: string;
   campaignId?: string;
   lastError?: string;
-  runs?: Array<{ result?: { groupCount?: number; complete?: boolean } }>;
+  runs?: Array<{ startedAt?: string; completedAt?: string; result?: { groupCount?: number; complete?: boolean; [key: string]: unknown } }>;
   account: Account;
-}
-
-interface MediaAsset {
-  id: string;
-  fileName: string;
-  contentType: string;
-  sizeBytes: string;
-  status: string;
 }
 
 interface AccountFormValue {
@@ -208,15 +151,15 @@ const fingerprintPresets: Record<string, { languages: string[]; timezones: strin
   'vi-VN': { languages: ['vi-VN', 'vi'], timezones: ['Asia/Ho_Chi_Minh'] },
   'en-US': { languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'] },
   'en-GB': { languages: ['en-GB', 'en'], timezones: ['Europe/London'] },
-  'ja-JP': { languages: ['ja-JP', 'ja', 'en-US'], timezones: ['Asia/Tokyo'] },
-  'ko-KR': { languages: ['ko-KR', 'ko', 'en-US'], timezones: ['Asia/Seoul'] },
-  'th-TH': { languages: ['th-TH', 'th', 'en-US'], timezones: ['Asia/Bangkok'] },
-  'id-ID': { languages: ['id-ID', 'id', 'en-US'], timezones: ['Asia/Jakarta', 'Asia/Makassar', 'Asia/Jayapura'] },
-  'zh-CN': { languages: ['zh-CN', 'zh', 'en-US'], timezones: ['Asia/Shanghai'] },
-  'zh-TW': { languages: ['zh-TW', 'zh', 'en-US'], timezones: ['Asia/Taipei'] },
-  'de-DE': { languages: ['de-DE', 'de', 'en-US'], timezones: ['Europe/Berlin'] },
-  'fr-FR': { languages: ['fr-FR', 'fr', 'en-US'], timezones: ['Europe/Paris'] },
-  'es-ES': { languages: ['es-ES', 'es', 'en-US'], timezones: ['Europe/Madrid'] },
+  'ja-JP': { languages: ['ja-JP', 'ja'], timezones: ['Asia/Tokyo'] },
+  'ko-KR': { languages: ['ko-KR', 'ko'], timezones: ['Asia/Seoul'] },
+  'th-TH': { languages: ['th-TH', 'th'], timezones: ['Asia/Bangkok'] },
+  'id-ID': { languages: ['id-ID', 'id'], timezones: ['Asia/Jakarta', 'Asia/Makassar', 'Asia/Jayapura'] },
+  'zh-CN': { languages: ['zh-CN', 'zh'], timezones: ['Asia/Shanghai'] },
+  'zh-TW': { languages: ['zh-TW', 'zh'], timezones: ['Asia/Taipei'] },
+  'de-DE': { languages: ['de-DE', 'de'], timezones: ['Europe/Berlin'] },
+  'fr-FR': { languages: ['fr-FR', 'fr'], timezones: ['Europe/Paris'] },
+  'es-ES': { languages: ['es-ES', 'es'], timezones: ['Europe/Madrid'] },
 };
 
 function fingerprintPreset(locale: string) {
@@ -226,38 +169,12 @@ function fingerprintPreset(locale: string) {
 
 function defaultFingerprintForm(locale = 'vi-VN'): FingerprintFormValue {
   const preset = fingerprintPreset(locale);
-  // Patchright's bundled Chromium in this demo is Chrome 153; keep the
-  // dashboard's initial bundle coherent with the browser used by the worker.
-  const major = '153';
-  const version = `${major}.0.0.0`;
-  const brands = [
-    { brand: 'Not_A Brand', version: '24' },
-    { brand: 'Chromium', version: major },
-    { brand: 'Google Chrome', version: major },
-  ];
   return {
+    mode: 'auto',
+    configureLocale: true,
     locale,
     languages: [...preset.languages],
     timezoneId: preset.timezones[0] ?? 'UTC',
-    viewport: { width: 1440, height: 900 },
-    colorScheme: 'light',
-    deviceScaleFactor: 1,
-    features: { canvas: false, webgl: false, gpu: false, userAgent: false, clientHints: false },
-    canvas: { signature: 'profile-canvas-v1', noise: [0, 1, 0] },
-    webgl: { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)' },
-    gpu: { vendor: 'intel', architecture: 'gen-9', device: '0x3e92', description: 'Intel(R) UHD Graphics 630' },
-    userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`,
-    clientHints: {
-      brands: JSON.stringify(brands),
-      fullVersionList: JSON.stringify(brands.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : version }))),
-      mobile: false,
-      platform: 'Windows',
-      platformVersion: '15.0.0',
-      architecture: 'x86',
-      bitness: '64',
-      model: '',
-      uaFullVersion: version,
-    },
   };
 }
 
@@ -265,102 +182,28 @@ function fingerprintToForm(value?: BrowserFingerprintConfig): FingerprintFormVal
   if (!value) return defaultFingerprintForm();
   const preset = fingerprintPreset(value.locale);
   return {
-    ...value,
+    mode: value.mode === 'native' ? 'native' : 'auto',
+    configureLocale: value.localeMode !== 'native',
+    locale: value.locale,
     languages: value.languages.filter((language) => preset.languages.includes(language)).length
       ? value.languages.filter((language) => preset.languages.includes(language))
       : [...preset.languages],
     timezoneId: preset.timezones.includes(value.timezoneId) ? value.timezoneId : preset.timezones[0] ?? 'UTC',
-    features: {
-      canvas: value.features?.canvas ?? false,
-      webgl: value.features?.webgl ?? false,
-      gpu: value.features?.gpu ?? false,
-      userAgent: value.features?.userAgent ?? false,
-      clientHints: value.features?.clientHints ?? false,
-    },
-    clientHints: {
-      ...value.clientHints,
-      brands: JSON.stringify(value.clientHints.brands),
-      fullVersionList: JSON.stringify(value.clientHints.fullVersionList),
-    },
   };
-}
-
-function parseClientHintBrands(value: string, label: string): Array<{ brand: string; version: string }> {
-  let parsed: unknown;
-  try { parsed = JSON.parse(value); }
-  catch { throw new Error(`${label} phải là JSON hợp lệ`); }
-  if (!Array.isArray(parsed) || !parsed.every((item) => item && typeof item === 'object' && typeof (item as { brand?: unknown }).brand === 'string' && typeof (item as { version?: unknown }).version === 'string')) {
-    throw new Error(`${label} phải là mảng gồm brand và version`);
-  }
-  return parsed as Array<{ brand: string; version: string }>;
 }
 
 function normalizeFingerprintForm(value: Partial<FingerprintFormValue>): BrowserFingerprintConfig {
   const defaults = defaultFingerprintForm(value.locale ?? 'vi-VN');
-  const merged: FingerprintFormValue = {
-    ...defaults,
-    ...value,
-    viewport: { ...defaults.viewport, ...(value.viewport ?? {}) },
-    features: { ...defaults.features, ...(value.features ?? {}) },
-    canvas: { ...defaults.canvas, ...(value.canvas ?? {}) },
-    webgl: { ...defaults.webgl, ...(value.webgl ?? {}) },
-    gpu: { ...defaults.gpu, ...(value.gpu ?? {}) },
-    clientHints: { ...defaults.clientHints, ...(value.clientHints ?? {}) },
-  } as FingerprintFormValue;
+  const merged = { ...defaults, ...value };
   const preset = fingerprintPreset(merged.locale);
   const languages = merged.languages.filter((language) => preset.languages.includes(language));
   return {
-    ...merged,
+    mode: merged.mode,
+    localeMode: merged.configureLocale ? 'configured' : 'native',
+    locale: merged.locale,
     languages: languages.length ? languages : [...preset.languages],
     timezoneId: preset.timezones.includes(merged.timezoneId) ? merged.timezoneId : preset.timezones[0] ?? 'UTC',
-    features: { ...merged.features },
-    clientHints: {
-      ...merged.clientHints,
-      brands: parseClientHintBrands(merged.clientHints.brands, 'Client Hints brands'),
-      fullVersionList: parseClientHintBrands(merged.clientHints.fullVersionList, 'Client Hints fullVersionList'),
-    },
   };
-}
-
-type FingerprintFeatureKey = keyof FingerprintFormValue['features'];
-
-function randomFingerprintId(size = 16): string {
-  const bytes = new Uint8Array(size);
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(bytes);
-  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
-  return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
-}
-
-const realisticGpuPresets = [
-  { webglVendor: 'Google Inc. (Intel)', webglRenderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)', vendor: 'intel', architecture: 'gen-9', device: '0x3e92', description: 'Intel(R) UHD Graphics 630' },
-  { webglVendor: 'Google Inc. (NVIDIA)', webglRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)', vendor: 'nvidia', architecture: 'ampere', device: '0x2503', description: 'NVIDIA GeForce RTX 3060' },
-  { webglVendor: 'Google Inc. (AMD)', webglRenderer: 'ANGLE (AMD, AMD Radeon RX 6600 XT (0x000073FF) Direct3D11 vs_5_0 ps_5_0, D3D11)', vendor: 'amd', architecture: 'rdna-2', device: '0x73ff', description: 'AMD Radeon RX 6600 XT' },
-] as const;
-
-function randomizeFingerprintFeature(value: FingerprintFormValue, feature: FingerprintFeatureKey): FingerprintFormValue {
-  const next = { ...value, features: { ...value.features, [feature]: true } };
-  if (feature === 'canvas') {
-    next.canvas = { signature: `profile-canvas-${randomFingerprintId(16)}`, noise: [Math.floor(Math.random() * 2), Math.floor(Math.random() * 2), Math.floor(Math.random() * 2)] as [number, number, number] };
-    if (next.canvas.noise.every((item) => item === 0)) next.canvas.noise[2] = 1;
-  }
-  if (feature === 'webgl' || feature === 'gpu') {
-    const preset = realisticGpuPresets[Math.floor(Math.random() * realisticGpuPresets.length)]!;
-    next.webgl = { vendor: preset.webglVendor, renderer: preset.webglRenderer };
-    next.gpu = { vendor: preset.vendor, architecture: preset.architecture, device: preset.device, description: preset.description };
-  }
-  if (feature === 'userAgent' || feature === 'clientHints') {
-    const major = String(152 + Math.floor(Math.random() * 4));
-    const version = `${major}.0.0.0`;
-    const brands = [{ brand: 'Not_A Brand', version: '24' }, { brand: 'Chromium', version: major }, { brand: 'Google Chrome', version: major }];
-    next.userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
-    next.clientHints = {
-      ...next.clientHints,
-      brands: JSON.stringify(brands),
-      fullVersionList: JSON.stringify(brands.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : version }))),
-      platform: 'Windows', platformVersion: '15.0.0', architecture: 'x86', bitness: '64', model: '', uaFullVersion: version,
-    };
-  }
-  return next;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -391,20 +234,10 @@ function errorMessage(message: string | string[] | undefined, status: number) {
   return message ?? `Yêu cầu thất bại (${status.toString()})`;
 }
 
-type ActionIconName = 'open' | 'close' | 'edit' | 'delete' | 'test' | 'play' | 'pause' | 'approve' | 'reject' | 'logout' | 'refresh';
-
-function ActionIcon({ name }: { name: ActionIconName }) {
-  return <Icon name={name} size={17} />;
-}
-
-function ActionButton({ label, icon, ...props }: Omit<ButtonProps, 'children' | 'icon'> & { label: string; icon: ActionIconName }) {
-  return (
-    <Tooltip title={label}>
-      <span className="action-tooltip">
-        <Button {...props} aria-label={label} icon={<ActionIcon name={icon} />} />
-      </span>
-    </Tooltip>
-  );
+function formatProxyLatency(latencyMs?: number | null) {
+  if (latencyMs == null) return 'Chưa kiểm tra';
+  if (latencyMs >= 1000) return `${(latencyMs / 1000).toFixed(latencyMs >= 10_000 ? 1 : 2)} s`;
+  return `${latencyMs.toLocaleString('vi-VN')} ms`;
 }
 
 export default function DashboardClient() {
@@ -455,19 +288,15 @@ export default function DashboardClient() {
   const [accountStatus, setAccountStatus] = useState('ALL');
   const [proxySearch, setProxySearch] = useState('');
   const [taskStatus, setTaskStatus] = useState<string>('ALL');
+  const [taskAction, setTaskAction] = useState<string>('ALL');
+  const [taskAccount, setTaskAccount] = useState<string>('ALL');
+  const [taskDateRange, setTaskDateRange] = useState<string>('ALL');
+  const [selectedTask, setSelectedTask] = useState<TaskItem>();
   const [scheduleName, setScheduleName] = useState('');
   const [scheduleAccount, setScheduleAccount] = useState<string>();
   const [scheduleCron, setScheduleCron] = useState('0 * * * *');
   const [scheduleTimezone, setScheduleTimezone] = useState('Asia/Bangkok');
   const [scheduleAction, setScheduleAction] = useState('HEALTH_CHECK');
-  const setFingerprintFeature = (feature: FingerprintFeatureKey, enabled: boolean) => {
-    const current = (accountForm.getFieldValue('fingerprint') as FingerprintFormValue | undefined) ?? defaultFingerprintForm();
-    const next = enabled
-      ? randomizeFingerprintFeature(current, feature)
-      : { ...current, features: { ...current.features, [feature]: false } };
-    accountForm.setFieldsValue({ fingerprint: next });
-  };
-
   const accounts = useQuery({
     queryKey: ['accounts'],
     queryFn: () => getJson<Account[]>('/api/control/accounts'),
@@ -488,10 +317,6 @@ export default function DashboardClient() {
   const tasks = useQuery({
     queryKey: ['tasks'],
     queryFn: () => getJson<TaskItem[]>('/api/control/tasks'),
-  });
-  const media = useQuery({
-    queryKey: ['media'],
-    queryFn: () => getJson<MediaAsset[]>('/api/media'),
   });
   const me = useQuery({
     queryKey: ['me'],
@@ -523,15 +348,33 @@ export default function DashboardClient() {
     );
   }, [proxies.data, proxySearch]);
   const filteredTasks = useMemo(
-    () =>
-      (tasks.data ?? []).filter(
-        (task) => taskStatus === 'ALL' || task.status === taskStatus,
-      ),
-    [tasks.data, taskStatus],
+    () => {
+      const cutoff = taskDateRange === '7D'
+        ? Date.now() - 7 * 24 * 60 * 60 * 1000
+        : taskDateRange === '30D'
+          ? Date.now() - 30 * 24 * 60 * 60 * 1000
+          : undefined;
+      return (tasks.data ?? []).filter((task) =>
+        (taskStatus === 'ALL' || task.status === taskStatus)
+        && (taskAction === 'ALL' || task.action === taskAction)
+        && (taskAccount === 'ALL' || task.account.id === taskAccount)
+        && (cutoff === undefined || new Date(task.createdAt).getTime() >= cutoff),
+      );
+    },
+    [taskAccount, taskAction, taskDateRange, taskStatus, tasks.data],
   );
   const currentView = NAV_ITEMS.find((item) => item.key === activeView)!;
   const setupProgress = [accountRows.length > 0, accountRows.some(account => account.status === 'READY'), (tasks.data ?? []).length > 0]
     .filter(Boolean).length;
+  const taskActionOptions = useMemo(
+    () => [...new Set((tasks.data ?? []).map((task) => task.action))].map((value) => ({ value, label: ACTION_LABELS[value] ?? value })),
+    [tasks.data],
+  );
+  const taskAccountOptions = useMemo(
+    () => [...new Map((tasks.data ?? []).map((task) => [task.account.id, task.account.username ?? task.account.id]))]
+      .map(([value, label]) => ({ value, label })),
+    [tasks.data],
+  );
   const perform = async <T,>(
     key: string,
     operation: () => Promise<T>,
@@ -801,32 +644,13 @@ export default function DashboardClient() {
     }
   };
 
-  const uploadProps: UploadProps = {
-    accept: 'image/jpeg,image/png,image/webp,video/mp4',
-    showUploadList: false,
-    customRequest: async ({ file, onError, onSuccess }) => {
-      try {
-        const body = new FormData();
-        body.set('file', file as File);
-        const response = await fetch('/api/media', { method: 'POST', body });
-        if (!response.ok) throw new Error('Không thể tải media lên');
-        await cache.invalidateQueries({ queryKey: ['media'] });
-        onSuccess?.({});
-        message.success('Đã tải nội dung lên');
-      } catch (caught) {
-        message.error(caught instanceof Error ? caught.message : String(caught));
-        onError?.(caught instanceof Error ? caught : new Error(String(caught)));
-      }
-    },
-  };
-
   const queryError =
     accounts.error?.message ??
     proxies.error?.message ??
     sessions.error?.message ??
-    schedules.error?.message ?? tasks.error?.message ?? media.error?.message ?? me.error?.message;
+    schedules.error?.message ?? tasks.error?.message ?? me.error?.message;
   useToastNotice(queryError, 'dashboard-load-error', 'error',
-    ![accounts, proxies, sessions, schedules, tasks, media, me].some(query => query.isFetching));
+    ![accounts, proxies, sessions, schedules, tasks, me].some(query => query.isFetching));
 
   return (
     <Layout className="app-shell">
@@ -840,7 +664,7 @@ export default function DashboardClient() {
           <span><strong>Socio Workspace</strong><small>Không gian quản lý của bạn</small></span>
         </div>
         <div className="nav-label">Quản trị</div>
-        <nav className="nav">
+        <nav className="nav" aria-label="Điều hướng chính">
           {NAV_ITEMS.map((item, index) => <div key={item.key}>{index === 3 ? <div className="nav-label nav-group">Tự động hóa</div> : null}
             <button
               key={item.key}
@@ -877,7 +701,7 @@ export default function DashboardClient() {
           </select>
           <div className="topbar-actions">
             <ActionButton label="Làm mới dữ liệu" icon="refresh" type="text" loading={accounts.isFetching} onClick={() => void cache.invalidateQueries()} />
-            <span className={`live-indicator ${queryError ? 'offline' : ''}`}><i />{queryError ? 'Lỗi tải dữ liệu' : accounts.isLoading ? 'Đang đồng bộ' : 'Đã đồng bộ'}</span>
+            <span className={`live-indicator ${queryError ? 'offline' : ''}`} role="status" aria-live="polite"><i />{queryError ? 'Lỗi tải dữ liệu' : accounts.isLoading ? 'Đang đồng bộ' : 'Đã đồng bộ'}</span>
             <span className="topbar-divider" />
             <Avatar size={30}>{(me.data?.email ?? 'O').slice(0, 1).toUpperCase()}</Avatar>
             <div className="user-meta">
@@ -908,11 +732,17 @@ export default function DashboardClient() {
             </Space>
           ) : null}
         </Flex>
+        {queryError ? <Alert
+          className="connection-alert"
+          title="Một số dữ liệu chưa tải được"
+          description={`Chi tiết: ${queryError}`}
+          action={<Button size="small" onClick={() => void cache.invalidateQueries()}>Thử lại</Button>}
+        /> : null}
 
 
         {activeView === 'facebook' ? <div id="facebook" className="dashboard-row"><FacebookWorkspace accounts={accountRows} canOperate={canOperate} canAdmin={canAdmin} onNavigateProfiles={() => navigate('accounts')} /></div> : null}
         {activeView === 'tiktok' ? <div id="tiktok" className="dashboard-row"><TikTokWorkspace accounts={accountRows} canOperate={canOperate} canAdmin={canAdmin} onNavigateProfiles={() => navigate('accounts')} /></div> : null}
-        {activeView === 'overview' ? <div className="overview-welcome"><div><span className="welcome-kicker">VẬN HÀNH ĐƠN GIẢN HƠN</span><h3>Mọi tài khoản. Một không gian.</h3><p>Quản lý profile, kết nối và chiến dịch từ một nơi — rõ ràng ở từng bước.</p><Button onClick={() => navigate('facebook')} icon={<Icon name="arrow" />}>Đến chiến dịch Facebook</Button></div><div className="welcome-summary"><span className="welcome-orbit"><Icon name="accounts" size={34} /></span><strong>{accountRows.filter(x => x.status === 'READY').length}<small>profile sẵn sàng</small></strong></div></div> : null}
+        {activeView === 'overview' && setupProgress < 3 ? <div className="overview-welcome"><div><span className="welcome-kicker">VẬN HÀNH ĐƠN GIẢN HƠN</span><h3>Mọi tài khoản. Một không gian.</h3><p>Hoàn tất vài bước để bắt đầu theo dõi profile, kết nối và chiến dịch từ một nơi.</p><Button onClick={() => navigate('facebook')} icon={<Icon name="arrow" />}>Đến chiến dịch Facebook</Button></div></div> : null}
         {activeView === 'overview' ? <>
         <Row gutter={[14, 14]} className="stats-grid">
           <Col xs={12} xl={6}><Card className="metric-card"><span className="metric-icon"><Icon name="accounts" /></span><Statistic title="Tổng profiles" value={accountRows.length} /><small>{accountRows.filter((x) => x.status === 'READY').length} sẵn sàng</small></Card></Col>
@@ -925,7 +755,7 @@ export default function DashboardClient() {
           <Col xs={24} xl={16}>
             <Card
               className="overview-card"
-              title={<SectionTitle title="Browser đang hoạt động" description="Phiên thao tác thủ công và browser đang chạy tác vụ" />}
+              title={<PageSectionTitle title="Browser đang hoạt động" description="Phiên thao tác thủ công và browser đang chạy tác vụ" />}
               extra={<Button type="link" onClick={() => navigate('accounts')}>Xem profiles →</Button>}
             >
               {activeSessions.length ? (
@@ -934,7 +764,7 @@ export default function DashboardClient() {
                     <div className="session-item" key={session.id}>
                       <span className="session-platform">{session.account.platform.slice(0, 1)}</span>
                       <div><strong>{session.account.username ?? session.account.id}</strong><small>{session.mode === 'AUTOMATION' ? 'Đang chạy tác vụ' : session.account.platform}{session.processId ? ` · PID ${session.processId}` : ''} · hết hạn {new Date(session.expiresAt).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}</small></div>
-                      {statusTag(session.status)}
+                      <StatusTag value={session.status} />
                       <ActionButton label="Mở lại browser" icon="open" disabled={!canOperate || session.status === 'CLOSING' || session.mode === 'AUTOMATION'} onClick={() => router.push(`/sessions/${session.id}`)} />
                       <ActionButton label={session.status === 'CLOSING' ? 'Ép đóng browser' : 'Đóng browser'} icon="close" danger type="text" disabled={!canOperate} loading={busy === `close-${session.id}`} onClick={() => void closeBrowser(session)} />
                     </div>
@@ -948,7 +778,7 @@ export default function DashboardClient() {
             </Card>
           </Col>
           <Col xs={24} xl={8}>
-            <Card className="overview-card setup-card" title={<SectionTitle title="Bắt đầu cùng Socio" description="Ba bước để chạy chiến dịch đầu tiên" />}>
+            {setupProgress === 3 ? <div className="overview-ready-strip"><span className="ready-check">✓</span><div><strong>Workspace đã sẵn sàng</strong><small>Profile, kết nối và tác vụ đã được thiết lập.</small></div><Button type="link" onClick={() => navigate('facebook')}>Đến chiến dịch →</Button></div> : <Card className="overview-card setup-card" title={<PageSectionTitle title="Bắt đầu cùng Socio" description="Ba bước để chạy chiến dịch đầu tiên" />}>
               <div className="setup-progress">
                 <strong>{setupProgress}/3 bước hoàn tất</strong>
                 <span>{Math.round((setupProgress / 3) * 100)}%</span>
@@ -965,7 +795,7 @@ export default function DashboardClient() {
                   <small>→</small>
                 </button>
               ))}
-            </Card>
+            </Card>}
           </Col>
         </Row>
         </> : null}
@@ -973,14 +803,14 @@ export default function DashboardClient() {
         {activeView === 'accounts' ? <Card
           id="accounts"
           className="dashboard-row resource-card"
-          title={<SectionTitle title="Danh sách profiles" description={`${accountRows.length} profile · mỗi profile có dữ liệu trình duyệt riêng`} />}
+          title={<PageSectionTitle title="Danh sách profiles" description={`${accountRows.length} profile · mỗi profile có dữ liệu trình duyệt riêng`} />}
           extra={<Space className="card-toolbar"><Input.Search aria-label="Tìm profile" allowClear value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} placeholder="Tìm profile hoặc proxy..." /><Select aria-label="Lọc trạng thái profile" className="status-filter" value={accountStatus} onChange={setAccountStatus} options={['ALL', 'READY', 'LOGIN_REQUIRED', 'CHALLENGED', 'RUNNING', 'ERROR'].map(value => ({ value, label: value === 'ALL' ? 'Mọi trạng thái' : STATUS_LABELS[value] }))} /><Button icon={<Icon name="plus" />} type="primary" disabled={!canAdmin} onClick={openAccountModal}>Thêm profile</Button></Space>}
         >
           <Table
             rowKey="id"
             loading={accounts.isLoading}
             dataSource={filteredAccounts}
-            pagination={{ pageSize: 8, hideOnSinglePage: true, showTotal: (total) => `${total} profile` }}
+            pagination={tablePagination('profile')}
             size="middle"
             scroll={{ x: 850 }}
             locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={accountSearch ? 'Không tìm thấy profile phù hợp' : 'Chưa có profile nào'} /> }}
@@ -997,7 +827,7 @@ export default function DashboardClient() {
               },
               { title: 'Nền tảng', dataIndex: 'platform', render: (value: string) => <Tag>{value}</Tag> },
               { title: 'Đăng nhập', width: 190, render: (_: unknown, item: Account) => loginFlow(item.browserProfile) },
-              { title: 'Trạng thái', dataIndex: 'status', render: statusTag },
+              { title: 'Trạng thái', dataIndex: 'status', render: (value: string) => <StatusTag value={value} /> },
               { title: 'Proxy', render: (_: unknown, item: Account) => item.proxyBinding?.proxy.name ?? <span className="muted">Không dùng</span> },
               {
                 title: 'Thao tác',
@@ -1051,14 +881,14 @@ export default function DashboardClient() {
         {activeView === 'proxies' ? <Card
           id="proxies"
           className="dashboard-row resource-card"
-          title={<SectionTitle title="Hạ tầng proxy" description={`${(proxies.data ?? []).length} proxy · có thể phân bổ cho nhiều profile`} />}
+          title={<PageSectionTitle title="Hạ tầng proxy" description={`${(proxies.data ?? []).length} proxy · có thể phân bổ cho nhiều profile`} />}
           extra={<Space className="card-toolbar"><Input.Search aria-label="Tìm proxy" allowClear value={proxySearch} onChange={(event) => setProxySearch(event.target.value)} placeholder="Tìm tên hoặc địa chỉ proxy..." /><Button icon={<Icon name="plus" />} type="primary" disabled={!canAdmin} onClick={openProxyModal}>Thêm proxy</Button></Space>}
         >
           <Table
             rowKey="id"
             loading={proxies.isLoading}
             dataSource={filteredProxies}
-            pagination={{ pageSize: 8, hideOnSinglePage: true, showTotal: (total) => `${total} proxy` }}
+            pagination={tablePagination('proxy')}
             size="middle"
             scroll={{ x: 1075 }}
             locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={proxySearch ? 'Không tìm thấy proxy phù hợp' : 'Chưa có proxy'} /> }}
@@ -1066,8 +896,8 @@ export default function DashboardClient() {
               { title: 'Tên', width: 150, dataIndex: 'name', render: (value: string) => <strong>{value}</strong> },
               { title: 'Địa chỉ', width: 290, render: (_: unknown, item: ProxyItem) => <code>{`${item.protocol.toLowerCase()}://${item.host}:${item.port.toString()}`}</code> },
               { title: 'Xác thực', width: 105, render: (_: unknown, item: ProxyItem) => item.hasAuthentication ? <Tag>Có xác thực</Tag> : <span className="muted">Không</span> },
-              { title: 'Trạng thái', width: 125, dataIndex: 'status', render: statusTag },
-              { title: 'Độ trễ', width: 85, render: (_: unknown, item: ProxyItem) => item.latencyMs === undefined || item.latencyMs === null ? '-' : `${item.latencyMs.toString()} ms` },
+              { title: 'Trạng thái', width: 125, dataIndex: 'status', render: (value: string) => <StatusTag value={value} labels={{ HEALTHY: 'Kết nối được', UNHEALTHY: 'Không kết nối', UNKNOWN: 'Chưa kiểm tra' }} /> },
+              { title: 'Chất lượng', width: 105, render: (_: unknown, item: ProxyItem) => <span className={item.latencyMs != null && item.latencyMs >= 1500 ? 'proxy-latency proxy-latency-warning' : 'proxy-latency'}>{formatProxyLatency(item.latencyMs)}</span> },
               {
                 title: 'Profile đang dùng',
                 width: 200,
@@ -1105,7 +935,7 @@ export default function DashboardClient() {
           />
         </Card> : null}
 
-        {activeView === 'schedules' ? <Card id="schedules" className="dashboard-row resource-card" title={<SectionTitle title="Lịch chạy" description="Kiểm tra phiên và profile theo lịch định kỳ." />} extra={<Button type="primary" icon={<Icon name="plus" />} disabled={!canOperate} onClick={() => { setError(undefined); setScheduleModalOpen(true); }}>Tạo lịch</Button>}>
+        {activeView === 'schedules' ? <Card id="schedules" className="dashboard-row resource-card" title={<PageSectionTitle title="Lịch chạy" description="Kiểm tra phiên và profile theo lịch định kỳ." />} extra={<Button type="primary" icon={<Icon name="plus" />} disabled={!canOperate} onClick={() => { setError(undefined); setScheduleModalOpen(true); }}>Tạo lịch</Button>}>
           <Modal title="Tạo lịch tự động" open={scheduleModalOpen} onCancel={() => { if (!busy) setScheduleModalOpen(false); }} width={720} footer={<Button className="schedule-submit" type="primary" disabled={!canOperate || !scheduleName.trim() || !scheduleAccount} loading={busy === 'schedule-create'} onClick={() => void createSchedule()}>Tạo lịch</Button>}>
           <div className="form-row">
             <div className="compact-field"><span>Tên lịch</span><Input aria-label="Tên lịch" value={scheduleName} placeholder="Ví dụ: Kiểm tra mỗi giờ" onChange={(event) => setScheduleName(event.target.value)} /></div>
@@ -1115,7 +945,7 @@ export default function DashboardClient() {
             <div className="compact-field"><span>Tác vụ</span><Select aria-label="Tác vụ cho lịch" value={scheduleAction} onChange={setScheduleAction} options={['HEALTH_CHECK', 'GET_PROFILE'].map((value) => ({ value, label: ACTION_LABELS[value] }))} /></div>
           </div>
           </Modal>
-          <Table rowKey="id" dataSource={schedules.data ?? []} pagination={{ pageSize: 6, hideOnSinglePage: true }} scroll={{ x: 900 }} columns={[
+          <Table size="middle" rowKey="id" dataSource={schedules.data ?? []} pagination={tablePagination('lịch')} scroll={{ x: 900 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có lịch chạy nào"><Button type="primary" icon={<Icon name="plus" />} disabled={!canOperate} onClick={() => { setError(undefined); setScheduleModalOpen(true); }}>Tạo lịch chạy</Button></Empty> }} columns={[
             { title: 'Tên', dataIndex: 'name' },
             { title: 'Tài khoản', render: (_: unknown, item: ScheduleItem) => item.account.username ?? item.account.id },
             { title: 'Cron', render: (_: unknown, item: ScheduleItem) => <code>{`${item.cronExpression} · ${item.timezone}`}</code> },
@@ -1126,40 +956,43 @@ export default function DashboardClient() {
           ]} />
         </Card> : null}
 
-        {activeView === 'media' ? <Card id="media" className="dashboard-row resource-card" title={<SectionTitle title="Thư viện nội dung" description="Quản lý media và chuyển đến khu vực soạn chiến dịch." />}>
-          <Row gutter={[18, 18]} className="composer-grid">
-            <Col xs={24} xl={16}>
-              <div className="composer-panel">
-                <span className="summary-icon"><Icon name="media" size={28} /></span>
-                <Typography.Title level={4} style={{ margin: 0 }}>Nội dung cho chiến dịch</Typography.Title>
-                <Typography.Paragraph type="secondary" style={{ margin: 0 }}>Tải ảnh và video vào thư viện để quản lý tập trung. Đăng bài vào nhóm được thực hiện trong khu vực Facebook, nơi bạn chọn profile và nhóm đích; bài đăng được lên lịch ngay sau khi tạo.</Typography.Paragraph>
-                <Alert type="info" showIcon title="Chiến dịch nhóm hỗ trợ bài chữ và ảnh." description="Chọn ảnh từ thư viện hoặc tải ảnh trong Soạn bài nhóm. Hỗ trợ JPG, PNG, WebP; tối đa 10 ảnh, 10 MB/ảnh. Chưa hỗ trợ video và đăng lên trang cá nhân." />
-                <Flex><Button type="primary" icon={<Icon name="arrow" />} onClick={() => navigate('facebook')}>Soạn bài nhóm Facebook</Button></Flex>
-              </div>
-            </Col>
-            <Col xs={24} xl={8}>
-              <div className="media-library">
-                <Flex justify="space-between" align="center"><div><strong>Thư viện media</strong><small>{(media.data ?? []).length} tệp đã tải lên</small></div><Upload {...uploadProps} disabled={!canOperate}><Button icon={<Icon name="upload" />} disabled={!canOperate}>Tải lên</Button></Upload></Flex>
-                {(media.data ?? []).length ? (media.data ?? []).slice(0, 8).map((asset) => (
-                  <div className="media-item" key={asset.id}><span>{asset.contentType.startsWith('video/') ? '▶' : '▧'}</span><div><strong>{asset.fileName}</strong><small>{asset.contentType} · {formatBytes(asset.sizeBytes)}</small></div>{statusTag(asset.status)}</div>
-                )) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có media" />}
-              </div>
-            </Col>
-          </Row>
-        </Card> : null}
-
-        {activeView === 'tasks' ? <Card id="tasks" className="dashboard-row resource-card" title={<SectionTitle title="Tác vụ gần đây" description="Theo dõi thực thi và các tác vụ cần xử lý." />} extra={<Select aria-label="Lọc trạng thái tác vụ" className="status-filter" value={taskStatus} onChange={setTaskStatus} options={['ALL', 'DRAFT', 'PAUSED', 'SCHEDULED', 'QUEUED', 'RUNNING', 'REQUIRES_ACTION', 'SUCCEEDED', 'FAILED', 'CANCELLED'].map((value) => ({ value, label: value === 'ALL' ? 'Tất cả trạng thái' : STATUS_LABELS[value] }))} />}>
-          <Table rowKey="id" loading={tasks.isLoading} dataSource={filteredTasks} pagination={{ pageSize: 10, hideOnSinglePage: true }} size="middle" scroll={{ x: 800 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có tác vụ phù hợp" /> }} columns={[
-            { title: 'Tài khoản', render: (_: unknown, item: TaskItem) => item.account.username ?? item.account.id },
-            { title: 'Tác vụ', dataIndex: 'action', render: (value: string) => ACTION_LABELS[value] ?? value },
-            { title: 'Trạng thái', dataIndex: 'status', render: statusTag },
-            { title: 'Phê duyệt', dataIndex: 'approvalStatus', render: (value: string) => STATUS_LABELS[value] ?? value },
-            { title: 'Ngày tạo', render: (_: unknown, item: TaskItem) => new Date(item.createdAt).toLocaleString('vi-VN') },
-            { title: 'Chi tiết', render: (_: unknown, item: TaskItem) => <Space orientation="vertical" size={2}>{item.action === 'SYNC_FACEBOOK_GROUPS' && typeof item.runs?.[0]?.result?.groupCount === 'number' ? <Typography.Text>Đã đồng bộ {item.runs[0].result.groupCount} nhóm{item.runs[0].result.complete === false ? ' · Chưa đọc hết danh sách' : ''}</Typography.Text> : null}<Typography.Text type="secondary">{item.lastError ?? (item.action === 'SYNC_FACEBOOK_GROUPS' && item.runs?.[0]?.result?.complete ? 'Đã quét hết danh sách nhóm Facebook tải được.' : '—')}</Typography.Text>{!item.campaignId && item.approvalStatus === 'PENDING' ? <Space><ActionButton label="Duyệt" icon="approve" disabled={!canAdmin} onClick={() => void perform(`approve-${item.id}`, () => mutate(`/api/tasks/${item.id}/approve`), ['tasks'])} /><ActionButton label="Từ chối" icon="reject" danger disabled={!canAdmin} onClick={() => void perform(`reject-${item.id}`, () => mutate(`/api/tasks/${item.id}/reject`), ['tasks'])} /></Space> : null}</Space> },
+        {activeView === 'tasks' ? <Card id="tasks" className="dashboard-row resource-card" title={<PageSectionTitle title="Tác vụ gần đây" description="Theo dõi thực thi và các tác vụ cần xử lý." />} extra={<Space className="card-toolbar"><Select aria-label="Lọc trạng thái tác vụ" className="status-filter" value={taskStatus} onChange={setTaskStatus} options={['ALL', 'DRAFT', 'PAUSED', 'SCHEDULED', 'QUEUED', 'RUNNING', 'REQUIRES_ACTION', 'SUCCEEDED', 'FAILED', 'CANCELLED'].map((value) => ({ value, label: value === 'ALL' ? 'Tất cả trạng thái' : STATUS_LABELS[value] }))} /><Select aria-label="Lọc tác vụ theo loại" className="status-filter" value={taskAction} onChange={setTaskAction} options={[{ value: 'ALL', label: 'Mọi loại tác vụ' }, ...taskActionOptions]} /><Select aria-label="Lọc tác vụ theo profile" className="status-filter" value={taskAccount} onChange={setTaskAccount} options={[{ value: 'ALL', label: 'Mọi profile' }, ...taskAccountOptions]} /><Select aria-label="Lọc tác vụ theo thời gian" className="status-filter" value={taskDateRange} onChange={setTaskDateRange} options={[{ value: 'ALL', label: 'Mọi thời gian' }, { value: '7D', label: '7 ngày qua' }, { value: '30D', label: '30 ngày qua' }]} /></Space>}>
+          <Table className="tasks-table" rowKey="id" loading={tasks.isLoading} dataSource={filteredTasks} pagination={tablePagination('tác vụ')} size="middle" scroll={{ x: 1_270 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có tác vụ phù hợp" /> }} columns={[
+            { title: 'Tài khoản', width: 160, ellipsis: true, render: (_: unknown, item: TaskItem) => item.account.username ?? item.account.id },
+            { title: 'Tác vụ', width: 210, ellipsis: true, dataIndex: 'action', render: (value: string) => ACTION_LABELS[value] ?? value },
+            { title: 'Trạng thái', width: 120, dataIndex: 'status', render: (value: string) => <StatusTag value={value} /> },
+            { title: 'Phê duyệt', width: 110, dataIndex: 'approvalStatus', render: (value: string) => STATUS_LABELS[value] ?? value },
+            { title: 'Ngày tạo', width: 150, render: (_: unknown, item: TaskItem) => new Date(item.createdAt).toLocaleString('vi-VN') },
+            { title: 'Chi tiết', width: 520, render: (_: unknown, item: TaskItem) => <div className="task-detail-cell">{item.action === 'SYNC_FACEBOOK_GROUPS' && typeof item.runs?.[0]?.result?.groupCount === 'number' ? <Typography.Text>Đã đồng bộ {item.runs[0].result.groupCount} nhóm{item.runs[0].result.complete === false ? ' · Chưa đọc hết danh sách' : ''}</Typography.Text> : null}{item.lastError ? <Typography.Text type="secondary" className="task-error" title={item.lastError}>{summarizeTaskError(item.lastError)}</Typography.Text> : item.action === 'SYNC_FACEBOOK_GROUPS' && item.runs?.[0]?.result?.complete ? <Typography.Text type="secondary">Đã quét hết danh sách nhóm Facebook tải được.</Typography.Text> : <Typography.Text type="secondary">—</Typography.Text>}<Space wrap>{!item.campaignId && item.approvalStatus === 'PENDING' ? <><ActionButton label="Duyệt" icon="approve" disabled={!canAdmin} onClick={() => void perform(`approve-${item.id}`, () => mutate(`/api/tasks/${item.id}/approve`), ['tasks'])} /><ActionButton label="Từ chối" icon="reject" danger disabled={!canAdmin} onClick={() => void perform(`reject-${item.id}`, () => mutate(`/api/tasks/${item.id}/reject`), ['tasks'])} /></> : null}<ActionButton label="Xem chi tiết tác vụ" icon="view" onClick={() => setSelectedTask(item)} /></Space></div> },
           ]} />
         </Card> : null}
       </Layout.Content>
       </Layout>
+
+      <Drawer
+        title={<PageSectionTitle title="Chi tiết tác vụ" description={selectedTask ? ACTION_LABELS[selectedTask.action] ?? selectedTask.action : 'Thông tin thực thi'} />}
+        open={Boolean(selectedTask)}
+        onClose={() => setSelectedTask(undefined)}
+        size={520}
+      >
+        {selectedTask ? <Space orientation="vertical" size={18} className="task-drawer-content">
+          <div className="task-drawer-grid">
+            <div><span>Tài khoản</span><strong>{selectedTask.account.username ?? selectedTask.account.id}</strong></div>
+            <div><span>Trạng thái</span><StatusTag value={selectedTask.status} /></div>
+            <div><span>Phê duyệt</span><strong>{STATUS_LABELS[selectedTask.approvalStatus ?? ''] ?? selectedTask.approvalStatus ?? '—'}</strong></div>
+            <div><span>Ngày tạo</span><strong>{new Date(selectedTask.createdAt).toLocaleString('vi-VN')}</strong></div>
+          </div>
+          {selectedTask.campaignId ? <Typography.Text type="secondary">Campaign: {selectedTask.campaignId}</Typography.Text> : null}
+          <div>
+            <Typography.Text strong>Kết quả / lỗi gần nhất</Typography.Text>
+            {selectedTask.lastError ? <Typography.Paragraph className="task-drawer-error" copyable={{ text: selectedTask.lastError }}>{selectedTask.lastError}</Typography.Paragraph> : <Typography.Paragraph type="secondary">Chưa có lỗi được ghi nhận.</Typography.Paragraph>}
+          </div>
+          {selectedTask.runs?.[0] ? <div>
+            <Typography.Text strong>Log lần chạy gần nhất</Typography.Text>
+            <pre className="task-drawer-result">{JSON.stringify(selectedTask.runs[0].result ?? {}, null, 2)}</pre>
+          </div> : null}
+        </Space> : null}
+      </Drawer>
 
       <Modal
         title={editingAccount ? 'Chỉnh sửa profile' : 'Thêm profile'}
@@ -1208,93 +1041,6 @@ export default function DashboardClient() {
               </Form.Item>
             </Col>
           </Row>
-          <Divider titlePlacement="start">Môi trường trình duyệt theo profile</Divider>
-          <Alert type="info" showIcon title="Locale, ngôn ngữ và timezone được giữ cùng một vùng để cấu hình giống người dùng thật. URL mở platform cũng sẽ dùng locale này." />
-          <Form.Item noStyle dependencies={[[ 'fingerprint', 'locale' ]] as never}>
-            {({ getFieldValue }) => {
-              const locale = String(getFieldValue(['fingerprint', 'locale']) ?? 'vi-VN');
-              const preset = fingerprintPreset(locale);
-              return (
-                <>
-                  <Row gutter={16}>
-                    <Col xs={24} sm={8}>
-                      <Form.Item name={['fingerprint', 'locale']} label="Locale" rules={[{ required: true }]}>
-                        <Select
-                          options={Object.keys(fingerprintPresets).map((value) => ({ value, label: value }))}
-                          onChange={(nextLocale: string) => {
-                            const next = fingerprintPreset(nextLocale);
-                            accountForm.setFieldsValue({ fingerprint: { ...accountForm.getFieldValue('fingerprint'), locale: nextLocale, languages: [...next.languages], timezoneId: next.timezones[0] ?? 'UTC' } });
-                          }}
-                        />
-                      </Form.Item>
-                    </Col>
-                    <Col xs={24} sm={8}>
-                      <Form.Item name={['fingerprint', 'languages']} label="Languages" rules={[{ required: true, type: 'array', min: 1 }]}>
-                        <Select mode="multiple" options={preset.languages.map((value) => ({ value, label: value }))} />
-                      </Form.Item>
-                    </Col>
-                    <Col xs={24} sm={8}>
-                      <Form.Item name={['fingerprint', 'timezoneId']} label="Timezone" rules={[{ required: true }]}>
-                        <Select options={preset.timezones.map((value) => ({ value, label: value }))} />
-                      </Form.Item>
-                    </Col>
-                  </Row>
-                </>
-              );
-            }}
-          </Form.Item>
-          <Row gutter={16}>
-            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'viewport', 'width']} label="Viewport rộng"><InputNumber min={320} max={7680} style={{ width: '100%' }} /></Form.Item></Col>
-            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'viewport', 'height']} label="Viewport cao"><InputNumber min={240} max={4320} style={{ width: '100%' }} /></Form.Item></Col>
-            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'deviceScaleFactor']} label="Device scale"><InputNumber min={0.5} max={3} step={0.25} style={{ width: '100%' }} /></Form.Item></Col>
-            <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'colorScheme']} label="Color scheme"><Select options={['light', 'dark', 'no-preference'].map((value) => ({ value, label: value }))} /></Form.Item></Col>
-          </Row>
-          <Collapse
-            items={[{
-              key: 'advanced-fingerprint',
-              label: 'Canvas / WebGL / GPU / User-Agent / Client Hints',
-              children: <>
-                <Alert type="info" showIcon title="Mặc định các lớp nâng cao đều tắt. Khi bật, hệ thống tự sinh một bộ giá trị hợp lý và lưu cùng profile để các lần mở sau dùng lại; bạn vẫn có thể chỉnh tay bên dưới." />
-                <Row gutter={[12, 4]}>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'canvas']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('canvas', event.target.checked)}>Dùng Canvas emulation</Checkbox></Form.Item></Col>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'webgl']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('webgl', event.target.checked)}>Dùng WebGL emulation</Checkbox></Form.Item></Col>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'gpu']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('gpu', event.target.checked)}>Dùng GPU emulation</Checkbox></Form.Item></Col>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'userAgent']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('userAgent', event.target.checked)}>Dùng User-Agent emulation</Checkbox></Form.Item></Col>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'features', 'clientHints']} valuePropName="checked"><Checkbox onChange={(event) => setFingerprintFeature('clientHints', event.target.checked)}>Dùng Client Hints emulation</Checkbox></Form.Item></Col>
-                </Row>
-                <Row gutter={16}>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'canvas', 'signature']} label="Canvas signature"><Input /></Form.Item></Col>
-                  <Col xs={8} sm={4}><Form.Item name={['fingerprint', 'canvas', 'noise', 0]} label="Canvas R"><InputNumber min={0} max={255} style={{ width: '100%' }} /></Form.Item></Col>
-                  <Col xs={8} sm={4}><Form.Item name={['fingerprint', 'canvas', 'noise', 1]} label="Canvas G"><InputNumber min={0} max={255} style={{ width: '100%' }} /></Form.Item></Col>
-                  <Col xs={8} sm={4}><Form.Item name={['fingerprint', 'canvas', 'noise', 2]} label="Canvas B"><InputNumber min={0} max={255} style={{ width: '100%' }} /></Form.Item></Col>
-                </Row>
-                <Row gutter={16}>
-                  <Col xs={24} sm={8}><Form.Item name={['fingerprint', 'webgl', 'vendor']} label="WebGL vendor"><Input /></Form.Item></Col>
-                  <Col xs={24} sm={16}><Form.Item name={['fingerprint', 'webgl', 'renderer']} label="WebGL renderer"><Input /></Form.Item></Col>
-                </Row>
-                <Row gutter={16}>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'vendor']} label="GPU vendor"><Input /></Form.Item></Col>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'architecture']} label="GPU architecture"><Input /></Form.Item></Col>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'device']} label="GPU device"><Input /></Form.Item></Col>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'gpu', 'description']} label="GPU description"><Input /></Form.Item></Col>
-                </Row>
-                <Form.Item name={['fingerprint', 'userAgent']} label="User-Agent"><Input /></Form.Item>
-                <Row gutter={16}>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'platform']} label="CH platform"><Select options={['Windows', 'Linux', 'macOS', 'Android'].map((value) => ({ value }))} /></Form.Item></Col>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'platformVersion']} label="CH platform version"><Input /></Form.Item></Col>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'architecture']} label="CH architecture"><Input /></Form.Item></Col>
-                  <Col xs={12} sm={6}><Form.Item name={['fingerprint', 'clientHints', 'bitness']} label="CH bitness"><Input /></Form.Item></Col>
-                </Row>
-                <Row gutter={16}>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'clientHints', 'uaFullVersion']} label="CH UA full version"><Input /></Form.Item></Col>
-                  <Col xs={24} sm={12}><Form.Item name={['fingerprint', 'clientHints', 'model']} label="CH model"><Input /></Form.Item></Col>
-                </Row>
-                <Form.Item name={['fingerprint', 'clientHints', 'brands']} label="CH brands (JSON)"><Input.TextArea rows={2} className="code-input" /></Form.Item>
-                <Form.Item name={['fingerprint', 'clientHints', 'fullVersionList']} label="CH fullVersionList (JSON)"><Input.TextArea rows={2} className="code-input" /></Form.Item>
-                <Form.Item name={['fingerprint', 'clientHints', 'mobile']} valuePropName="checked"><Checkbox>Client Hints mobile</Checkbox></Form.Item>
-              </>,
-            }]}
-          />
           <Divider titlePlacement="start">Thông tin đăng nhập</Divider>
           <Row gutter={16}>
             <Col xs={24} sm={12}>
@@ -1336,6 +1082,57 @@ export default function DashboardClient() {
             <Input.TextArea rows={5} className="code-input" placeholder="Không bắt buộc · c_user=...; xs=..." />
           </Form.Item>
           <Alert type="info" showIcon title="Thứ tự đăng nhập: Cookie → tài khoản/mật khẩu → bạn tiếp tục thao tác thủ công nếu vẫn chưa đăng nhập được. Dữ liệu được mã hóa khi lưu." />
+          <Divider titlePlacement="start">Môi trường trình duyệt theo profile</Divider>
+          <Row gutter={16}>
+            <Col xs={24} sm={12}>
+              <Form.Item
+                name={['fingerprint', 'mode']}
+                label="Desktop bundle"
+                getValueProps={(value: FingerprintFormValue['mode'] | undefined) => ({ checked: value !== 'native' })}
+                getValueFromEvent={(checked: boolean) => (checked ? 'auto' : 'native')}
+              >
+                <Switch />
+              </Form.Item>
+            </Col>
+            <Col xs={24} sm={12}>
+              <Form.Item name={['fingerprint', 'configureLocale']} label="Locale / Languages / Timezone" valuePropName="checked">
+                <Switch />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item noStyle dependencies={[[ 'fingerprint', 'locale' ], [ 'fingerprint', 'configureLocale' ]] as never}>
+            {({ getFieldValue }) => {
+              const locale = String(getFieldValue(['fingerprint', 'locale']) ?? 'vi-VN');
+              const configureLocale = Boolean(getFieldValue(['fingerprint', 'configureLocale']) ?? true);
+              const preset = fingerprintPreset(locale);
+              return (
+                <Row gutter={16}>
+                  <Col xs={24} sm={8}>
+                    <Form.Item name={['fingerprint', 'locale']} label="Locale" rules={[{ required: configureLocale }]}>
+                      <Select
+                        disabled={!configureLocale}
+                        options={Object.keys(fingerprintPresets).map((value) => ({ value, label: value }))}
+                        onChange={(nextLocale: string) => {
+                          const next = fingerprintPreset(nextLocale);
+                          accountForm.setFieldsValue({ fingerprint: { ...accountForm.getFieldValue('fingerprint'), locale: nextLocale, languages: [...next.languages], timezoneId: next.timezones[0] ?? 'UTC' } });
+                        }}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} sm={8}>
+                    <Form.Item name={['fingerprint', 'languages']} label="Languages" rules={[{ required: configureLocale, type: 'array', min: 1 }]}>
+                      <Select disabled={!configureLocale} mode="multiple" options={preset.languages.map((value) => ({ value, label: value }))} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} sm={8}>
+                    <Form.Item name={['fingerprint', 'timezoneId']} label="Timezone" rules={[{ required: configureLocale }]}>
+                      <Select disabled={!configureLocale} options={preset.timezones.map((value) => ({ value, label: value }))} />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              );
+            }}
+          </Form.Item>
           {!editingAccount ? (
             <Form.Item name="openAfterCreate" valuePropName="checked" className="modal-checkbox">
               <Checkbox>Mở browser ngay sau khi tạo</Checkbox>
@@ -1458,10 +1255,6 @@ export default function DashboardClient() {
   );
 }
 
-function SectionTitle({ title, description }: { title: string; description: string }) {
-  return <div className="section-title"><strong>{title}</strong><small>{description}</small></div>;
-}
-
 function loginFlow(profile?: Account['browserProfile']) {
   return (
     <span className="login-flow">
@@ -1474,20 +1267,7 @@ function loginFlow(profile?: Account['browserProfile']) {
   );
 }
 
-function statusTag(value: string) {
-  const color = ['READY', 'HEALTHY', 'SUCCEEDED'].includes(value)
-    ? 'green'
-    : ['ERROR', 'FAILED', 'UNHEALTHY', 'CRASHED'].includes(value)
-      ? 'red'
-      : ['RUNNING', 'STARTING'].includes(value)
-        ? 'blue'
-        : 'default';
-  return <Tag color={value === 'REQUIRES_ACTION' || value === 'LOGIN_REQUIRED' || value === 'CHALLENGED' ? 'orange' : color}>{STATUS_LABELS[value] ?? value}</Tag>;
-}
-
-function formatBytes(value: string): string {
-  const bytes = Number(value);
-  if (!Number.isFinite(bytes) || bytes < 1_024) return `${bytes || 0} B`;
-  if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KB`;
-  return `${(bytes / 1_048_576).toFixed(1)} MB`;
+function summarizeTaskError(value: string): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > 420 ? `${compact.slice(0, 417)}…` : compact;
 }

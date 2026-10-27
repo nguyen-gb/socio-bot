@@ -159,7 +159,13 @@ export class BrowserRuntime {
         args: launchArgs,
         // Headless Chromium hides native scrollbars by default. Remote users
         // need visible, draggable thumbs just like in a normal browser.
-        ignoreDefaultArgs: ['--hide-scrollbars'],
+        // Patchright adds --disable-blink-features=AutomationControlled by
+        // default. Chrome now displays a visible unsupported-flag warning for
+        // it, so omit that flag while retaining the normal scrollbar behavior.
+        ignoreDefaultArgs: [
+          '--hide-scrollbars',
+          '--disable-blink-features=AutomationControlled',
+        ],
         timeout: 45_000,
         headless,
         channel: options.channel ?? 'chrome',

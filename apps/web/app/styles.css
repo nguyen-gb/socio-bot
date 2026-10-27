@@ -3,13 +3,21 @@
   --canvas: #f6f7f5;
   --sidebar: #fafbf9;
   --surface: #fff;
+  --surface-elevated: #fff;
   --surface-soft: #f7f8f6;
   --line: #e4e7e1;
+  --line-subtle: #edf0e9;
   --muted: #717972;
   --text: #252b28;
   --accent: #217a67;
+  --accent-strong: #176453;
   --accent-soft: #eaf3ee;
   --green: #27845f;
+  --focus-ring: #89b9a8;
+  --radius-control: 8px;
+  --radius-card: 12px;
+  --shadow-card: 0 2px 3px #25331f03;
+  --shadow-modal: 0 20px 80px #19291926;
   font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
   background: var(--canvas);
   color: var(--text);
@@ -20,7 +28,7 @@ body { min-height: 100vh; font-size: 14px; }
 button, input, textarea, select { font: inherit; }
 button, select { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
-:focus-visible { outline: 3px solid #89b9a8; outline-offset: 3px; }
+:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: 3px; }
 code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-soft); color: #505a53; font-family: Consolas, monospace; font-size: 12px; }
 .muted { color: var(--muted); }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -77,7 +85,6 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .content[data-view="accounts"] .dashboard-row:not(#accounts),
 .content[data-view="proxies"] .dashboard-row:not(#proxies),
 .content[data-view="schedules"] .dashboard-row:not(#schedules),
-.content[data-view="media"] .dashboard-row:not(#media),
 .content[data-view="tasks"] .dashboard-row:not(#tasks),
 .content[data-view="facebook"] .dashboard-row:not(#facebook) { display: none; }
 .overview-welcome { display: flex; justify-content: space-between; align-items: center; gap: 24px; margin-bottom: 24px; padding: 28px 32px; border: 1px solid #dce5d8; border-radius: 14px; background: #edf2e7; }
@@ -85,6 +92,12 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .overview-welcome h3 { margin: 9px 0; color: #354a32; font-size: 27px; font-weight: 600; letter-spacing: -.8px; }
 .overview-welcome p { margin: 0 0 18px; color: #75826e; font-size: 12px; line-height: 1.7; }
 .overview-welcome .ant-btn { background: #fff !important; border-color: #d1dccc !important; color: #47653f !important; }
+.overview-ready-strip { display: flex; align-items: center; gap: 12px; min-height: 84px; padding: 18px 20px; border: 1px solid #dce5d8; border-radius: 12px; background: #f1f6ee; }
+.overview-ready-strip > div { min-width: 0; flex: 1; }
+.overview-ready-strip strong, .overview-ready-strip small { display: block; }
+.overview-ready-strip strong { color: #40583d; font-size: 13px; font-weight: 600; }
+.overview-ready-strip small { margin-top: 4px; color: #74826d; font-size: 11px; }
+.ready-check { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; border-radius: 50%; background: #dcebd9; color: #3d7650; font-weight: 650; }
 .welcome-summary { display: flex; align-items: center; gap: 24px; padding: 16px; }
 .welcome-orbit { display: grid; place-items: center; width: 96px; height: 96px; border: 14px solid #e1e9d7; border-radius: 50%; background: #d3dfc8; color: #668158; }
 .welcome-summary strong { color: #45603b; font-size: 40px; line-height: 1.1; font-weight: 500; }
@@ -142,16 +155,7 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .compact-field > span { color: #606c60; font-size: 12px; font-weight: 500; }
 .compact-field > .ant-select { width: 100%; }
 .schedule-submit { align-self: end; }
-.composer-panel, .media-library { display: grid; gap: 18px; padding: 22px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
-.media-library { display: block; }
-.media-library > .ant-flex { margin-bottom: 18px; gap: 10px; }
-.media-library strong, .media-library small { display: block; }
-.media-library strong { font-size: 13px; font-weight: 500; }
-.media-library small { margin-top: 4px; color: var(--muted); font-size: 11px; }
-.media-item { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 16px 0; border-top: 1px solid var(--line); }
-.media-item > span { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 7px; background: #e9eee4; color: #6c815f; }
-.media-item strong, .media-item small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ant-card { border-color: var(--line); border-radius: 12px !important; box-shadow: 0 2px 3px #25331f03; }
+.ant-card { border-color: var(--line); border-radius: var(--radius-card) !important; box-shadow: var(--shadow-card); }
 .ant-card-head { border-bottom-color: var(--line) !important; }
 .ant-card-head-title { overflow: visible !important; white-space: normal !important; }
 .ant-card-extra { min-width: 0; margin-left: 16px; }
@@ -160,7 +164,20 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .ant-table-thead > tr > th { color: #687267 !important; background: #f7f8f5 !important; font-size: 12px; font-weight: 500 !important; }
 .ant-table-tbody > tr > td { border-bottom-color: #edf0e9 !important; font-size: 13px; }
 .ant-table-tbody > tr:hover > td { background: #f8faf6 !important; }
+.tasks-table .ant-table-tbody > tr > td { vertical-align: top; }
+.task-detail-cell { display: grid; min-width: 0; max-width: 520px; gap: 8px; }
+.task-error { display: -webkit-box; overflow: hidden; overflow-wrap: anywhere; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.task-drawer-content { width: 100%; }
+.task-drawer-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.task-drawer-grid > div { display: grid; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--line-subtle); border-radius: 8px; background: var(--surface-soft); }
+.task-drawer-grid span { color: var(--muted); font-size: 11px; }
+.task-drawer-grid strong { overflow-wrap: anywhere; font-size: 12px; font-weight: 550; }
+.task-drawer-error { margin-top: 8px !important; padding: 12px; border: 1px solid #f0d9d3; border-radius: 8px; background: #fff8f6; color: #8c4c42; overflow-wrap: anywhere; white-space: pre-wrap; }
+.task-drawer-result { max-height: 280px; margin: 8px 0 0; padding: 12px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #202923; color: #e6f0e9; font: 11px/1.55 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.proxy-latency { color: #536158; font-variant-numeric: tabular-nums; }
+.proxy-latency-warning { color: #a06425; font-weight: 600; }
 .ant-table-cell-fix-right { background: #fff !important; }
+.campaign-table .ant-table-cell-fix-right { z-index: 2; box-shadow: -8px 0 14px #25331f0b; }
 .ant-table code { white-space: nowrap; }
 .ant-table td code { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
 .ant-table-expanded-row > td { background: #f7f9f5 !important; }
@@ -177,7 +194,7 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .ant-empty-description { color: var(--muted) !important; font-size: 13px; }
 .ant-modal-wrap { display: flex; align-items: center; padding: 24px 16px; overflow-y: auto; }
 .ant-modal { top: 0 !important; max-height: calc(100vh - 48px); margin: 0 auto !important; }
-.ant-modal-container, .ant-modal-content { display: flex; flex-direction: column; box-sizing: border-box; max-height: calc(100vh - 48px); overflow: hidden; padding: 24px !important; border: 1px solid var(--line); border-radius: 14px !important; box-shadow: 0 20px 80px #19291926 !important; }
+.ant-modal-container, .ant-modal-content { display: flex; flex-direction: column; box-sizing: border-box; max-height: calc(100vh - 48px); overflow: hidden; padding: 24px !important; border: 1px solid var(--line); border-radius: 14px !important; box-shadow: var(--shadow-modal) !important; }
 .ant-modal-title { font-size: 19px !important; font-weight: 600 !important; }
 .ant-modal-body { flex: 1 1 auto; min-height: 0; max-height: none !important; overflow-y: auto; padding-right: 4px; }
 .ant-modal-header, .ant-modal-footer { flex-shrink: 0; }
@@ -199,12 +216,6 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .facebook-workspace { width: 100%; }
 .tiktok-workspace { width: 100%; min-width: 0; display: grid; gap: 16px; }
 .tiktok-workspace > * { min-width: 0; max-width: 100%; }
-.tiktok-intro { display: flex; align-items: flex-start; gap: 14px; min-width: 0; padding: 17px 20px; border: 1px solid #dce5d8; border-radius: 12px; background: #f0f5ed; }
-.tiktok-intro-icon { display: grid; place-items: center; flex: 0 0 34px; width: 34px; height: 34px; border-radius: 9px; background: #dfece0; color: #4d7d67; }
-.tiktok-intro > div { min-width: 0; flex: 1; }
-.tiktok-intro strong { display: block; color: #405b46; font-size: 13px; font-weight: 600; }
-.tiktok-intro p { margin: 5px 0 0; color: #718070; font-size: 12px; line-height: 1.65; }
-.tiktok-intro > .ant-tag { flex: 0 0 auto; margin-top: 2px; }
 .tiktok-workspace .resource-card { width: 100%; max-width: 100%; min-width: 0; overflow: hidden; }
 .tiktok-workspace .resource-card > .ant-card-head, .tiktok-workspace .resource-card > .ant-card-body { min-width: 0; max-width: 100%; }
 .tiktok-workspace .ant-table-wrapper { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; }
@@ -253,12 +264,15 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .facebook-actions p { margin: 6px 0 0; color: #798670; font-size: 12px; }
 .facebook-actions .ant-space { flex-wrap: wrap; }
 .facebook-tabs { margin: 0 0 20px; }
-.campaign-progress { width: 95px; }
-.campaign-progress small { font-size: 11px; color: var(--muted); }
-.campaign-progress .progress-track { height: 4px; margin: 6px 0; }
 .campaign-name strong, .campaign-name small { display: block; }
 .campaign-name strong { font-size: 13px; font-weight: 500; }
 .campaign-name small { margin-top: 5px; color: var(--muted); font-size: 11px; }
+.campaign-table .ant-table-tbody > tr > td { vertical-align: top; }
+.campaign-table .ant-table-cell { white-space: normal; }
+.campaign-result-cell { display: grid; min-width: 0; gap: 4px; }
+.campaign-result-primary { color: var(--text); font-size: 13px; font-weight: 400; line-height: 1.45; }
+.campaign-result-detail { display: -webkit-box; overflow: hidden; overflow-wrap: anywhere; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.campaign-actions { max-width: 180px; }
 .group-link { display: block; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .login-page { display: grid; grid-template-columns: 1fr 1fr; min-height: 100vh; background: #fff; }
 .login-story { display: flex; flex-direction: column; justify-content: space-between; margin: 18px; padding: 40px 48px; border-radius: 16px; background: #edf2e7; }
@@ -358,6 +372,8 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
   .page-header > .ant-space { width: 100%; }
   .overview-welcome { padding: 22px; }
   .overview-welcome h3 { font-size: 24px; }
+  .overview-ready-strip { align-items: flex-start; padding: 14px; }
+  .overview-ready-strip .ant-btn { padding-inline: 0; }
   .welcome-summary { display: none; }
   .stats-grid .ant-card { height: 150px; }
   .metric-card .ant-card-body { padding: 16px !important; }
@@ -382,10 +398,9 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
   .tiktok-summary .summary-icon { display: none; }
   .tiktok-summary strong { font-size: 23px; }
   .tiktok-summary small { font-size: 10px; }
-  .tiktok-intro { padding: 15px; }
-  .tiktok-intro > .ant-tag { display: none; }
   .tiktok-form-grid-2, .tiktok-search-row, .tiktok-filter-grid, .tiktok-filter-grid-3 { grid-template-columns: 1fr; }
   .facebook-actions { padding: 18px; }
+  .task-drawer-grid { grid-template-columns: 1fr; }
   .ant-modal-wrap { padding: 12px 10px; }
   .ant-modal-container, .ant-modal-content { max-height: calc(100vh - 24px); padding: 20px !important; }
   .ant-modal { max-width: calc(100vw - 20px); top: 0 !important; }

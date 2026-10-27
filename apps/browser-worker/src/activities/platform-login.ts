@@ -87,7 +87,8 @@ export function platformHomeUrl(platform: SupportedPlatform, locale?: string): s
 }
 
 export function platformHomeUrlForProfile(platform: SupportedPlatform, metadata: unknown): string {
-  return platformHomeUrl(platform, profileFingerprintSettings(metadata)?.locale);
+  const fingerprint = profileFingerprintSettings(metadata);
+  return platformHomeUrl(platform, fingerprint?.localeMode === 'native' ? undefined : fingerprint?.locale);
 }
 
 function platformLoginUrl(platform: SupportedPlatform, locale?: string): string {

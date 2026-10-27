@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import type { BrowserContext, Route } from 'playwright';
 import type { BrowserColorScheme, BrowserViewport } from './browser-runtime';
@@ -38,10 +38,22 @@ const DISABLED_FEATURES: FingerprintFeatureToggles = {
   clientHints: false,
 };
 
+// Auto profiles get stable desktop-only rendering surfaces. User-Agent and
+// Client Hints remain native-looking and are refreshed from the installed
+// Chrome version instead of being made unique per account.
+const AUTO_FEATURES: FingerprintFeatureToggles = {
+  canvas: true,
+  webgl: true,
+  gpu: true,
+  userAgent: false,
+  clientHints: false,
+};
+
 export interface FingerprintEmulationConfig {
   version: 2;
   createdAt: string;
   seed: string;
+  localeMode: 'configured' | 'native';
   locale: string;
   languages: string[];
   timezoneId: string;
@@ -57,6 +69,8 @@ export interface FingerprintEmulationConfig {
 }
 
 export interface FingerprintEmulationOverrides {
+  mode?: 'auto' | 'native' | 'custom';
+  localeMode?: 'configured' | 'native';
   locale?: string;
   languages?: string[];
   timezoneId?: string;
@@ -113,12 +127,21 @@ function pick<T>(values: readonly T[], entropy: string, offset = 0): T {
   return values[value % values.length]!;
 }
 
+function canonicalLocale(locale: string): string {
+  return Intl.getCanonicalLocales(locale)[0] ?? locale;
+}
+
 function languageBundle(locale: string): string[] {
-  const base = locale.split('-')[0] ?? locale;
-  // Keep Vietnamese profiles entirely Vietnamese. In particular, do not add
-  // the browser's usual English fallback to Accept-Language or navigator.
-  if (base.toLowerCase() === 'vi') return [locale, 'vi'].filter((value, index, values) => values.indexOf(value) === index);
-  return [locale, base, 'en-US'].filter((value, index, values) => values.indexOf(value) === index);
+  // Chromium normally derives the language fallback from the selected
+  // locale: `de-DE,de`, `ja-JP,ja`, etc. It does not universally append
+  // `en-US`; that is only appropriate when English is explicitly present in
+  // the user's language preferences.
+  const canonical = canonicalLocale(locale);
+  const parsed = new Intl.Locale(canonical);
+  const script = parsed.script ? `${parsed.language}-${parsed.script}` : undefined;
+  return [canonical, script, parsed.language]
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index);
 }
 
 function mergeFeatures(value?: Partial<FingerprintFeatureToggles>): FingerprintFeatureToggles {
@@ -152,19 +175,22 @@ function createConfig(
     Number.parseInt(entropy.slice(22, 24), 16) % 2,
   ];
   if (canvasNoise.every((value) => value === 0)) canvasNoise[2] = 1;
-  const locale = defaults.locale ?? Intl.getCanonicalLocales(new Intl.DateTimeFormat().resolvedOptions().locale)[0] ?? 'en-US';
+  const locale = canonicalLocale(defaults.locale ?? new Intl.DateTimeFormat().resolvedOptions().locale ?? 'en-US');
   const timezoneId = defaults.timezoneId ?? new Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC';
+  const localeMode = overrides?.localeMode
+    ?? (overrides?.mode === 'native' ? 'native' : defaults.locale || defaults.timezoneId ? 'configured' : 'native');
   const generated: FingerprintEmulationConfig = {
     version: 2,
     createdAt: new Date().toISOString(),
     seed,
+    localeMode,
     locale,
     languages: languageBundle(locale),
     timezoneId,
     viewport: { ...viewport },
     colorScheme,
     deviceScaleFactor: 1,
-    features: { ...DISABLED_FEATURES },
+    features: { ...AUTO_FEATURES },
     canvas: {
       signature: digest(seed, 'canvas').slice(0, 32),
       noise: canvasNoise,
@@ -184,7 +210,7 @@ function createConfig(
       uaFullVersion: fullVersion,
     },
   };
-  return mergeFingerprintConfig(generated, overrides);
+  return refreshBrowserVersion(mergeFingerprintConfig(generated, overrides), chromeMajor);
 }
 
 function validateConfig(value: unknown): FingerprintEmulationConfig {
@@ -208,9 +234,19 @@ function validateConfig(value: unknown): FingerprintEmulationConfig {
     || typeof config.clientHints.mobile !== 'boolean' || typeof config.clientHints.platform !== 'string') {
     throw new Error(`Invalid ${FILE_NAME}`);
   }
-  Intl.getCanonicalLocales(config.locale);
+  const locale = canonicalLocale(config.locale);
   new Intl.DateTimeFormat('en-US', { timeZone: config.timezoneId });
-  return { ...config, features: mergeFeatures(config.features) } as FingerprintEmulationConfig;
+  return {
+    ...config,
+    localeMode: config.localeMode === 'native' ? 'native' : 'configured',
+    locale,
+    features: mergeFeatures(config.features),
+    clientHints: {
+      ...config.clientHints,
+      mobile: false,
+      platform: browserPlatform(config.clientHints.platform),
+    },
+  } as FingerprintEmulationConfig;
 }
 
 function mergeFingerprintConfig(
@@ -218,30 +254,107 @@ function mergeFingerprintConfig(
   overrides?: FingerprintEmulationOverrides,
 ): FingerprintEmulationConfig {
   if (!overrides) {
-    const allowedLanguages = languageBundle(base.locale);
+    const locale = canonicalLocale(base.locale);
+    const allowedLanguages = languageBundle(locale);
     const storedLanguages = base.languages.filter((language) => allowedLanguages.includes(language));
     return {
       ...base,
+      locale,
+      localeMode: base.localeMode ?? 'configured',
       languages: storedLanguages.length ? storedLanguages : allowedLanguages,
       features: mergeFeatures(base.features),
     };
   }
-  const locale = overrides.locale ?? base.locale;
-  const languages = overrides.languages?.length
-    ? languageBundle(locale).filter((language) => overrides.languages!.includes(language))
+  const autoMode = overrides.mode === 'auto';
+  const nativeMode = overrides.mode === 'native';
+  const managedMode = autoMode || nativeMode;
+  const effectiveOverrides = managedMode
+    ? {
+      locale: overrides.locale,
+      languages: overrides.languages,
+      timezoneId: overrides.timezoneId,
+      localeMode: overrides.localeMode,
+    }
+    : overrides;
+  const locale = canonicalLocale(effectiveOverrides.locale ?? base.locale);
+  const languages = effectiveOverrides.languages?.length
+    ? languageBundle(locale).filter((language) => effectiveOverrides.languages!.includes(language))
     : languageBundle(locale);
+  const localeMode = effectiveOverrides.localeMode ?? base.localeMode ?? 'configured';
+  const clientHints = effectiveOverrides.clientHints
+    ? { ...base.clientHints, ...effectiveOverrides.clientHints }
+    : base.clientHints;
   return {
     ...base,
-    ...overrides,
+    ...(managedMode ? {} : effectiveOverrides),
     locale,
     languages: languages.length ? languages : languageBundle(locale),
-    features: mergeFeatures(overrides.features ?? base.features),
-    viewport: overrides.viewport ? { ...base.viewport, ...overrides.viewport } : base.viewport,
-    canvas: overrides.canvas ? { ...base.canvas, ...overrides.canvas } : base.canvas,
-    webgl: overrides.webgl ? { ...base.webgl, ...overrides.webgl } : base.webgl,
-    gpu: overrides.gpu ? { ...base.gpu, ...overrides.gpu } : base.gpu,
-    clientHints: overrides.clientHints ? { ...base.clientHints, ...overrides.clientHints } : base.clientHints,
+    timezoneId: effectiveOverrides.timezoneId ?? base.timezoneId,
+    localeMode,
+    features: autoMode
+      ? { ...AUTO_FEATURES }
+      : nativeMode
+        ? { ...DISABLED_FEATURES }
+        : mergeFeatures(effectiveOverrides.features ?? base.features),
+    viewport: effectiveOverrides.viewport ? { ...base.viewport, ...effectiveOverrides.viewport } : base.viewport,
+    canvas: effectiveOverrides.canvas ? { ...base.canvas, ...effectiveOverrides.canvas } : base.canvas,
+    webgl: effectiveOverrides.webgl ? { ...base.webgl, ...effectiveOverrides.webgl } : base.webgl,
+    gpu: effectiveOverrides.gpu ? { ...base.gpu, ...effectiveOverrides.gpu } : base.gpu,
+    clientHints: {
+      ...clientHints,
+      mobile: false,
+      platform: browserPlatform(clientHints.platform),
+    },
   };
+}
+
+function browserPlatform(value: string): 'Windows' | 'Linux' | 'macOS' {
+  if (value === 'Windows' || value === 'Linux' || value === 'macOS') return value;
+  return process.platform === 'win32' ? 'Windows' : 'Linux';
+}
+
+function refreshBrowserVersion(config: FingerprintEmulationConfig, chromeMajor: number): FingerprintEmulationConfig {
+  const fullVersion = `${chromeMajor}.0.0.0`;
+  const platform = browserPlatform(config.clientHints.platform);
+  const platformDetails = platform === 'Windows'
+    ? { userAgentPlatform: 'Windows NT 10.0; Win64; x64', platformVersion: '19.0.0' }
+      : platform === 'macOS'
+        ? { userAgentPlatform: 'Macintosh; Intel Mac OS X 10_15_7', platformVersion: '15.0.0' }
+        : { userAgentPlatform: 'X11; Linux x86_64', platformVersion: '6.8.0' };
+  const userAgent = `Mozilla/5.0 (${platformDetails.userAgentPlatform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`;
+  const brands = [
+    { brand: 'Not_A Brand', version: '24' },
+    { brand: 'Chromium', version: String(chromeMajor) },
+    { brand: 'Google Chrome', version: String(chromeMajor) },
+  ];
+  const fullVersionList = brands.map((brand) => ({
+    ...brand,
+    version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : fullVersion,
+  }));
+  return {
+    ...config,
+    userAgent,
+    clientHints: {
+      ...config.clientHints,
+      mobile: false,
+      platform,
+      platformVersion: platformDetails.platformVersion,
+      brands,
+      fullVersionList,
+      uaFullVersion: fullVersion,
+    },
+  };
+}
+
+async function persistFingerprintConfig(destination: string, config: FingerprintEmulationConfig): Promise<void> {
+  const profilePath = dirname(destination);
+  const temporary = join(profilePath, `${FILE_NAME}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    await rename(temporary, destination);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
 export async function loadFingerprintEmulation(
@@ -250,13 +363,22 @@ export async function loadFingerprintEmulation(
   overrides?: FingerprintEmulationOverrides,
 ): Promise<FingerprintEmulationConfig> {
   const destination = join(profilePath, FILE_NAME);
+  const chromeMajor = await detectChromeMajor();
   try {
     const stored = validateConfig(JSON.parse(await readFile(destination, 'utf8')));
-    return mergeFingerprintConfig(stored, overrides);
+    const refreshed = refreshBrowserVersion(stored, chromeMajor);
+    if (refreshed.userAgent !== stored.userAgent
+      || refreshed.clientHints.uaFullVersion !== stored.clientHints.uaFullVersion
+      || refreshed.clientHints.platform !== stored.clientHints.platform
+      || refreshed.clientHints.platformVersion !== stored.clientHints.platformVersion
+      || refreshed.clientHints.mobile !== stored.clientHints.mobile) {
+      await persistFingerprintConfig(destination, refreshed);
+    }
+    return refreshBrowserVersion(mergeFingerprintConfig(refreshed, overrides), chromeMajor);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  const config = createConfig(defaults, await detectChromeMajor(), overrides);
+  const config = createConfig(defaults, chromeMajor, overrides);
   const temporary = join(profilePath, `${FILE_NAME}.${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
@@ -302,8 +424,7 @@ async function detectChromeMajor(): Promise<number> {
 export function fingerprintLaunchOptions(config: FingerprintEmulationConfig) {
   return {
     ...(config.features.userAgent ? { userAgent: config.userAgent } : {}),
-    locale: config.locale,
-    timezoneId: config.timezoneId,
+    ...(config.localeMode === 'configured' ? { locale: config.locale, timezoneId: config.timezoneId } : {}),
     viewport: config.viewport,
     colorScheme: config.colorScheme,
     deviceScaleFactor: config.deviceScaleFactor,
@@ -314,9 +435,9 @@ export function fingerprintLaunchOptions(config: FingerprintEmulationConfig) {
 
 export async function installFingerprintEmulation(context: BrowserContext, config: FingerprintEmulationConfig): Promise<void> {
   const brandsHeader = config.clientHints.brands.map(({ brand, version }) => `"${brand}";v="${version}"`).join(', ');
-  const headers: Record<string, string> = {
+  const headers: Record<string, string> = config.localeMode === 'configured' ? {
     'accept-language': config.languages.map((language, index) => index === 0 ? language : `${language};q=${Math.max(0.1, 1 - index * 0.1).toFixed(1)}`).join(','),
-  };
+  } : {};
   if (config.features.clientHints) {
     headers['sec-ch-ua'] = brandsHeader;
     headers['sec-ch-ua-mobile'] = config.clientHints.mobile ? '?1' : '?0';
@@ -333,7 +454,7 @@ export async function installFingerprintEmulation(context: BrowserContext, confi
     const nativeUserAgent = await page.evaluate(() => navigator.userAgent).catch(() => config.userAgent);
     await cdp.send('Emulation.setUserAgentOverride', {
         userAgent: config.features.userAgent ? config.userAgent : nativeUserAgent,
-        acceptLanguage: config.languages.join(','),
+        ...(config.localeMode === 'configured' ? { acceptLanguage: config.languages.join(',') } : {}),
         platform: config.clientHints.platform === 'Windows' ? 'Win32' : 'Linux x86_64',
         ...(config.features.clientHints ? { userAgentMetadata: {
           brands: config.clientHints.brands,
@@ -392,12 +513,13 @@ function applyPageFingerprint(emulation: FingerprintEmulationConfig): void {
     if (emulation.features.userAgent) define(Navigator.prototype, 'userAgent', emulation.userAgent);
     if (emulation.features.userAgent) {
       const platform = emulation.clientHints.platform === 'Windows' ? 'Win32'
-        : emulation.clientHints.platform === 'macOS' ? 'MacIntel'
-          : emulation.clientHints.platform === 'Android' ? 'Linux armv8l' : 'Linux x86_64';
+        : emulation.clientHints.platform === 'macOS' ? 'MacIntel' : 'Linux x86_64';
       define(Navigator.prototype, 'platform', platform);
     }
-    define(Navigator.prototype, 'language', emulation.locale);
-    define(Navigator.prototype, 'languages', [...emulation.languages]);
+    if (emulation.localeMode === 'configured') {
+      define(Navigator.prototype, 'language', emulation.locale);
+      define(Navigator.prototype, 'languages', [...emulation.languages]);
+    }
     const userAgentData = {
       brands: emulation.clientHints.brands,
       mobile: emulation.clientHints.mobile,

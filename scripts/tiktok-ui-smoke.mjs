@@ -7,6 +7,7 @@ const browser = await chromium.launch({ headless: true });
 const writes = [], errors = [];
 const accounts = [
   { id: 'tt-ready', username: 'TikTok ready', platform: 'TIKTOK', status: 'READY' },
+  { id: 'tt-ready-2', username: 'TikTok ready 2', platform: 'TIKTOK', status: 'READY' },
   { id: 'tt-search', username: 'TikTok search', platform: 'TIKTOK', status: 'LOGIN_REQUIRED' },
 ];
 const videoRows = [
@@ -43,7 +44,7 @@ try {
   await page.getByText('TikTok', { exact: true }).first().waitFor();
   assert.ok(await page.locator('.content[data-view="tiktok"]').count());
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
-  await page.getByRole('button', { name: 'Xem báo cáo', exact: true }).click();
+  await page.getByRole('button', { name: 'Xem kết quả', exact: true }).click();
   const report = page.getByRole('dialog');
   await report.getByText('2 video đã được lưu trong campaign', { exact: true }).waitFor();
   const selectionAction = report.getByRole('button', { name: 'Hành động trên video đã chọn', exact: true });
@@ -56,18 +57,38 @@ try {
   assert.equal(await report.locator('.tiktok-selection-toolbar').evaluate(element => getComputedStyle(element).flexDirection), 'column');
   await report.getByRole('button', { name: 'Đóng' }).click();
   await page.setViewportSize({ width: 1280, height: 900 });
-  await page.getByRole('button', { name: 'Duyệt & xếp hàng', exact: true }).click();
-  await page.getByRole('button', { name: 'Duyệt & xếp hàng', exact: true }).last().click();
+  await page.getByRole('button', { name: 'Duyệt & chạy', exact: true }).click();
+  await page.getByRole('button', { name: 'Duyệt & chạy', exact: true }).last().click();
   await page.waitForTimeout(200);
   assert.ok(writes.some(write => String(write.path).includes('/approve')));
-  await page.getByRole('button', { name: 'Search video', exact: true }).click();
+  await page.getByRole('button', { name: 'Tạo chiến dịch', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Search video', exact: true }).click();
   const dialog = page.locator('.tiktok-create-modal');
   await dialog.getByText('Thiết lập Search video', { exact: true }).waitFor();
-  await dialog.locator('input').nth(1).fill('Search fixture');
-  await dialog.locator('input').nth(2).fill('áo khoác');
+  assert.equal(await dialog.getByText('Profile chạy campaign', { exact: true }).count(), 0);
+  await dialog.getByLabel('Tên campaign').fill('Search fixture');
+  await dialog.getByLabel('Từ khóa').fill('áo khoác');
   await dialog.getByRole('button', { name: 'Search video', exact: true }).click();
   await dialog.waitFor({ state: 'hidden' });
   assert.ok(writes.some(write => write.path === '/api/tasks'));
+  await page.locator('.tiktok-result-modal .ant-modal-close').click();
+
+  await page.getByRole('button', { name: 'Tạo chiến dịch', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Auto-comment For You', exact: true }).click();
+  const actionDialog = page.locator('.tiktok-create-modal');
+  await actionDialog.getByText('Thiết lập auto-comment For You', { exact: true }).waitFor();
+  const profileSelect = actionDialog.locator('.ant-select').first();
+  await profileSelect.click();
+  await page.locator('.ant-select-dropdown:visible').getByText('TikTok ready', { exact: true }).click();
+  await page.locator('.ant-select-dropdown:visible').getByText('TikTok ready 2', { exact: true }).click();
+  await actionDialog.getByLabel('Tên campaign').fill('Auto comment fixture');
+  await actionDialog.getByLabel('Nội dung comment').fill('Fixture comment');
+  await actionDialog.getByRole('button', { name: 'Lưu bản nháp', exact: true }).click();
+  await actionDialog.waitFor({ state: 'hidden' });
+  const taskWrites = writes.filter(write => write.path === '/api/tasks');
+  assert.equal(taskWrites.at(-1).input.action.accountId, 'tt-ready-2');
+  assert.deepEqual(taskWrites.slice(-2).map(write => write.input.action.payload.maxVideos), [5, 5]);
+  assert.equal(taskWrites.length, 3);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(200);
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));

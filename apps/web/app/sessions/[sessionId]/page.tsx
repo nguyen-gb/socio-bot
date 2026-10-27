@@ -5,7 +5,8 @@ import { Button, Card, Flex, Input, Space, Spin, Tag, Tooltip, Typography } from
 import { useParams, useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { Icon, STATUS_LABELS } from '../../ui';
+import { Icon } from '../../ui';
+import { StatusTag } from '../../admin-ui';
 import { RemoteViewport } from '../remote-viewport';
 import { useToast, useToastError, useToastNotice } from '../../toast';
 
@@ -230,9 +231,7 @@ export default function LoginSessionPage() {
           <Typography.Text className="eyebrow">PHIÊN TRÌNH DUYỆT</Typography.Text>
           <Typography.Title level={2}>Trình duyệt từ xa</Typography.Title>
           <Space wrap>
-            <Tag color={statusColor(session.data?.status)}>
-              {STATUS_LABELS[session.data?.status ?? ''] ?? 'Đang tải'}
-            </Tag>
+            {session.data?.status ? <StatusTag value={session.data.status} /> : <Tag>Đang tải</Tag>}
             <Tag color={connected ? 'green' : !stopping && connection === 'error' ? 'red' : 'default'}>
               {connectionLabel(terminal ? 'closed' : stopping ? 'closing' : connection)}
             </Tag>
@@ -326,15 +325,6 @@ export default function LoginSessionPage() {
       </div>
     </main>
   );
-}
-
-function statusColor(status?: string) {
-  if (status === 'AUTHENTICATED') return 'green';
-  if (status === 'RUNNING') return 'blue';
-  if (status === 'CRASHED') return 'red';
-  if (status === 'EXPIRED') return 'orange';
-  if (status === 'CLOSED') return 'default';
-  return 'cyan';
 }
 
 function connectionLabel(status: string) {

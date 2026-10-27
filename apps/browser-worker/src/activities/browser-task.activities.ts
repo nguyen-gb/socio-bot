@@ -312,9 +312,13 @@ export class BrowserTaskActivities {
       try {
         runtimeProfileId = tiktokSearchAction ? searchRuntimeProfileId : profile.id;
         const emulateFingerprint = this.config.get('browserFingerprintEmulation', { infer: true });
-        const fingerprint = emulateFingerprint && !tiktokSearchAction
+        const profileFingerprint = emulateFingerprint && !tiktokSearchAction
           ? profileFingerprintSettings(current.account.browserProfile?.metadata)
           : undefined;
+        const profileControlsBrowser = Boolean(profileFingerprint);
+        const useFingerprint = Boolean(emulateFingerprint && (!profileControlsBrowser || profileFingerprint?.mode !== 'native'));
+        const profileLocale = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.locale;
+        const profileTimezoneId = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.timezoneId;
         result = await this.runtime.withProfile(
           {
             profileId: runtimeProfileId,
@@ -325,12 +329,12 @@ export class BrowserTaskActivities {
             ),
             headless: this.config.get('browserHeadless', { infer: true }),
             channel: this.config.get('browserChannel', { infer: true }),
-            locale: fingerprint?.locale ?? this.config.get('browserLocale', { infer: true }),
-            timezoneId: fingerprint?.timezoneId ?? this.config.get('browserTimezoneId', { infer: true }),
-            colorScheme: fingerprint?.colorScheme ?? this.config.get('browserColorScheme', { infer: true }),
-            viewport: fingerprint?.viewport ?? this.config.get('browserViewport', { infer: true }),
-            emulateFingerprint,
-            fingerprint,
+            locale: profileControlsBrowser ? profileLocale : this.config.get('browserLocale', { infer: true }),
+            timezoneId: profileControlsBrowser ? profileTimezoneId : this.config.get('browserTimezoneId', { infer: true }),
+            colorScheme: profileControlsBrowser ? undefined : this.config.get('browserColorScheme', { infer: true }),
+            viewport: profileControlsBrowser ? undefined : this.config.get('browserViewport', { infer: true }),
+            emulateFingerprint: useFingerprint,
+            fingerprint: useFingerprint ? profileFingerprint : undefined,
             executionTimeoutMs: this.config.get('browserTaskTimeoutMs', { infer: true }),
             sessionStateOrigins: platformSessionStateOrigins(action.platform),
             recordHarPath: harPath,
@@ -376,7 +380,7 @@ export class BrowserTaskActivities {
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
                 await initializePlatformSession(session, 'FACEBOOK', credentials, {
-                  locale: fingerprint?.locale,
+                  locale: profileLocale,
                   entryUrl: platformHomeUrlForProfile('FACEBOOK', current.account.browserProfile?.metadata),
                 });
                 if (await isPlatformChallenged(session, 'FACEBOOK')) {
@@ -398,7 +402,7 @@ export class BrowserTaskActivities {
                 // navigation (profile/video/search) belongs to the action
                 // after the shared session/authentication step.
                 await initializePlatformSession(session, 'TIKTOK', credentials, {
-                  locale: fingerprint?.locale,
+                  locale: profileLocale,
                   entryUrl: platformHomeUrlForProfile('TIKTOK', current.account.browserProfile?.metadata),
                 });
                 if (await isPlatformChallenged(session, 'TIKTOK')) {
