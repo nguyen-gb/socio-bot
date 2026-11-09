@@ -13,6 +13,7 @@ import {
   installFingerprintEmulation,
   loadFingerprintEmulation,
 } from './fingerprint-emulation';
+import type { BrowserLocaleEnvironment } from './ip-locale';
 
 const DEFAULT_EXECUTION_TIMEOUT_MS = 15 * 60_000;
 
@@ -44,6 +45,8 @@ export interface OpenProfileOptions {
   emulateFingerprint?: boolean;
   /** Profile-level fingerprint settings loaded from BrowserProfile.metadata. */
   fingerprint?: FingerprintEmulationOverrides;
+  /** Locale environment saved by the proxy's successful health check. */
+  localeEnvironment?: BrowserLocaleEnvironment;
   /** `null` follows the native browser window size, like a normal Chrome window. */
   viewport?: BrowserViewport | null;
   slotTimeoutMs?: number;
@@ -67,6 +70,8 @@ export interface ManagedBrowserSession extends PlatformSession {
   slot: number;
   processId?: number;
   signal?: AbortSignal;
+  locale?: string;
+  timezoneId?: string;
   close(): Promise<void>;
 }
 
@@ -135,16 +140,30 @@ export class BrowserRuntime {
     const restoreStructuredOriginState = await isSidecarOnlyProfile(profilePath);
     let context: BrowserContext | undefined;
     let record: BrowserProcessRecord | undefined;
+    let sessionLocale: BrowserLocaleEnvironment | undefined;
     try {
       await mkdir(profilePath, { recursive: true });
       record = await this.processes.begin(options.profileId, options.ownerId);
+      const localeEnvironment = options.localeEnvironment;
+      sessionLocale = localeEnvironment;
+      const effectiveFingerprint = localeEnvironment
+        ? {
+          ...(options.fingerprint ?? { mode: 'auto' as const }),
+          localeMode: 'configured' as const,
+          locale: localeEnvironment.locale,
+          languages: localeEnvironment.languages,
+          timezoneId: localeEnvironment.timezoneId,
+        }
+        : options.fingerprint?.localeMode === 'auto'
+          ? { ...options.fingerprint, localeMode: 'native' as const }
+          : options.fingerprint;
       const fingerprint = options.emulateFingerprint
         ? await loadFingerprintEmulation(profilePath, {
-          locale: options.locale,
-          timezoneId: options.timezoneId,
+          locale: localeEnvironment?.locale ?? options.locale,
+          timezoneId: localeEnvironment?.timezoneId ?? options.timezoneId,
           viewport: options.viewport,
           colorScheme: options.colorScheme,
-        }, options.fingerprint)
+        }, effectiveFingerprint)
         : undefined;
       const viewport = options.viewport ?? null;
       const headless = options.headless ?? true;
@@ -157,15 +176,6 @@ export class BrowserRuntime {
       ];
       context = await chromium.launchPersistentContext(profilePath, {
         args: launchArgs,
-        // Headless Chromium hides native scrollbars by default. Remote users
-        // need visible, draggable thumbs just like in a normal browser.
-        // Patchright adds --disable-blink-features=AutomationControlled by
-        // default. Chrome now displays a visible unsupported-flag warning for
-        // it, so omit that flag while retaining the normal scrollbar behavior.
-        ignoreDefaultArgs: [
-          '--hide-scrollbars',
-          '--disable-blink-features=AutomationControlled',
-        ],
         timeout: 45_000,
         headless,
         channel: options.channel ?? 'chrome',
@@ -181,10 +191,10 @@ export class BrowserRuntime {
         hasTouch: false,
         // Leave color scheme and reduced-motion preferences to the host OS,
         // matching a normal Chrome launch instead of emulating a fixed theme.
-        locale: options.locale,
-        timezoneId: options.timezoneId,
+        locale: localeEnvironment?.locale ?? options.locale,
+        timezoneId: localeEnvironment?.timezoneId ?? options.timezoneId,
         colorScheme: options.colorScheme,
-        bypassCSP: fingerprint !== undefined,
+        bypassCSP: fingerprint?.mode === 'custom',
         ...(fingerprint ? fingerprintLaunchOptions(fingerprint) : {}),
         // Do not inject a DNT header. Chrome does not send it by default, and
         // forcing a privacy header makes the anonymous search profile less
@@ -195,7 +205,7 @@ export class BrowserRuntime {
           ? { path: options.recordHarPath, content: 'omit', mode: 'minimal' }
           : undefined,
       }) as unknown as BrowserContext;
-      if (fingerprint) await installFingerprintEmulation(context, fingerprint);
+      if (fingerprint) await installFingerprintEmulation(context, fingerprint, profilePath);
       await this.processes.identify(record);
       context.setDefaultTimeout(15_000);
       context.setDefaultNavigationTimeout(45_000);
@@ -223,7 +233,7 @@ export class BrowserRuntime {
     if (!context || !record) throw new Error('Browser process was not created');
     const abort = new AbortController();
     const identity = {};
-    const promise = this.createManagedSession(options.profileId, context, lease, record, identity, abort);
+    const promise = this.createManagedSession(options.profileId, context, lease, record, identity, abort, sessionLocale);
     const active: ActiveSession = {
       context,
       profilePath,
@@ -362,6 +372,7 @@ export class BrowserRuntime {
     record: BrowserProcessRecord,
     identity: object,
     abort: AbortController,
+    localeEnvironment?: BrowserLocaleEnvironment,
   ): Promise<ManagedBrowserSession> {
     const pages = context.pages();
     const page = pages[0] ?? (await withDeadline(context.newPage(), 10_000, 'Browser page startup timed out'));
@@ -373,6 +384,8 @@ export class BrowserRuntime {
       slot: lease.slot,
       processId: record.pid,
       signal: abort.signal,
+      locale: localeEnvironment?.locale,
+      timezoneId: localeEnvironment?.timezoneId,
       close: () => {
         const active = this.sessions.get(profileId);
         return active?.identity === identity

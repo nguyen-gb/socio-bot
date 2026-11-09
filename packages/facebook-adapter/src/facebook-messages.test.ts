@@ -44,9 +44,31 @@ test('an old identical bubble never confirms a new unacknowledged send', async (
   assert.equal(await page.getByRole('row').count(), 1);
 }));
 
-test('prefers Enter to submit a Messenger message before the button fallback', async () => fixture(`<button onclick="document.querySelector('[role=dialog]').hidden=false">Message</button>
-  <div role="dialog" hidden><div role="textbox" contenteditable="true" onkeydown="if(event.key==='Enter'){event.preventDefault(); const box=this; const row=document.createElement('div'); row.setAttribute('role','row'); row.textContent=box.textContent; this.parentElement.append(row); box.textContent='';}"></div><button aria-label="Send" onclick="throw new Error('button fallback should not be used')">Send</button></div>`, async page => {
-  const result = await automation.message({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, profileUrl, 'Tin nhắn bằng Enter');
+test('prefers the scoped Messenger send control when it is available', async () => fixture(`<button onclick="document.querySelector('[role=dialog]').hidden=false">Message</button>
+  <div role="dialog" hidden><div role="textbox" contenteditable="true" onkeydown="if(event.key==='Enter'){throw new Error('Enter fallback should not be used')}"></div><button aria-label="Press Enter to send" onclick="const box=this.previousElementSibling; const row=document.createElement('div'); row.setAttribute('role','row'); row.textContent=box.textContent; this.parentElement.append(row); box.textContent=''">Send</button></div>`, async page => {
+  const result = await automation.message({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, profileUrl, 'Tin nhắn bằng nút gửi');
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.messageStatus, 'SENT');
+  assert.equal(await page.getByRole('row').count(), 1);
+}));
+
+test('restores a Lexical draft when Facebook replaces the editor after the durable marker', async () => fixture(`<button onclick="document.querySelector('[role=dialog]').hidden=false">Message</button>
+  <div role="dialog" hidden><div role="textbox" contenteditable="true" aria-label="Write to Consented User"></div><button aria-label="Press Enter to send" onclick="const box=this.previousElementSibling; const row=document.createElement('div'); row.setAttribute('role','row'); row.textContent=box.textContent; this.parentElement.append(row); box.textContent=''">Send</button></div>`, async page => {
+  const result = await automation.message({ page, profileId: 'fixture', beforeExternalAction: async () => {
+    await page.getByRole('textbox').evaluate(element => {
+      const replacement = element.cloneNode(false) as HTMLElement;
+      element.replaceWith(replacement);
+    });
+  } }, profileUrl, 'Draft được khôi phục');
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.messageStatus, 'SENT');
+  assert.equal(await page.getByRole('row').count(), 1);
+  assert.equal(await page.getByRole('row').innerText(), 'Draft được khôi phục');
+}));
+
+test('submits a text message when docked Messenger exposes no named Send button', async () => fixture(`<button onclick="document.querySelector('#composer').hidden=false">Message</button>
+  <div id="composer" hidden><div role="textbox" contenteditable="true" onkeydown="if(event.key==='Enter'){event.preventDefault(); const row=document.createElement('div'); row.setAttribute('role','row'); row.textContent=this.textContent; this.parentElement.append(row); this.textContent='';}"></div></div>`, async page => {
+  const result = await automation.message({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, profileUrl, 'Tin nhắn không có nút gửi');
   assert.equal(result.ok, true);
   assert.equal(result.data?.messageStatus, 'SENT');
   assert.equal(await page.getByRole('row').count(), 1);
@@ -76,17 +98,49 @@ test('sends from Facebook docked Messenger composer without a dialog role', asyn
   assert.equal(result.data?.messageStatus, 'SENT');
 }));
 
+test('confirms from the profile chat root when the themed composer excludes the transcript', async () => {
+  const numericProfileUrl = 'https://www.facebook.com/100095503110962';
+  await fixture(`<button onclick="document.querySelector('#chat').hidden=false">Message</button>
+    <div id="chat" hidden><a href="/100095503110962/">Recipient</a><div id="transcript"></div>
+      <div style="--chat-composer: 1"><div role="textbox" contenteditable="true"></div><button aria-label="Press Enter to send" onclick="const box=this.previousElementSibling;const row=document.createElement('div');row.setAttribute('role','row');row.textContent=box.textContent;document.querySelector('#transcript').append(row);box.textContent=''">Send</button></div>
+    </div>`, async page => {
+    const result = await automation.message({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, numericProfileUrl, 'Tin nhắn nằm ngoài composer');
+    assert.equal(result.ok, true);
+    assert.equal(result.data?.messageStatus, 'SENT');
+    assert.equal(await page.locator('#transcript').getByRole('row').count(), 1);
+  });
+});
+
 test('opens the profile Message action instead of a stale body-level chat action', async () => {
+  const numericProfileUrl = 'https://www.facebook.com/100095503110962';
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext();
-    await context.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<div id="stale-chat"><button>Message</button><textarea></textarea></div>
-      <main role="main"><h1>Recipient</h1><button onclick="document.querySelector('#profile-chat').hidden=false">Message</button>
-        <div id="profile-chat" role="dialog" hidden><div role="textbox" contenteditable="true"></div><button aria-label="Send" onclick="const box=this.parentElement.querySelector('[contenteditable=true]');const row=document.createElement('div');row.setAttribute('role','row');row.textContent=box.textContent;this.parentElement.append(row);box.textContent=''">Send</button></div>
+    await context.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<div id="stale-chat"><a href="https://www.facebook.com/999">Other chat</a><textarea></textarea><button aria-label="Send">Send</button></div>
+      <main role="main"><button>Recipient</button><button onclick="document.querySelector('#profile-chat').hidden=false">Message</button>
+        <div id="profile-chat" hidden><a href="/100095503110962/">Recipient</a><div role="textbox" contenteditable="true"></div><button aria-label="Send" onclick="const box=this.parentElement.querySelector('[contenteditable=true]');const row=document.createElement('div');row.setAttribute('role','row');row.textContent=box.textContent;this.parentElement.append(row);box.textContent=''">Send</button></div>
       </main>` }));
-    const result = await automation.message({ page: await context.newPage(), profileId: 'fixture', beforeExternalAction: async () => {} }, profileUrl, 'Tin nhắn đúng profile');
+    const result = await automation.message({ page: await context.newPage(), profileId: 'fixture', beforeExternalAction: async () => {} }, numericProfileUrl, 'Tin nhắn đúng profile');
     assert.equal(result.ok, true);
     assert.equal(result.data?.messageStatus, 'SENT');
+    assert.equal(await context.pages()[0]!.locator('#stale-chat').getByRole('row').count(), 0);
+    assert.equal(await context.pages()[0]!.locator('#profile-chat').getByRole('row').count(), 1);
+  } finally { await browser.close(); }
+});
+
+test('accepts a username chat header after a numeric profile redirects', async () => {
+  const numericProfileUrl = 'https://www.facebook.com/100004534306532';
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<script>history.replaceState({}, '', '/nguyenphucmanh22/')</script>
+      <main role="main"><h1>Nguyễn Phúc Mạnh</h1><button onclick="document.querySelector('#profile-chat').hidden=false">Message</button></main>
+      <div id="profile-chat" hidden><a href="/nguyenphucmanh22/">Nguyễn Phúc Mạnh</a><div aria-label="Messages in conversation with Nguyễn Phúc Mạnh"></div><div role="textbox" contenteditable="true" aria-label="Write to Nguyễn Phúc Mạnh"></div><button aria-label="Press Enter to send" onclick="const box=this.previousElementSibling;const row=document.createElement('div');row.setAttribute('role','row');row.textContent=box.textContent;this.parentElement.append(row);box.textContent=''">Send</button></div>` }));
+    const page = await context.newPage();
+    const result = await automation.message({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, numericProfileUrl, 'Tin nhắn profile username');
+    assert.equal(result.ok, true);
+    assert.equal(result.data?.messageStatus, 'SENT');
+    assert.equal(await page.locator('#profile-chat').getByRole('row').count(), 1);
   } finally { await browser.close(); }
 });
 
@@ -158,7 +212,7 @@ test('selects a visible group member at random and only then opens the message f
     await context.route('**/*', route => {
       const memberPage = route.request().url().endsWith('/groups/fixture/members');
       return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<main role="main">${memberPage
-        ? '<a href="https://www.facebook.com/groups/1710577763336777/user/61594169541646/">Current account</a><a href="https://www.facebook.com/groups/1710577763336777/user/100028475506542/">Member One</a><a href="https://www.facebook.com/people/Member-Two/100012345678901/">Member Two</a>'
+        ? '<a href="https://www.facebook.com/help/">Visit Help Center</a><a href="https://www.facebook.com/groups/1710577763336777/user/61594169541646/">Current account</a><a href="https://www.facebook.com/groups/1710577763336777/user/100028475506542/">Member One</a><a href="https://www.facebook.com/people/Member-Two/100012345678901/">Member Two</a>'
         : messenger}</main>` });
     });
     const page = await context.newPage();
@@ -177,18 +231,18 @@ test('skips recipients rejected by the durable message ledger', async () => {
     await context.route('**/*', route => {
       const memberPage = route.request().url().endsWith('/groups/fixture/members');
       return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<main role="main">${memberPage
-        ? '<a href="https://www.facebook.com/groups/1710577763336777/user/100028475506542/">Already messaged</a><a href="https://www.facebook.com/people/Member-Two/100012345678901/">New member</a>'
+        ? '<a href="https://www.facebook.com/groups/1710577763336777/user/100028475506542/">Already messaged</a><a href="https://www.facebook.com/groups/1710577763336777/user/100012345678901/">New member</a>'
         : messenger}</main>` });
     });
     const page = await context.newPage();
     const result = await automation.messageRandomGroupMember({
       page,
       profileId: 'fixture',
-      reserveMessageRecipient: async ({ profileUrl }) => profileUrl === 'https://www.facebook.com/profile.php?id=100012345678901',
+      reserveMessageRecipient: async ({ profileUrl }) => profileUrl === 'https://www.facebook.com/100012345678901',
       beforeExternalAction: async () => {},
     }, 'https://www.facebook.com/groups/fixture/', 'Tin nhắn không trùng');
     assert.equal(result.ok, true);
-    assert.equal(result.data?.profileUrl, 'https://www.facebook.com/profile.php?id=100012345678901');
+    assert.equal(result.data?.profileUrl, 'https://www.facebook.com/100012345678901');
   } finally { await browser.close(); }
 });
 
@@ -208,6 +262,24 @@ test('selects a visible post reactor at random and reuses the Messenger flow', a
     assert.equal(result.ok, true);
     assert.equal(result.data?.postUrl, 'https://www.facebook.com/groups/fixture/posts/456');
     assert.ok(['https://www.facebook.com/100028475506542', 'https://www.facebook.com/profile.php?id=100012345678901'].includes(String(result.data?.profileUrl)));
+  } finally { await browser.close(); }
+});
+
+test('post reactor flow uses the reaction summary in a post dialog and never clicks the Like action', async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addCookies([{ name: 'c_user', value: '61594169541646', domain: '.facebook.com', path: '/' }]);
+    await context.route('**/*', route => {
+      const postPage = route.request().url().includes('/groups/fixture/posts/456');
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: postPage
+        ? `<main role="main"></main><div role="dialog"><button aria-label="React with Like to Fixture's post" onclick="window.unwantedLike=true">Like</button><div role="toolbar" aria-label="See who reacted to this"><button aria-label="Like: 1 person" onclick="document.querySelector('[data-reactions]').hidden=false"></button></div></div><div role="dialog" data-reactions hidden><a href="https://www.facebook.com/100028475506542">Reactor One</a></div>`
+        : `<main role="main">${messenger}</main>` });
+    });
+    const page = await context.newPage();
+    const result = await automation.messageRandomPostReactor({ page, profileId: 'fixture', beforeExternalAction: async () => {} }, 'https://www.facebook.com/groups/fixture/posts/456', 'Tin nhắn người react');
+    assert.equal(result.ok, true);
+    assert.notEqual(await page.evaluate(() => (window as unknown as { unwantedLike?: boolean }).unwantedLike), true);
   } finally { await browser.close(); }
 });
 

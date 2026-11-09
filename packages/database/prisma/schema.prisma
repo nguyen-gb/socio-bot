@@ -157,6 +157,8 @@ model User {
   auditLogs   AuditLog[]
   refreshTokens RefreshToken[]
   approvedTasks Task[]               @relation("TaskApprover")
+  createdTasks Task[]                @relation("TaskCreator")
+  createdFacebookCampaigns FacebookCampaign[] @relation("FacebookCampaignCreator")
 }
 
 model RefreshToken {
@@ -250,6 +252,9 @@ model Proxy {
   status         ProxyStatus           @default(CREATED)
   lastCheckedAt  DateTime?
   latencyMs      Int?
+  locale         String?
+  languages      String[]              @default([])
+  timezoneId     String?
   createdAt      DateTime              @default(now())
   updatedAt      DateTime              @updatedAt
   organization   Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
@@ -275,10 +280,12 @@ model Task {
   accountId      String          @db.Uuid
   idempotencyKey String
   workflowId     String?         @unique
+  dispatchedAt   DateTime?
   platform       Platform
   action         String
   payload        Json
   campaignId     String?         @db.Uuid
+  batchId        String?         @db.Uuid
   campaign       FacebookCampaign? @relation(fields: [campaignId], references: [id], onDelete: Restrict)
   priority       Int             @default(50)
   status         TaskStatus      @default(QUEUED)
@@ -287,6 +294,7 @@ model Task {
   attemptCount   Int             @default(0)
   approvalStatus TaskApprovalStatus @default(NOT_REQUIRED)
   approvedByUserId String?       @db.Uuid
+  createdByUserId  String?       @db.Uuid
   approvedAt     DateTime?
   rejectedAt     DateTime?
   pausedAt       DateTime?
@@ -297,6 +305,7 @@ model Task {
   organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   account        PlatformAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
   approvedBy     User?           @relation("TaskApprover", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  createdBy      User?           @relation("TaskCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
   runs           TaskRun[]
   artifacts      Artifact[]
 
@@ -305,6 +314,9 @@ model Task {
   @@index([accountId, status])
   @@index([organizationId, approvalStatus])
   @@index([campaignId, status])
+  @@index([organizationId, batchId, createdAt])
+  @@index([createdByUserId])
+  @@index([status, dispatchedAt])
 }
 
 model FacebookGroupMembership {
@@ -389,6 +401,44 @@ model FacebookMessageRecipient {
   @@index([organizationId, profileUrl])
 }
 
+// A durable per-account ledger shared by every TikTok campaign. It prevents
+// concurrent and later campaigns from acting on the same recipient/video.
+model TikTokActionTarget {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  accountId      String   @db.Uuid
+  taskId         String?  @db.Uuid
+  action         String
+  targetKey      String
+  status         String   @default("RESERVED")
+  reservedAt     DateTime @default(now())
+  completedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, accountId, action, targetKey])
+  @@index([organizationId, accountId, action, status])
+  @@index([taskId, status])
+}
+
+model FacebookActionTarget {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  accountId      String   @db.Uuid
+  taskId         String?  @db.Uuid
+  action         String
+  targetKey      String
+  status         String   @default("RESERVED")
+  reservedAt     DateTime @default(now())
+  completedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, accountId, action, targetKey])
+  @@index([organizationId, accountId, action, status])
+  @@index([taskId, status])
+}
+
 model FacebookCampaign {
   id             String       @id @default(uuid()) @db.Uuid
   organizationId String       @db.Uuid
@@ -399,12 +449,15 @@ model FacebookCampaign {
   approvedAt     DateTime?
   pausedAt       DateTime?
   cancelledAt    DateTime?
+  createdByUserId String?      @db.Uuid
   createdAt      DateTime     @default(now())
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   tasks          Task[]
+  createdBy      User?        @relation("FacebookCampaignCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
 
   @@unique([organizationId, idempotencyKey])
   @@index([organizationId, createdAt])
+  @@index([createdByUserId])
 }
 
 model TaskRun {

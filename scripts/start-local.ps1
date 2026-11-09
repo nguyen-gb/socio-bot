@@ -195,5 +195,5 @@ Write-Host 'API ready:   http://localhost:3001/api/health/ready'
 Write-Host 'Temporal UI: http://localhost:8233'
 Write-Host 'Press Ctrl+C to stop application processes only; local infrastructure stays running.'
 
-corepack pnpm dev
+corepack pnpm dev:apps
 exit $LASTEXITCODE

@@ -123,12 +123,30 @@ test('TikTok comment, reply and like actions require approval', () => {
   assert.equal(requiresExternalApproval('LIKE_TIKTOK_COMMENTS'), true);
 });
 
-test('TikTok follower messaging accepts a bounded username campaign and requires approval', () => {
+test('TikTok comment actions reject image attachments', () => {
+  const videoUrl = 'https://www.tiktok.com/@creator/video/1234567890123456789';
+  const mediaAssetIds = ['00000000-0000-4000-8000-000000000020'];
+  const actions = [
+    { action: 'AUTO_COMMENT_TIKTOK_HOME', payload: { text: 'Xin chào', mediaAssetIds, maxVideos: 1, minLikes: 0 } },
+    { action: 'COMMENT_TIKTOK_VIDEOS', payload: { videoUrls: [videoUrl], text: 'Xin chào', mediaAssetIds, maxVideos: 1 } },
+    { action: 'REPLY_TIKTOK_COMMENTS', payload: { videoUrls: [videoUrl], text: 'Cảm ơn bạn', mediaAssetIds, maxReplies: 1 } },
+  ] as const;
+
+  for (const [index, action] of actions.entries()) {
+    const result = createTaskSchema.safeParse({
+      idempotencyKey: `tiktok-no-image-${index}`,
+      action: { platform: 'TIKTOK', accountId, ...action },
+    });
+    assert.equal(result.success, false);
+  }
+});
+
+test('TikTok follower messaging accepts an image-only campaign and requires approval', () => {
   const result = createTaskSchema.safeParse({
     idempotencyKey: 'tiktok-follower-dm-0001',
     action: {
       platform: 'TIKTOK', accountId, action: 'MESSAGE_TIKTOK_FOLLOWERS',
-      payload: { name: 'IB follower', username: '@kenh_cua_toi', text: 'Xin chào', maxFollowers: 10, mediaAssetIds: [], intervalSeconds: 5 },
+      payload: { name: 'IB follower', username: '@kenh_cua_toi', text: '', maxFollowers: 10, mediaAssetIds: ['00000000-0000-4000-8000-000000000020'], intervalSeconds: 5 },
     },
   });
   assert.equal(result.success, true);

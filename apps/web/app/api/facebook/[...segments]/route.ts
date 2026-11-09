@@ -13,7 +13,7 @@ async function forward(request: NextRequest, context: { params: Promise<{ segmen
       : request.method === 'PATCH' ? collectionPath || recipientPath
         : request.method === 'DELETE' ? collectionPath || recipientPath : false;
   if (!allowed) return NextResponse.json({ message: 'Action not found' }, { status: 404 });
-  return forwardAuthenticated(request, `/api/facebook/${path}`, {
+  return forwardAuthenticated(request, `/api/facebook/${path}${request.nextUrl.search}`, {
     method: request.method,
     ...(['POST', 'PATCH'].includes(request.method) ? { headers: { 'content-type': 'application/json' }, body: await request.text() } : {}),
   });

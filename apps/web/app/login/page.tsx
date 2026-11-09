@@ -4,6 +4,7 @@ import { Button, Card, Form, Input, Typography } from 'antd';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { useToast, useToastError } from '../toast';
+import { readApiJson } from '../../lib/api-response';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -20,9 +21,9 @@ export default function LoginPage() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(values),
       });
-      const payload = (await response.json()) as { message?: string };
+      const payload = await readApiJson<{ message?: string | string[] }>(response, '/api/auth/login');
       if (!response.ok) {
-        throw new Error(payload.message ?? 'Đăng nhập thất bại');
+        throw new Error(Array.isArray(payload.message) ? payload.message.join('. ') : payload.message ?? 'Đăng nhập thất bại');
       }
       toast.success('Đăng nhập thành công');
       router.replace('/');

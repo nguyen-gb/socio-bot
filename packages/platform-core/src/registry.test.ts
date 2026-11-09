@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { BrowserPage, PlatformAdapter } from './index';
-import { gotoPlatformPage, PlatformAdapterRegistry } from './index';
+import { gotoPlatformPage, PlatformAdapterRegistry, waitForPlatformPageReady } from './index';
 
 const adapter: PlatformAdapter = {
   platform: 'X',
@@ -77,13 +77,104 @@ test('waits for the full page load before returning from navigation', async () =
     goto: async () => { milestones.push('goto'); },
     waitForLoadState: async (state) => { milestones.push(state ?? 'unknown'); },
     waitForTimeout: async (milliseconds) => { milestones.push(`settle:${milliseconds}`); },
-    evaluate: async () => 'complete' as never,
+    evaluate: async () => 'loading' as never,
     locator: () => ({ count: async () => 0 }),
   };
 
   await gotoPlatformPage(page, 'https://www.facebook.com/');
 
-  assert.deepEqual(milestones, ['goto', 'domcontentloaded', 'load', 'settle:400']);
+  assert.deepEqual(milestones.slice(0, 3), ['goto', 'domcontentloaded', 'load']);
+  const settleEvents = milestones.filter((milestone) => milestone.startsWith('settle:'));
+  const settleMs = Number(settleEvents[settleEvents.length - 1]?.replace('settle:', ''));
+  assert.ok(settleMs >= 1_000 && settleMs <= 3_000, `expected a 1-3s human delay, received ${settleMs}ms`);
+});
+
+test('accepts the completed replacement document when the old load-state wait times out', async () => {
+  let probes = 0;
+  const page: BrowserPage = {
+    url: () => 'https://www.tiktok.com/en',
+    title: async () => 'TikTok',
+    goto: async () => undefined,
+    waitForLoadState: async (state) => {
+      if (state === 'load') {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        throw new Error('page.waitForLoadState: Timeout 1ms exceeded.');
+      }
+    },
+    waitForTimeout: async () => undefined,
+    evaluate: async () => { probes += 1; return 'complete' as never; },
+    locator: () => ({ count: async () => 0 }),
+  };
+
+  await waitForPlatformPageReady(page, { timeoutMs: 1 });
+
+  assert.equal(probes, 1);
+});
+
+test('continues immediately when the current document is complete even if the old load wait is still pending', async () => {
+  let settled = false;
+  const page: BrowserPage = {
+    url: () => 'https://www.tiktok.com/en',
+    title: async () => 'TikTok',
+    goto: async () => undefined,
+    waitForLoadState: async () => new Promise<void>(() => undefined),
+    waitForTimeout: async () => undefined,
+    evaluate: async () => 'complete' as never,
+    locator: () => ({ count: async () => 0 }),
+  };
+
+  await waitForPlatformPageReady(page, { timeoutMs: 45_000 });
+  settled = true;
+
+  assert.equal(settled, true);
+});
+
+test('applies the human settle delay only once for repeated checks of the same completed document', async () => {
+  const delays: number[] = [];
+  const page: BrowserPage = {
+    url: () => 'https://www.tiktok.com/en',
+    title: async () => 'TikTok',
+    goto: async () => undefined,
+    waitForLoadState: async () => new Promise<void>(() => undefined),
+    waitForTimeout: async (milliseconds) => { delays.push(milliseconds); },
+    evaluate: async () => ({
+      readyState: 'complete',
+      href: 'https://www.tiktok.com/en',
+      timeOrigin: 12345,
+    }) as never,
+    locator: () => ({ count: async () => 0 }),
+  };
+
+  await waitForPlatformPageReady(page);
+  await waitForPlatformPageReady(page);
+  await waitForPlatformPageReady(page);
+
+  assert.equal(delays.length, 1);
+  assert.ok(delays[0]! >= 1_000 && delays[0]! <= 3_000);
+});
+
+test('applies a new settle delay after the browser loads a new document', async () => {
+  const delays: number[] = [];
+  let timeOrigin = 12345;
+  const page: BrowserPage = {
+    url: () => 'https://www.tiktok.com/en',
+    title: async () => 'TikTok',
+    goto: async () => undefined,
+    waitForLoadState: async () => undefined,
+    waitForTimeout: async (milliseconds) => { delays.push(milliseconds); },
+    evaluate: async () => ({
+      readyState: 'complete',
+      href: 'https://www.tiktok.com/en',
+      timeOrigin,
+    }) as never,
+    locator: () => ({ count: async () => 0 }),
+  };
+
+  await waitForPlatformPageReady(page);
+  timeOrigin += 1;
+  await waitForPlatformPageReady(page);
+
+  assert.equal(delays.length, 2);
 });
 
 test('reloads a failed target once before surfacing the navigation error', async () => {

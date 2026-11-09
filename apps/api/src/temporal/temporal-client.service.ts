@@ -4,6 +4,7 @@ import { Client, Connection, ScheduleOverlapPolicy } from '@temporalio/client';
 import type { Schedule } from '@socio/database';
 import type { ProxyCheckResult, ProxyCheckWorkflowInput } from '@socio/contracts';
 import type { ApiEnvironment } from '../config/environment';
+import { PrismaService } from '../database/prisma.service';
 import {
   executeTaskWorkflow,
   loginSessionWorkflow,
@@ -18,6 +19,7 @@ export class TemporalClientService implements OnModuleDestroy {
 
   constructor(
     private readonly config: ConfigService<ApiEnvironment, true>,
+    private readonly prisma: PrismaService,
   ) {}
 
   async startTask(
@@ -31,10 +33,20 @@ export class TemporalClientService implements OnModuleDestroy {
       namespace: this.config.get('temporalNamespace', { infer: true }),
     });
 
-    await client.workflow.start(executeTaskWorkflow, {
-      taskQueue: this.config.get('temporalTaskQueue', { infer: true }),
-      workflowId,
-      args: [{ taskId, workflowId, scheduledAt: scheduledAt?.toISOString() }],
+    try {
+      await client.workflow.start(executeTaskWorkflow, {
+        taskQueue: this.config.get('temporalTaskQueue', { infer: true }),
+        workflowId,
+        args: [{ taskId, workflowId, scheduledAt: scheduledAt?.toISOString() }],
+      });
+    } catch (error) {
+      // Temporal workflow IDs are our delivery idempotency key. A previous
+      // request may have reached Temporal while the API lost the response.
+      if (!this.isAlreadyStarted(error)) throw error;
+    }
+    await this.prisma.task.updateMany({
+      where: { id: taskId, workflowId },
+      data: { dispatchedAt: new Date(), lastError: null },
     });
   }
 
@@ -153,5 +165,11 @@ export class TemporalClientService implements OnModuleDestroy {
 
   private scheduleId(id: string): string {
     return `socio-schedule-${id}`;
+  }
+
+  private isAlreadyStarted(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    return error.name === 'WorkflowExecutionAlreadyStartedError'
+      || /already started|already exists/i.test(error.message);
   }
 }

@@ -23,6 +23,7 @@ interface InputViewport {
 
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 720;
+const SESSION_PROTOCOL_PREFIX = 'socio-remote.';
 
 @Injectable()
 export class RemoteSessionGateway implements OnModuleDestroy {
@@ -75,9 +76,17 @@ export class RemoteSessionGateway implements OnModuleDestroy {
       response.writeHead(404);
       response.end();
     });
-    this.webSocketServer = new WebSocketServer({ server: this.server });
+    this.webSocketServer = new WebSocketServer({
+      server: this.server,
+      handleProtocols: (protocols) =>
+        [...protocols].find((protocol) => protocol.startsWith(SESSION_PROTOCOL_PREFIX)) || false,
+    });
     this.webSocketServer.on('connection', (socket, request) => {
-      void this.acceptConnection(socket, request.url ?? '/');
+      void this.acceptConnection(
+        socket,
+        request.url ?? '/',
+        request.headers['sec-websocket-protocol'],
+      );
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -152,11 +161,18 @@ export class RemoteSessionGateway implements OnModuleDestroy {
     ]);
   }
 
-  private async acceptConnection(socket: WebSocket, rawUrl: string): Promise<void> {
+  private async acceptConnection(
+    socket: WebSocket,
+    rawUrl: string,
+    rawProtocol: string | string[] | undefined,
+  ): Promise<void> {
     const url = new URL(rawUrl, `http://localhost:${this.port.toString()}`);
     const match = /^\/sessions\/([0-9a-f-]+)$/i.exec(url.pathname);
     const sessionId = match?.[1];
-    const token = url.searchParams.get('token');
+    const offeredProtocol = (Array.isArray(rawProtocol) ? rawProtocol : rawProtocol?.split(','))
+      ?.map((value) => value.trim())
+      .find((value) => value.startsWith(SESSION_PROTOCOL_PREFIX));
+    const token = offeredProtocol?.slice(SESSION_PROTOCOL_PREFIX.length);
     if (
       !sessionId ||
       !token ||

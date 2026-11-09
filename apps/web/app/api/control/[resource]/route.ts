@@ -7,6 +7,7 @@ const ALLOWED_RESOURCES = new Set([
   'proxies',
   'audit',
   'schedules',
+  'users',
 ]);
 
 export async function GET(
@@ -18,7 +19,7 @@ export async function GET(
     return NextResponse.json({ message: 'Resource not found' }, { status: 404 });
   }
 
-  return forwardAuthenticated(request, `/api/${resource}`);
+  return forwardAuthenticated(request, `/api/${resource}${request.nextUrl.search}`);
 }
 
 export async function POST(

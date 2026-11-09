@@ -14,7 +14,7 @@ function setup(status = 'READY', stored: typeof credentials | null = credentials
   };
   const prisma = {
     platformAccount: { findFirst: async ({ where }: any) => { assert.equal(where.organizationId, 'org'); return account; } },
-    proxy: { findFirst: async () => ({ id: 'proxy', status: 'HEALTHY' }) },
+    proxy: { findFirst: async () => ({ id: 'proxy', status: 'HEALTHY', locale: 'vi-VN', languages: ['vi-VN', 'vi'], timezoneId: 'Asia/Ho_Chi_Minh' }) },
     $transaction: async (callback: any) => callback(tx),
   };
   const vault = { profileCredentials: () => stored ?? {}, seal: () => 'new-sealed-fixture' };
@@ -80,6 +80,16 @@ test('editing with an active browser remains blocked without writes', async () =
   context.account.browserProfile.sessions = [{ status: 'RUNNING' }];
   await assert.rejects(context.service.update('org', 'account', { username: 'New name' }), /Close the browser/);
   assert.equal(context.writes.length, 0);
+});
+
+test('an untested proxy cannot be assigned while creating a profile', async () => {
+  const prisma = {
+    proxy: { findFirst: async () => ({ id: 'proxy', status: 'CREATED', locale: null, languages: [], timezoneId: null }) },
+  };
+  const service = new AccountsService(prisma as never, {} as never);
+  await assert.rejects(service.create('org', {
+    platform: 'FACEBOOK', proxyId: 'proxy', authentication: {},
+  }), /Kiểm tra proxy thành công/);
 });
 
 test('deleting an account also removes its schedules, tasks, and browser sessions', async () => {

@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { ConfigService } from '@nestjs/config';
 import { Context } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
@@ -45,7 +46,7 @@ import type { ObjectStorage } from '@socio/object-storage';
 import { OBJECT_STORAGE } from '../storage/object-storage.providers';
 import { loadTaskImages } from '../storage/task-images';
 import { AntiCaptchaService } from '../captcha/anticaptcha.service';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrlForProfile, platformSessionStateOrigins, profileFingerprintSettings, profileLoginSettings } from './platform-login';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrl, platformSessionStateOrigins, profileFingerprintSettings, profileLoginSettings, proxyLocaleEnvironment } from './platform-login';
 import { installTikTokImAuthBridge } from './tiktok-im-auth-bridge';
 
 const sharedTikTokSearchProfileId = 'search-tiktok-anonymous';
@@ -247,11 +248,21 @@ export class BrowserTaskActivities {
     const facebookBrowserAction = ['SYNC_FACEBOOK_GROUPS', 'JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'SCAN_FACEBOOK_POST_COMMENTS', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action);
     const tiktokBrowserAction = ['SEARCH_TIKTOK_VIDEOS', 'AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action);
     const authenticatedBrowserAction = facebookBrowserAction || (tiktokBrowserAction && !tiktokSearchAction);
-    if (authenticatedBrowserAction && current.account.status !== 'READY') {
+    const browserReuseKey = current.campaignId
+      ? `campaign/${current.campaignId}/account/${current.accountId}`
+      : current.batchId
+        ? `batch/${current.batchId}/account/${current.accountId}`
+        : undefined;
+    const activeProfileSession = current.account.browserProfile?.sessions?.[0];
+    const reusableProfileSession = Boolean(browserReuseKey
+      && activeProfileSession?.mode === 'AUTOMATION'
+      && activeProfileSession.workflowId === browserReuseKey
+      && activeProfileSession.workerId === this.registry.workerId);
+    if (authenticatedBrowserAction && current.account.status !== 'READY' && !(current.account.status === 'RUNNING' && reusableProfileSession)) {
       await this.prisma.task.update({ where: { id: task.id }, data: { status: 'REQUIRES_ACTION', lastError: 'Account không ở trạng thái READY; hãy đăng nhập hoặc xử lý xác minh trước.' } });
       return { ok: false, data: { requiresAction: true, reason: 'Account is not READY' } };
     }
-    const hasActiveProfileSession = Boolean(current.account.browserProfile?.sessions.length);
+    const hasActiveProfileSession = Boolean(current.account.browserProfile?.sessions?.length) && !reusableProfileSession;
     const hasUnhealthyProxy = current.account.proxyBinding?.proxy.status !== 'HEALTHY' && Boolean(current.account.proxyBinding);
     if ((authenticatedBrowserAction && (hasActiveProfileSession || hasUnhealthyProxy)) || (tiktokSearchAction && hasUnhealthyProxy)) {
       const reason = tiktokSearchAction
@@ -280,12 +291,21 @@ export class BrowserTaskActivities {
     });
     if (!run) return { ok: false, data: { cancelled: true, reason: 'Task state changed before execution' } };
     const activityContext = Context.current();
-    const heartbeat = setInterval(() => activityContext.heartbeat({ stage: 'processing_task', taskId: task.id }), 10_000);
+    let browserSessionId: string | undefined;
+    const heartbeat = setInterval(() => {
+      activityContext.heartbeat({ stage: 'processing_task', taskId: task.id });
+      if (browserSessionId) {
+        void this.prisma.browserSession.updateMany({
+          where: { id: browserSessionId, status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } },
+          data: { lastActiveAt: new Date() },
+        }).catch(() => undefined);
+      }
+    }, 10_000);
     let sideEffectStarted = false;
     let authenticated = false;
-    let browserSessionId: string | undefined;
     let runtimeProfileId = profile.id;
     let browserCloseWaitCompleted = false;
+    let browserRetainedForBatch = false;
     const actionProgressEntries: Array<Record<string, unknown>> = [];
     const waitForBrowserClose = async () => {
       if (browserCloseWaitCompleted) return;
@@ -294,15 +314,40 @@ export class BrowserTaskActivities {
       browserCloseWaitCompleted = true;
     };
     try {
-      const browserSession = await this.prisma.browserSession.create({ data: {
-        profileId: profile.id, workerId: this.registry.workerId, mode: 'AUTOMATION', status: 'STARTING',
-        // The session lease must outlive the browser action deadline. The
-        // previous fixed six-minute expiry could terminate a valid campaign
-        // long before BROWSER_TASK_TIMEOUT_MS and leave it looking stuck.
-        expiresAt: new Date(Date.now() + (this.config.get('browserTaskTimeoutMs', { infer: true }) ?? 15 * 60_000) + 2 * 60_000),
-      } });
+      const sessionExpiresAt = new Date(Date.now() + (this.config.get('browserTaskTimeoutMs', { infer: true }) ?? 15 * 60_000) + 2 * 60_000);
+      const existingReusableSession = browserReuseKey
+        ? await this.prisma.browserSession.findUnique({ where: { workflowId: browserReuseKey } })
+        : undefined;
+      const reuseOpenBrowser = Boolean(existingReusableSession
+        && ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE'].includes(existingReusableSession.status)
+        && existingReusableSession.workerId === this.registry.workerId);
+      if (reuseOpenBrowser) {
+        this.logger.log(`Reusing browser for ${browserReuseKey} on task ${task.id}`);
+      }
+      const browserSession = existingReusableSession
+        ? await this.prisma.browserSession.update({
+          where: { id: existingReusableSession.id },
+          data: {
+            workerId: this.registry.workerId,
+            mode: 'AUTOMATION',
+            status: 'STARTING',
+            expiresAt: sessionExpiresAt,
+            lastActiveAt: new Date(),
+            closedAt: null,
+            lastError: null,
+            forceCloseRequestedAt: null,
+            ...(!reuseOpenBrowser ? { processId: null } : {}),
+          },
+        })
+        : await this.prisma.browserSession.create({ data: {
+          profileId: profile.id, workerId: this.registry.workerId, workflowId: browserReuseKey, mode: 'AUTOMATION', status: 'STARTING',
+          // The session lease must outlive the browser action deadline. The
+          // previous fixed six-minute expiry could terminate a valid campaign
+          // long before BROWSER_TASK_TIMEOUT_MS and leave it looking stuck.
+          expiresAt: sessionExpiresAt,
+        } });
       browserSessionId = browserSession.id;
-      if (!tiktokSearchAction) {
+      if (!tiktokSearchAction && !reuseOpenBrowser) {
         Context.current().heartbeat({ stage: 'restoring_profile_snapshot' });
         await this.snapshots.restore(current.account.browserProfile ?? profile);
       }
@@ -316,25 +361,29 @@ export class BrowserTaskActivities {
           ? profileFingerprintSettings(current.account.browserProfile?.metadata)
           : undefined;
         const profileControlsBrowser = Boolean(profileFingerprint);
-        const useFingerprint = Boolean(emulateFingerprint && (!profileControlsBrowser || profileFingerprint?.mode !== 'native'));
+        // Search uses a dedicated anonymous profile and must stay native. The
+        // previous condition enabled the global auto bundle whenever no
+        // account fingerprint was present, which made search inconsistent with
+        // the demo/browser-native path.
+        const useFingerprint = Boolean(emulateFingerprint && !tiktokSearchAction && (!profileControlsBrowser || profileFingerprint?.mode !== 'native'));
+        const autoLocale = profileFingerprint?.localeMode === 'auto';
         const profileLocale = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.locale;
-        const profileTimezoneId = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.timezoneId;
+        const assignedProxy = current.account.proxyBinding?.proxy;
+        const localeEnvironment = proxyLocaleEnvironment(assignedProxy);
         result = await this.runtime.withProfile(
           {
             profileId: runtimeProfileId,
-            ownerId: browserSession.id,
-            proxy: await toRuntimeProxy(
-              current.account.proxyBinding?.proxy,
-              this.secrets,
-            ),
+            ownerId: browserReuseKey ?? browserSession.id,
+            proxy: await toRuntimeProxy(assignedProxy, this.secrets),
             headless: this.config.get('browserHeadless', { infer: true }),
             channel: this.config.get('browserChannel', { infer: true }),
-            locale: profileControlsBrowser ? profileLocale : this.config.get('browserLocale', { infer: true }),
-            timezoneId: profileControlsBrowser ? profileTimezoneId : this.config.get('browserTimezoneId', { infer: true }),
+            locale: undefined,
+            timezoneId: undefined,
+            localeEnvironment,
             colorScheme: profileControlsBrowser ? undefined : this.config.get('browserColorScheme', { infer: true }),
             viewport: profileControlsBrowser ? undefined : this.config.get('browserViewport', { infer: true }),
             emulateFingerprint: useFingerprint,
-            fingerprint: useFingerprint ? profileFingerprint : undefined,
+            fingerprint: profileFingerprint,
             executionTimeoutMs: this.config.get('browserTaskTimeoutMs', { infer: true }),
             sessionStateOrigins: platformSessionStateOrigins(action.platform),
             recordHarPath: harPath,
@@ -375,13 +424,14 @@ export class BrowserTaskActivities {
                 .catch(() => undefined);
             }
             try {
+              const effectiveLocale = session.locale ?? (autoLocale ? undefined : profileLocale);
               let blocked: ActionResult | undefined;
               if (action.platform === 'FACEBOOK' && facebookBrowserAction) {
                 const loginSettings = profileLoginSettings(current.account.browserProfile?.metadata);
                 const credentials = loginSettings.credentialsRef ? await this.secrets.profileCredentials(loginSettings.credentialsRef) : undefined;
                 await initializePlatformSession(session, 'FACEBOOK', credentials, {
-                  locale: profileLocale,
-                  entryUrl: platformHomeUrlForProfile('FACEBOOK', current.account.browserProfile?.metadata),
+                  locale: effectiveLocale,
+                  entryUrl: platformHomeUrl('FACEBOOK', effectiveLocale),
                 });
                 if (await isPlatformChallenged(session, 'FACEBOOK')) {
                   await this.anticaptcha?.trySolveVisibleRecaptcha(session.page);
@@ -402,8 +452,8 @@ export class BrowserTaskActivities {
                 // navigation (profile/video/search) belongs to the action
                 // after the shared session/authentication step.
                 await initializePlatformSession(session, 'TIKTOK', credentials, {
-                  locale: profileLocale,
-                  entryUrl: platformHomeUrlForProfile('TIKTOK', current.account.browserProfile?.metadata),
+                  locale: effectiveLocale,
+                  entryUrl: platformHomeUrl('TIKTOK', effectiveLocale),
                 });
                 if (await isPlatformChallenged(session, 'TIKTOK')) {
                   const rotateCaptcha = await solveVisibleTikTokRotateCaptcha(session.page, this.tiktokCaptchaSolver);
@@ -425,7 +475,7 @@ export class BrowserTaskActivities {
                 ...session,
                 accountUsername: current.account.username ?? undefined,
                 accountExternalId: current.account.externalId ?? undefined,
-                platformHomeUrl: platformHomeUrlForProfile(action.platform, current.account.browserProfile?.metadata),
+                platformHomeUrl: platformHomeUrl(action.platform, effectiveLocale),
                 captureStepScreenshot: captureTestScreenshots
                   ? async (step: string) => {
                     await this.artifacts
@@ -469,9 +519,42 @@ export class BrowserTaskActivities {
                     ...recipient,
                   })
                   : undefined,
+                reserveFacebookTarget: ['JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action)
+                  ? async (target: { action: 'JOIN' | 'POST' | 'COMMENT' | 'REPLY' | 'MESSAGE'; targetKey: string }) => this.reserveFacebookTarget({ organizationId: current.organizationId, accountId: current.accountId, taskId: current.id, ...target })
+                  : undefined,
+                completeFacebookTarget: ['JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action)
+                  ? async (target: { action: 'JOIN' | 'POST' | 'COMMENT' | 'REPLY' | 'MESSAGE'; targetKey: string }) => this.completeFacebookTarget({ organizationId: current.organizationId, accountId: current.accountId, taskId: current.id, ...target })
+                  : undefined,
+                releaseFacebookTarget: ['JOIN_FACEBOOK_GROUP', 'POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS'].includes(action.action)
+                  ? async (target: { action: 'JOIN' | 'POST' | 'COMMENT' | 'REPLY' | 'MESSAGE'; targetKey: string }) => this.releaseFacebookTarget({ organizationId: current.organizationId, accountId: current.accountId, taskId: current.id, ...target })
+                  : undefined,
+                reserveTikTokTarget: ['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action)
+                  ? async (target: { action: 'COMMENT' | 'REPLY' | 'LIKE' | 'MESSAGE'; targetKey: string }) => this.reserveTikTokTarget({
+                    organizationId: current.organizationId,
+                    accountId: current.accountId,
+                    taskId: current.id,
+                    ...target,
+                  })
+                  : undefined,
+                completeTikTokTarget: ['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action)
+                  ? async (target: { action: 'COMMENT' | 'REPLY' | 'LIKE' | 'MESSAGE'; targetKey: string }) => this.completeTikTokTarget({
+                    organizationId: current.organizationId,
+                    accountId: current.accountId,
+                    taskId: current.id,
+                    ...target,
+                  })
+                  : undefined,
+                releaseTikTokTarget: ['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action)
+                  ? async (target: { action: 'COMMENT' | 'REPLY' | 'LIKE' | 'MESSAGE'; targetKey: string }) => this.releaseTikTokTarget({
+                    organizationId: current.organizationId,
+                    accountId: current.accountId,
+                    taskId: current.id,
+                    ...target,
+                  })
+                  : undefined,
                 resolveMediaAssets: async (ids: string[]) => {
                   const approvedMediaIds = 'mediaAssetIds' in action.payload ? action.payload.mediaAssetIds : [];
-                  if (!['POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS', 'AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action) || ids.some((id: string) => !approvedMediaIds.includes(id))) {
+                  if (!['POST_FACEBOOK_GROUP', 'MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR', 'REPLY_FACEBOOK_POST_COMMENTS', 'COMMENT_FACEBOOK_GROUP_POSTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action.action) || ids.some((id: string) => !approvedMediaIds.includes(id))) {
                     throw new Error('Ảnh không thuộc nội dung tác vụ đã duyệt');
                   }
                   return loadTaskImages(this.prisma, this.objects, task.organizationId, ids);
@@ -550,6 +633,33 @@ export class BrowserTaskActivities {
             }
           },
         );
+        if (browserReuseKey && result.data?.loginRequired !== true && result.data?.accountChallenged !== true) {
+          const followingTask = await this.prisma.task.findFirst({
+            where: {
+              id: { not: task.id },
+              accountId: task.accountId,
+              ...(current.campaignId ? { campaignId: current.campaignId } : { batchId: current.batchId }),
+              status: { in: ['QUEUED', 'SCHEDULED'] },
+              cancelledAt: null,
+              pausedAt: null,
+            },
+            orderBy: [{ scheduledAt: 'asc' }, { createdAt: 'asc' }],
+            select: { scheduledAt: true },
+          });
+          browserRetainedForBatch = Boolean(followingTask);
+          if (followingTask && browserSessionId) {
+            const nextAt = followingTask.scheduledAt?.getTime() ?? Date.now();
+            this.logger.log(`Keeping browser open for ${browserReuseKey}; another task is pending`);
+            await this.prisma.browserSession.update({
+              where: { id: browserSessionId },
+              data: {
+                status: 'IDLE',
+                lastActiveAt: new Date(),
+                expiresAt: new Date(Math.max(Date.now() + 2 * 60_000, nextAt + 2 * 60_000)),
+              },
+            });
+          }
+        }
       } finally {
         await this.artifacts
           .captureHar(task.id, run.id, harPath)
@@ -558,11 +668,11 @@ export class BrowserTaskActivities {
         // archiving the profile. Keeping the browser open while tar/lstat
         // reads the profile lets Windows hold profile.tar.gz handles and can
         // make the task appear stuck or fail with ENOTEMPTY/EPERM.
-        if (browserSessionId && this.runtime.closeProfile) {
+        if (!browserRetainedForBatch && browserSessionId && this.runtime.closeProfile) {
           await waitForBrowserClose();
-          await this.runtime.closeProfile(runtimeProfileId, browserSessionId).catch(() => undefined);
+          await this.runtime.closeProfile(runtimeProfileId, browserReuseKey ?? browserSessionId).catch(() => undefined);
         }
-        if (!tiktokSearchAction) {
+        if (!tiktokSearchAction && !browserRetainedForBatch) {
           Context.current().heartbeat({ stage: 'saving_profile_snapshot' });
           try {
             await this.snapshots.capture(profile.id);
@@ -607,7 +717,7 @@ export class BrowserTaskActivities {
         && !sideEffectStarted;
       const persistedReport = mergeTaskReports(
         extractTaskReport(task.runs?.[0]?.result),
-        buildTaskReport(task, result),
+        buildTaskReport(task, result, { runId: run.id }),
       );
 
       await this.prisma.$transaction([
@@ -626,11 +736,15 @@ export class BrowserTaskActivities {
         }),
         this.prisma.platformAccount.update({
           where: { id: task.accountId },
-          data: { status: tiktokSearchAction ? current.account.status : result.data?.accountChallenged === true ? 'CHALLENGED' : result.ok || requiresAction || retryableTikTokFailure ? 'READY' : 'ERROR' },
+          // Reaching this branch means the adapter completed normally. A
+          // partial TikTok campaign is a task-level failure, not a broken
+          // login/profile; keep the account available so the remaining
+          // checkpointed work can be continued immediately.
+          data: { status: browserRetainedForBatch ? 'RUNNING' : tiktokSearchAction ? current.account.status : result.data?.accountChallenged === true ? 'CHALLENGED' : task.platform === 'TIKTOK' || result.ok || requiresAction || retryableTikTokFailure ? 'READY' : 'ERROR' },
         }),
         ...(tiktokSearchAction ? [] : [this.prisma.browserProfile.update({
           where: { id: profile.id },
-          data: { status: 'AVAILABLE' },
+          data: { status: browserRetainedForBatch ? 'LEASED' : 'AVAILABLE' },
         })]),
       ]);
       return result;
@@ -660,9 +774,11 @@ export class BrowserTaskActivities {
           action: typeof actionProgressEntries[0]?.action === 'string' ? actionProgressEntries[0].action : task.action,
           entries: actionProgressEntries,
         }
-        : previousTaskReport
-          ? undefined
-          : buildTaskReport(task, { ok: false, data: { sideEffectStarted, reason: message } });
+        : buildTaskReport(
+          task,
+          { ok: false, data: { sideEffectStarted, reason: message } },
+          { runId: run.id },
+        );
       const persistedFailureReport = mergeTaskReports(
         extractTaskReport(task.runs?.[0]?.result),
         failureReport,
@@ -722,17 +838,24 @@ export class BrowserTaskActivities {
       throw error;
     } finally {
       clearInterval(heartbeat);
-      if (browserSessionId) {
+      if (browserSessionId && !browserRetainedForBatch) {
         // withProfile() is configured to defer closing for campaign work so
         // persistence and confirmation finish before Chromium is torn down.
         if (this.runtime.closeProfile) {
           await waitForBrowserClose();
-          await this.runtime.closeProfile(runtimeProfileId, browserSessionId).catch(() => undefined);
+          await this.runtime.closeProfile(runtimeProfileId, browserReuseKey ?? browserSessionId).catch(() => undefined);
         }
         await this.prisma.browserSession.update({ where: { id: browserSessionId }, data: { status: 'CLOSED', closedAt: new Date() } });
       }
     }
-    }, { waitTimeoutMs: 10 * 60_000, onWait: () => Context.current().heartbeat({ stage: 'waiting_profile', taskId: task.id }) });
+    }, {
+      waitTimeoutMs: 10 * 60_000,
+      onWait: () => Context.current().heartbeat({ stage: 'waiting_profile', taskId: task.id }),
+      // Search uses a shared runtime profile but records its browser session
+      // against the account profile. Probe the DB row that actually owns the
+      // running browser, not the derived Redis key.
+      isActive: () => this.leases.hasLiveProfileSession(profile.id),
+    });
   }
 
   private async logTikTokAuthenticationDiagnostics(session: ManagedBrowserSession): Promise<void> {
@@ -839,15 +962,204 @@ export class BrowserTaskActivities {
     await model.deleteMany({ where: { organizationId: input.organizationId, taskId: input.taskId, groupUrl: this.normalizeMessageScopeUrl(input.groupUrl), profileUrl: normalizeFacebookProfileUrl(input.profileUrl), status: 'RESERVED' } });
   }
 
+  private async reserveTikTokTarget(input: { organizationId: string; accountId: string; taskId: string; action: string; targetKey: string }): Promise<boolean> {
+    const model = (this.prisma as PrismaService & { tikTokActionTarget?: any }).tikTokActionTarget;
+    const targetKey = normalizeTikTokActionTarget(input.action, input.targetKey);
+    if (!model) {
+      const existing = await this.prisma.$queryRaw<Array<{ taskId: string | null; status: string }>>(Prisma.sql`
+        SELECT "taskId", "status" FROM "TikTokActionTarget"
+        WHERE "organizationId" = ${input.organizationId}::uuid
+          AND "accountId" = ${input.accountId}::uuid
+          AND "action" = ${input.action}
+          AND "targetKey" = ${targetKey}
+        LIMIT 1
+      `);
+      if (existing[0]) return existing[0].taskId === input.taskId && existing[0].status === 'RESERVED';
+      const inserted = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        INSERT INTO "TikTokActionTarget" (
+          "id", "organizationId", "accountId", "taskId", "action", "targetKey", "status", "reservedAt", "createdAt", "updatedAt"
+        ) VALUES (
+          ${randomUUID()}::uuid, ${input.organizationId}::uuid, ${input.accountId}::uuid, ${input.taskId}::uuid,
+          ${input.action}, ${targetKey}, 'RESERVED', NOW(), NOW(), NOW()
+        )
+        ON CONFLICT ("organizationId", "accountId", "action", "targetKey") DO NOTHING
+        RETURNING "id"
+      `);
+      return inserted.length === 1;
+    }
+    const where = {
+      organizationId_accountId_action_targetKey: {
+        organizationId: input.organizationId,
+        accountId: input.accountId,
+        action: input.action,
+        targetKey,
+      },
+    };
+    const existing = await model.findUnique({ where });
+    if (existing) return existing.taskId === input.taskId && existing.status === 'RESERVED';
+    try {
+      await model.create({ data: { ...input, targetKey, status: 'RESERVED' } });
+      return true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return false;
+      throw error;
+    }
+  }
+
+  private async reserveFacebookTarget(input: { organizationId: string; accountId: string; taskId: string; action: string; targetKey: string }): Promise<boolean> {
+    const model = (this.prisma as PrismaService & { facebookActionTarget?: any }).facebookActionTarget;
+    const targetKey = normalizeFacebookActionTarget(input.action, input.targetKey);
+    if (!model) {
+      if (typeof (this.prisma as PrismaService & { $queryRaw?: unknown }).$queryRaw !== 'function') return true;
+      const existing = await this.prisma.$queryRaw<Array<{ taskId: string | null; status: string }>>(Prisma.sql`
+        SELECT "taskId", "status" FROM "FacebookActionTarget"
+        WHERE "organizationId" = ${input.organizationId}::uuid AND "accountId" = ${input.accountId}::uuid
+          AND "action" = ${input.action} AND "targetKey" = ${targetKey} LIMIT 1
+      `);
+      if (existing[0]) return existing[0].taskId === input.taskId && existing[0].status === 'RESERVED';
+      const inserted = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        INSERT INTO "FacebookActionTarget" ("id", "organizationId", "accountId", "taskId", "action", "targetKey", "status", "reservedAt", "createdAt", "updatedAt")
+        VALUES (${randomUUID()}::uuid, ${input.organizationId}::uuid, ${input.accountId}::uuid, ${input.taskId}::uuid, ${input.action}, ${targetKey}, 'RESERVED', NOW(), NOW(), NOW())
+        ON CONFLICT ("organizationId", "accountId", "action", "targetKey") DO NOTHING RETURNING "id"
+      `);
+      return inserted.length === 1;
+    }
+    const where = { organizationId_accountId_action_targetKey: { organizationId: input.organizationId, accountId: input.accountId, action: input.action, targetKey } };
+    const existing = await model.findUnique({ where });
+    if (existing) return existing.taskId === input.taskId && existing.status === 'RESERVED';
+    try {
+      await model.create({ data: { ...input, targetKey, status: 'RESERVED' } });
+      return true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return false;
+      throw error;
+    }
+  }
+
+  private async completeFacebookTarget(input: { organizationId: string; accountId: string; taskId: string; action: string; targetKey: string }): Promise<void> {
+    const model = (this.prisma as PrismaService & { facebookActionTarget?: any }).facebookActionTarget;
+    const targetKey = normalizeFacebookActionTarget(input.action, input.targetKey);
+    if (!model) {
+      if (typeof (this.prisma as PrismaService & { $executeRaw?: unknown }).$executeRaw !== 'function') return;
+      await this.prisma.$executeRaw(Prisma.sql`
+        UPDATE "FacebookActionTarget" SET "status" = 'COMPLETED', "completedAt" = NOW(), "updatedAt" = NOW()
+        WHERE "organizationId" = ${input.organizationId}::uuid AND "accountId" = ${input.accountId}::uuid
+          AND "taskId" = ${input.taskId}::uuid AND "action" = ${input.action} AND "targetKey" = ${targetKey} AND "status" = 'RESERVED'
+      `);
+      return;
+    }
+    await model.updateMany({ where: { organizationId: input.organizationId, accountId: input.accountId, taskId: input.taskId, action: input.action, targetKey, status: 'RESERVED' }, data: { status: 'COMPLETED', completedAt: new Date() } });
+  }
+
+  private async releaseFacebookTarget(input: { organizationId: string; accountId: string; taskId: string; action: string; targetKey: string }): Promise<void> {
+    const model = (this.prisma as PrismaService & { facebookActionTarget?: any }).facebookActionTarget;
+    const targetKey = normalizeFacebookActionTarget(input.action, input.targetKey);
+    if (!model) {
+      if (typeof (this.prisma as PrismaService & { $executeRaw?: unknown }).$executeRaw !== 'function') return;
+      await this.prisma.$executeRaw(Prisma.sql`
+        DELETE FROM "FacebookActionTarget"
+        WHERE "organizationId" = ${input.organizationId}::uuid AND "accountId" = ${input.accountId}::uuid
+          AND "taskId" = ${input.taskId}::uuid AND "action" = ${input.action} AND "targetKey" = ${targetKey} AND "status" = 'RESERVED'
+      `);
+      return;
+    }
+    await model.deleteMany({ where: { organizationId: input.organizationId, accountId: input.accountId, taskId: input.taskId, action: input.action, targetKey, status: 'RESERVED' } });
+  }
+
+  private async completeTikTokTarget(input: { organizationId: string; accountId: string; taskId: string; action: string; targetKey: string }): Promise<void> {
+    const model = (this.prisma as PrismaService & { tikTokActionTarget?: any }).tikTokActionTarget;
+    if (!model) {
+      await this.prisma.$executeRaw(Prisma.sql`
+        UPDATE "TikTokActionTarget" SET "status" = 'COMPLETED', "completedAt" = NOW(), "updatedAt" = NOW()
+        WHERE "organizationId" = ${input.organizationId}::uuid
+          AND "accountId" = ${input.accountId}::uuid
+          AND "taskId" = ${input.taskId}::uuid
+          AND "action" = ${input.action}
+          AND "targetKey" = ${normalizeTikTokActionTarget(input.action, input.targetKey)}
+          AND "status" = 'RESERVED'
+      `);
+      return;
+    }
+    await model.updateMany({
+      where: {
+        organizationId: input.organizationId,
+        accountId: input.accountId,
+        taskId: input.taskId,
+        action: input.action,
+        targetKey: normalizeTikTokActionTarget(input.action, input.targetKey),
+        status: 'RESERVED',
+      },
+      data: { status: 'COMPLETED', completedAt: new Date() },
+    });
+  }
+
+  private async releaseTikTokTarget(input: { organizationId: string; accountId: string; taskId: string; action: string; targetKey: string }): Promise<void> {
+    const model = (this.prisma as PrismaService & { tikTokActionTarget?: any }).tikTokActionTarget;
+    if (!model) {
+      await this.prisma.$executeRaw(Prisma.sql`
+        DELETE FROM "TikTokActionTarget"
+        WHERE "organizationId" = ${input.organizationId}::uuid
+          AND "accountId" = ${input.accountId}::uuid
+          AND "taskId" = ${input.taskId}::uuid
+          AND "action" = ${input.action}
+          AND "targetKey" = ${normalizeTikTokActionTarget(input.action, input.targetKey)}
+          AND "status" = 'RESERVED'
+      `);
+      return;
+    }
+    await model.deleteMany({
+      where: {
+        organizationId: input.organizationId,
+        accountId: input.accountId,
+        taskId: input.taskId,
+        action: input.action,
+        targetKey: normalizeTikTokActionTarget(input.action, input.targetKey),
+        status: 'RESERVED',
+      },
+    });
+  }
+
   private normalizeMessageScopeUrl(value: string): string {
     try { return normalizeFacebookGroupUrl(value); }
     catch { return normalizeFacebookPostUrl(value); }
   }
 }
 
+function normalizeTikTokActionTarget(action: string, value: string): string {
+  if (action === 'MESSAGE') return value.trim().replace(/^@/, '').toLocaleLowerCase();
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    url.search = '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return value.trim();
+  }
+}
+
+function normalizeFacebookActionTarget(action: string, value: string): string {
+  if (action === 'MESSAGE') {
+    try { return normalizeFacebookProfileUrl(value); }
+    catch { return value.trim().toLocaleLowerCase(); }
+  }
+  if (action === 'POST') {
+    const separator = value.indexOf('|');
+    const group = separator >= 0 ? value.slice(0, separator) : value;
+    const content = separator >= 0 ? value.slice(separator + 1).replace(/\s+/g, ' ').trim() : '';
+    try { return `${normalizeFacebookGroupUrl(group)}|${content}`; }
+    catch { return `${group.trim()}|${content}`; }
+  }
+  try {
+    return action === 'JOIN' ? normalizeFacebookGroupUrl(value) : normalizeFacebookPostUrl(value);
+  } catch {
+    return value.trim();
+  }
+}
+
 function buildTaskReport(
   task: { action: string; payload: unknown },
   result: ActionResult,
+  options: { runId?: string } = {},
 ): Record<string, unknown> | undefined {
   const data = result.data ?? {};
   const existing = data.report;
@@ -857,7 +1169,14 @@ function buildTaskReport(
     : {};
   const completedAt = new Date().toISOString();
   const status = result.ok ? 'SUCCEEDED' : data.sideEffectStarted === true ? 'UNKNOWN' : 'FAILED';
-  const entry = (extra: Record<string, unknown> = {}) => ({ action: task.action, status, completedAt, ...(typeof data.reason === 'string' ? { reason: data.reason } : {}), ...extra });
+  const entry = (extra: Record<string, unknown> = {}) => ({
+    action: task.action,
+    status,
+    completedAt,
+    ...(options.runId ? { runId: options.runId } : {}),
+    ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
+    ...extra,
+  });
 
   if (['MESSAGE_FACEBOOK_RECIPIENT', 'MESSAGE_FACEBOOK_REACTOR'].includes(task.action)) {
     const profileUrl = typeof data.profileUrl === 'string' ? data.profileUrl : undefined;
@@ -882,8 +1201,14 @@ function buildTaskReport(
   if (task.action === 'MESSAGE_TIKTOK_FOLLOWERS' && typeof payload.username === 'string') {
     return { action: 'MESSAGE', entries: [entry({ username: payload.username })] };
   }
-  if (['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS'].includes(task.action) && Array.isArray(payload.videoUrls)) {
-    return { action: task.action, entries: payload.videoUrls.filter((videoUrl): videoUrl is string => typeof videoUrl === 'string').map(videoUrl => entry({ videoUrl })) };
+  if (['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS'].includes(task.action)) {
+    const videoUrls = Array.isArray(payload.videoUrls)
+      ? payload.videoUrls.filter((videoUrl): videoUrl is string => typeof videoUrl === 'string')
+      : [];
+    // AUTO_COMMENT can fail during entry/bootstrap before a concrete video is
+    // selected. Still persist one row for this run so retries remain visible
+    // instead of leaving the first historical failure as the only detail.
+    return { action: task.action, entries: videoUrls.length > 0 ? videoUrls.map(videoUrl => entry({ videoUrl })) : [entry()] };
   }
   return undefined;
 }

@@ -2,10 +2,182 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { PlatformAction } from '@socio/contracts';
 import type { BrowserPage, PlatformSession } from '@socio/platform-core';
-import { createTikTokFixtureSearchProvider, likeTikTokComments, replyTikTokComments, solveVisibleTikTokRotateCaptcha } from './tiktok-automation';
-import { InstagramAdapter, TikTokAdapter, XAdapter } from './web-platform-adapters';
+import { advanceTikTokForYouFeed, attachTikTokMessageMedia, commentTikTokVideos, createTikTokFixtureSearchProvider, enterTikTokRoot, likeTikTokComments, openTikTokFollowerMessageComposer, openTikTokHomeFeed, replyTikTokComments, solveVisibleTikTokRotateCaptcha } from './tiktok-automation';
+import { InstagramAdapter, isTikTokCampaignComplete, TikTokAdapter, XAdapter } from './web-platform-adapters';
 
 const accountId = '00000000-0000-4000-8000-000000000002';
+
+test('TikTok Home flow uses Ctrl+R instead of clicking For You', async () => {
+  const keys: string[] = [];
+  let forYouClicks = 0;
+  const page = {
+    url: () => 'https://www.tiktok.com/en',
+    title: async () => 'TikTok',
+    goto: async () => undefined,
+    waitForTimeout: async () => undefined,
+    keyboard: { press: async (key: string) => { keys.push(key); } },
+    locator: (selector: string) => selector.includes('For You')
+      ? { count: async () => 1, isVisible: async () => true, click: async () => { forYouClicks += 1; } }
+      : { count: async () => 0 },
+    evaluate: async (pageFunction: () => unknown) => {
+      const source = pageFunction.toString();
+      if (source.includes('readyState') && source.includes('timeOrigin')) {
+        return { readyState: 'complete', href: 'https://www.tiktok.com/en', timeOrigin: keys.length + 1 };
+      }
+      return false;
+    },
+  };
+
+  await openTikTokHomeFeed(page as never, { scrollAfterClick: false });
+
+  assert.deepEqual(keys, ['Control+R']);
+  assert.equal(forYouClicks, 0);
+});
+
+test('TikTok random comment advances only after the visible feed video changes', async () => {
+  const keys: string[] = [];
+  let signature = 'video-1';
+  const page = {
+    url: () => 'https://www.tiktok.com/en',
+    title: async () => 'TikTok',
+    goto: async () => undefined,
+    waitForTimeout: async () => undefined,
+    keyboard: {
+      press: async (key: string) => {
+        keys.push(key);
+        if (key === 'ArrowDown') signature = 'video-2';
+      },
+    },
+    locator: () => ({ count: async () => 0 }),
+    evaluate: async (pageFunction: () => unknown) => {
+      const source = pageFunction.toString();
+      if (source.includes('intersectionArea')) return signature;
+      return { moved: false, top: 0, height: 0 };
+    },
+  };
+
+  assert.equal(await advanceTikTokForYouFeed(page as never), true);
+  assert.deepEqual(keys, ['Escape', 'ArrowDown']);
+});
+
+test('TikTok campaign completion requires every requested action', () => {
+  assert.equal(isTikTokCampaignComplete({ sent: 1, requested: 2 }, 'sent'), false);
+  assert.equal(isTikTokCampaignComplete({ totalSent: 1, totalRequested: 2, sent: 1 }, 'sent'), false);
+  assert.equal(isTikTokCampaignComplete({ totalSent: 2, totalRequested: 2, sent: 1 }, 'sent'), true);
+  assert.equal(isTikTokCampaignComplete({ liked: 1, requested: 2 }, 'liked'), false);
+  assert.equal(isTikTokCampaignComplete({ liked: 2, requested: 2 }, 'liked'), true);
+});
+
+test('TikTok message media activates the current DM media button and handles its file chooser', async () => {
+  let mediaButtonClicks = 0;
+  let sendMediaClicks = 0;
+  let beforeUploadCalls = 0;
+  let uploadedFileName: string | undefined;
+  let mediaSelected = false;
+  const emptyLocator = { count: async () => 0 };
+  const mediaButton = {
+    count: async () => 1,
+    click: async () => { mediaButtonClicks += 1; },
+  };
+  const sendMediaButton = {
+    count: async () => mediaSelected ? 1 : 0,
+    isVisible: async () => mediaSelected,
+    click: async () => { sendMediaClicks += 1; mediaSelected = false; },
+  };
+  const page = {
+    locator: (selector: string) => selector.includes('dm-new-send-media-btn')
+      ? sendMediaButton
+      : selector.includes('dm-new-media-btn') ? mediaButton : emptyLocator,
+    waitForEvent: async (event: string) => {
+      assert.equal(event, 'filechooser');
+      return {
+        setFiles: async (files: Array<{ name: string }>) => { uploadedFileName = files[0]?.name; mediaSelected = true; },
+      };
+    },
+    waitForTimeout: async () => undefined,
+  };
+
+  await attachTikTokMessageMedia(page as never, [
+    { name: 'campaign-image.png', mimeType: 'image/png', buffer: Buffer.from('image') },
+  ], async () => { beforeUploadCalls += 1; });
+
+  assert.equal(mediaButtonClicks, 1);
+  assert.equal(sendMediaClicks, 1);
+  assert.equal(beforeUploadCalls, 1);
+  assert.equal(uploadedFileName, 'campaign-image.png');
+});
+
+test('TikTok follower inbox opens the collected profile URL directly and clicks its Message button', async () => {
+  const targetProfileUrl = 'https://www.tiktok.com/@target.user';
+  const navigations: string[] = [];
+  let currentUrl = 'about:blank';
+  let messageClicks = 0;
+  const emptyLocator = { count: async () => 0 };
+  const profileSignal = { count: async () => 1 };
+  const messageButton = {
+    count: async () => 1,
+    isVisible: async () => true,
+    click: async () => { messageClicks += 1; },
+  };
+  const page = {
+    url: () => currentUrl,
+    title: async () => 'TikTok',
+    goto: async (url: string) => { navigations.push(url); currentUrl = url; },
+    waitForTimeout: async () => undefined,
+    locator: (selector: string) => selector === 'a[href*="/followers"]'
+      ? profileSignal
+      : selector === '[data-e2e="message-button"]' ? messageButton : emptyLocator,
+  };
+
+  await openTikTokFollowerMessageComposer(page as never, targetProfileUrl);
+
+  assert.deepEqual(navigations, [targetProfileUrl]);
+  assert.equal(messageClicks, 1);
+  assert.equal(navigations.some((url) => url.includes('/search')), false);
+});
+
+test('TikTok profile navigation retries an HTTP response failure once with Ctrl+R', async () => {
+  const targetProfileUrl = 'https://www.tiktok.com/@lethanhhh811';
+  const navigations: string[] = [];
+  const keyboardPresses: string[] = [];
+  let currentUrl = 'about:blank';
+  let messageClicks = 0;
+  const emptyLocator = { count: async () => 0 };
+  const profileSignal = { count: async () => 1 };
+  const messageButton = {
+    count: async () => 1,
+    isVisible: async () => true,
+    click: async () => { messageClicks += 1; },
+  };
+  const page = {
+    url: () => currentUrl,
+    title: async () => 'TikTok',
+    goto: async (url: string) => {
+      navigations.push(url);
+      currentUrl = url;
+      throw new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE');
+    },
+    waitForTimeout: async () => undefined,
+    waitForLoadState: async () => undefined,
+    keyboard: { press: async (key: string) => { keyboardPresses.push(key); } },
+    evaluate: async (pageFunction: () => unknown) => {
+      const source = pageFunction.toString();
+      if (source.includes('readyState') && source.includes('href')) {
+        return { readyState: 'complete', href: currentUrl, timeOrigin: 123 };
+      }
+      return false;
+    },
+    locator: (selector: string) => selector === 'a[href*="/followers"]'
+      ? profileSignal
+      : selector === '[data-e2e="message-button"]' ? messageButton : emptyLocator,
+  };
+
+  await openTikTokFollowerMessageComposer(page as never, targetProfileUrl);
+
+  assert.deepEqual(navigations, [targetProfileUrl]);
+  assert.deepEqual(keyboardPresses, ['Control+R']);
+  assert.equal(messageClicks, 1);
+});
 
 test('TikTok fixture search is deterministic and does not require a browser page', async () => {
   const provider = createTikTokFixtureSearchProvider('success');
@@ -101,7 +273,7 @@ for (const [adapter, loginUrl] of [
   });
 }
 
-test('TikTok health check starts at root and does not force a login route', async () => {
+test('TikTok health check starts at the English entry and does not force a login route', async () => {
   const targets: string[] = [];
   let currentUrl = 'about:blank';
   const page: BrowserPage = {
@@ -124,7 +296,36 @@ test('TikTok health check starts at root and does not force a login route', asyn
 
   assert.equal(result.ok, false);
   assert.equal(result.data?.loginRequired, true);
-  assert.deepEqual(targets, ['https://www.tiktok.com/']);
+  assert.deepEqual(targets, ['https://www.tiktok.com/en']);
+});
+
+test('TikTok campaign entry keeps a completed English page when goto reports a late timeout', async () => {
+  const targets: string[] = [];
+  let currentUrl = 'about:blank';
+  const page = {
+    url: () => currentUrl,
+    title: async () => 'TikTok',
+    goto: async (url: string) => {
+      targets.push(url);
+      currentUrl = url;
+      throw new Error('page.goto: Timeout 60000ms exceeded while waiting until commit');
+    },
+    waitForLoadState: async () => new Promise<void>(() => undefined),
+    waitForTimeout: async () => {},
+    locator: () => ({ count: async () => 0 }),
+    evaluate: async (pageFunction: () => unknown) => {
+      const source = pageFunction.toString();
+      if (source.includes('readyState') && source.includes('href')) {
+        return { readyState: 'complete', href: currentUrl, timeOrigin: 123 };
+      }
+      return false;
+    },
+  };
+
+  await enterTikTokRoot(page as never);
+
+  assert.deepEqual(targets, ['https://www.tiktok.com/en']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/en');
 });
 
 test('TikTok search returns bounded metadata without requiring an external-action approval', async () => {
@@ -192,7 +393,7 @@ test('TikTok search returns bounded metadata without requiring an external-actio
   assert.equal(result.ok, true);
   assert.equal(result.data?.count, 1);
   assert.equal((result.data?.videos as Array<{ videoId: string }>)[0]?.videoId, '1234567890123456789');
-  assert.match(events[0] ?? '', /^goto:https:\/\/www\.tiktok\.com\/$/);
+  assert.equal(events[0], 'goto:https://www.tiktok.com/en');
   assert.equal(events.some((event) => event.includes('/foryou')), false);
   assert.equal(events.some((event) => event.includes('click-for-you')), false);
 });
@@ -288,7 +489,7 @@ test('TikTok live comment refuses to run without the worker approval hook', asyn
   };
   const action: PlatformAction = {
     platform: 'TIKTOK', accountId, action: 'COMMENT_TIKTOK_VIDEOS',
-    payload: { name: 'Comment test', videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'], text: 'Xin chào', mediaAssetIds: [], intervalSeconds: 120, maxVideos: 1 },
+    payload: { name: 'Comment test', videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'], text: 'Xin chào', intervalSeconds: 120, maxVideos: 1 },
   };
 
   const result = await new TikTokAdapter().execute(action, session(page));
@@ -298,6 +499,29 @@ test('TikTok live comment refuses to run without the worker approval hook', asyn
   assert.match(String((result.data?.failures as Array<{ reason: string }>)[0]?.reason), /approved task execution context/i);
   assert.equal((result.data?.report as { entries?: Array<{ status?: string; videoUrl?: string }> })?.entries?.[0]?.status, 'FAILED');
   assert.equal((result.data?.report as { entries?: Array<{ status?: string; videoUrl?: string }> })?.entries?.[0]?.videoUrl, action.payload.videoUrls[0]);
+});
+
+test('TikTok comment skips a video reserved by an earlier campaign without counting it as complete', async () => {
+  const videoUrl = 'https://www.tiktok.com/@creator/video/1234567890123456789';
+  let navigations = 0;
+  const page: BrowserPage = {
+    url: () => 'https://www.tiktok.com/en',
+    title: async () => 'TikTok',
+    goto: async () => { navigations += 1; },
+    locator: () => ({ count: async () => 0 }),
+  };
+  const progress: Array<Record<string, unknown>> = [];
+  const result = await commentTikTokVideos({
+    ...session(page),
+    reserveTikTokTarget: async () => false,
+    recordActionProgress: async entry => { progress.push(entry); },
+  }, { videoUrls: [videoUrl], text: 'Xin chào', maxVideos: 1 });
+
+  assert.equal(result.requested, 1);
+  assert.equal(result.sent, 0);
+  assert.match(String(result.reason), /campaign trước comment/i);
+  assert.equal(navigations, 0);
+  assert.equal(progress[0]?.status, 'SKIPPED');
 });
 
 test('TikTok reply keeps the configured target and reports why no comment was replied to', async () => {
@@ -314,7 +538,6 @@ test('TikTok reply keeps the configured target and reports why no comment was re
     {
       videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'],
       text: 'Xin chào',
-      mediaAssetIds: [],
       maxReplies: 2,
     },
   );
@@ -344,7 +567,6 @@ test('TikTok reply with zero sends is a failed action, not a successful task', a
       name: 'Reply test',
       videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'],
       text: 'Xin chào',
-      mediaAssetIds: [],
       intervalSeconds: 120,
       maxReplies: 2,
     },
@@ -378,7 +600,7 @@ test('TikTok reply reports a single reload-aware error when a video still return
 
   const result = await replyTikTokComments(
     session(page),
-    { videoUrls: [videoUrl], text: 'Xin chào', mediaAssetIds: [], maxReplies: 3 },
+    { videoUrls: [videoUrl], text: 'Xin chào', maxReplies: 3 },
   );
 
   assert.equal(reloadAttempts, 1);
@@ -424,7 +646,6 @@ test('TikTok reply opens the comment drawer before looking for reply controls', 
     {
       videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'],
       text: 'Xin chào',
-      mediaAssetIds: [],
       maxReplies: 1,
     },
   );
@@ -492,7 +713,6 @@ test('TikTok reply fills the reply editor and presses Enter instead of falling b
     {
       videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'],
       text: 'Xin chào reply',
-      mediaAssetIds: [],
       maxReplies: 1,
     },
   );
@@ -569,7 +789,6 @@ test('TikTok reply resolves the real DraftEditor contenteditable behind the Add 
     {
       videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'],
       text: 'Draft reply',
-      mediaAssetIds: [],
       maxReplies: 1,
     },
   );
@@ -666,7 +885,6 @@ test('TikTok reply keeps each click bound to its own in-viewport editor without 
     {
       videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'],
       text: 'Xin chào reply',
-      mediaAssetIds: [],
       maxReplies: 2,
     },
   );
@@ -742,7 +960,6 @@ test('TikTok reply scrolls the comment drawer to reach the next reply row', asyn
     {
       videoUrls: ['https://www.tiktok.com/@creator/video/1234567890123456789'],
       text: 'Xin chào reply',
-      mediaAssetIds: [],
       maxReplies: 2,
     },
   );
@@ -754,7 +971,7 @@ test('TikTok reply scrolls the comment drawer to reach the next reply row', asyn
   assert.equal(result.reason, undefined);
 });
 
-test('TikTok like-comments opens the comment drawer before resolving like controls', async () => {
+test('TikTok like-comments supports the current roleless DivLikeContainer control', async () => {
   let currentUrl = 'about:blank';
   let commentsOpen = false;
   const active = [false, false];
@@ -777,7 +994,7 @@ test('TikTok like-comments opens the comment drawer before resolving like contro
     goto: async (url: string) => { currentUrl = url; },
     waitForTimeout: async () => undefined,
     locator: (selector: string) => {
-      if (selector.includes('comment_like') || selector.includes('comment-like')) return makeLike(0);
+      if (selector.includes('DivLikeContainer')) return makeLike(0);
       if (selector.includes('comment-icon')) return opener;
       if (selector.includes('comment-list') || selector.includes('comment-container') || selector.includes('comment-panel') || selector.includes('comment-input')) {
         return { count: async () => commentsOpen ? 1 : 0, isVisible: async () => commentsOpen };

@@ -98,7 +98,8 @@ test('remote session relay moves commands and frames across worker gateways', as
     60,
   );
   const socket = new WebSocket(
-    `ws://127.0.0.1:39125/sessions/${sessionId}?token=${signed.token}`,
+    `ws://127.0.0.1:39125/sessions/${sessionId}`,
+    `socio-remote.${signed.token}`,
   );
   try {
     const frameReceived = new Promise<void>((resolve) => {

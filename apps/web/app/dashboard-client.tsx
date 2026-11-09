@@ -25,6 +25,7 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import { useRouter } from 'next/navigation';
@@ -33,24 +34,27 @@ import FacebookWorkspace from './facebook-workspace';
 import TikTokWorkspace from './tiktok-workspace';
 import { ActionButton, PageSectionTitle, StatusTag, tablePagination } from './admin-ui';
 import { Icon, STATUS_LABELS, ACTION_LABELS } from './ui';
-import { useToast, useToastError, useToastNotice } from './toast';
+import { useToast, useToastError } from './toast';
 import { ContextNote as Alert } from './context-note';
 
 type Role = 'OWNER' | 'ADMIN' | 'OPERATOR' | 'VIEWER';
-type DashboardView = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'tiktok' | 'schedules' | 'tasks';
+type DashboardView = 'overview' | 'accounts' | 'proxies' | 'facebook' | 'tiktok' | 'schedules' | 'tasks' | 'users' | 'activity';
 
 const NAV_ITEMS: Array<{
   key: DashboardView;
   label: string;
   description: string;
+  icon: 'overview' | 'accounts' | 'proxies' | 'facebook' | 'tiktok' | 'schedules' | 'tasks' | 'shield';
 }> = [
-  { key: 'overview', label: 'Tổng quan', description: 'Tình hình vận hành' },
-  { key: 'accounts', label: 'Profiles', description: 'Tài khoản & trình duyệt' },
-  { key: 'proxies', label: 'Proxy', description: 'Kết nối & phân bổ' },
-  { key: 'facebook', label: 'Facebook', description: 'Nhóm & chiến dịch' },
-  { key: 'tiktok', label: 'TikTok', description: 'Search & hành động có duyệt' },
-  { key: 'schedules', label: 'Lịch chạy', description: 'Tự động hóa định kỳ' },
-  { key: 'tasks', label: 'Tác vụ', description: 'Theo dõi thực thi' },
+  { key: 'overview', label: 'Tổng quan', description: 'Tình hình vận hành', icon: 'overview' },
+  { key: 'accounts', label: 'Profiles', description: 'Tài khoản & trình duyệt', icon: 'accounts' },
+  { key: 'proxies', label: 'Proxy', description: 'Kết nối & phân bổ', icon: 'proxies' },
+  { key: 'facebook', label: 'Facebook', description: 'Nhóm & chiến dịch', icon: 'facebook' },
+  { key: 'tiktok', label: 'TikTok', description: 'Search & hành động có duyệt', icon: 'tiktok' },
+  { key: 'schedules', label: 'Lịch chạy', description: 'Tự động hóa định kỳ', icon: 'schedules' },
+  { key: 'tasks', label: 'Tác vụ', description: 'Theo dõi thực thi', icon: 'tasks' },
+  { key: 'users', label: 'Người dùng', description: 'Tài khoản và phân quyền', icon: 'accounts' },
+  { key: 'activity', label: 'Activity logs', description: 'Nhật ký hoạt động trong workspace', icon: 'shield' },
 ];
 
 interface BrowserSession {
@@ -74,7 +78,7 @@ interface Account {
 
 interface BrowserFingerprintConfig {
   mode?: 'auto' | 'native' | 'custom';
-  localeMode?: 'configured' | 'native';
+  localeMode?: 'auto' | 'configured' | 'native';
   locale: string;
   languages: string[];
   timezoneId: string;
@@ -82,7 +86,6 @@ interface BrowserFingerprintConfig {
 
 interface FingerprintFormValue {
   mode: 'auto' | 'native';
-  configureLocale: boolean;
   locale: string;
   languages: string[];
   timezoneId: string;
@@ -96,10 +99,20 @@ interface ProxyItem {
   port: number;
   status: string;
   latencyMs?: number;
+  locale?: string;
+  languages?: string[];
+  timezoneId?: string;
   hasAuthentication?: boolean;
   accountBindings?: Array<{
     account: Pick<Account, 'id' | 'username' | 'platform' | 'status'>;
   }>;
+}
+
+function proxyReady(proxy: ProxyItem): boolean {
+  return proxy.status === 'HEALTHY'
+    && Boolean(proxy.locale)
+    && Boolean(proxy.languages?.length)
+    && Boolean(proxy.timezoneId);
 }
 
 interface ScheduleItem {
@@ -147,6 +160,71 @@ interface ProxyFormValue {
   accountIds?: string[];
 }
 
+interface WorkspaceUser {
+  role: Role;
+  createdAt: string;
+  user: { id: string; email: string; displayName?: string | null; status: 'ACTIVE' | 'DISABLED'; lastLoginAt?: string | null; createdAt: string };
+}
+
+interface UserFormValue { email: string; displayName?: string; password: string; role: 'ADMIN' | 'OPERATOR' | 'VIEWER' }
+interface ActivityLog { id: string; action: string; resourceType: string; resourceId?: string | null; ipAddress?: string | null; createdAt: string; actor?: { id: string; email: string; displayName?: string | null } | null }
+
+function activityActionLabel(action: string): string {
+  const normalized = action.replace(/\/api\//, '/').toLowerCase();
+  const exact: Array<[RegExp, string]> = [
+    [/^post \/facebook\/campaigns\/:id\/approve$/, 'Duyệt chiến dịch Facebook'],
+    [/^post \/facebook\/campaigns\/:id\/cancel$/, 'Hủy chiến dịch Facebook'],
+    [/^post \/facebook\/campaigns\/:id\/pause$/, 'Tạm dừng chiến dịch Facebook'],
+    [/^post \/facebook\/campaigns\/:id\/resume$/, 'Tiếp tục chiến dịch Facebook'],
+    [/^post \/facebook\/campaigns\/:id\/retry$/, 'Chạy lại tác vụ của chiến dịch Facebook'],
+    [/^post \/facebook\/groups\/sync$/, 'Đồng bộ nhóm Facebook'],
+    [/^post \/facebook\/groups\/join$/, 'Tạo chiến dịch tham gia nhóm Facebook'],
+    [/^post \/facebook\/groups\/post$/, 'Tạo chiến dịch đăng bài Facebook'],
+    [/^post \/facebook\/groups\/message$/, 'Tạo chiến dịch nhắn tin Facebook'],
+    [/^post \/facebook\/groups\/comment-posts$/, 'Tạo chiến dịch bình luận Facebook'],
+    [/^post \/facebook\/posts\/message-reactors$/, 'Tạo chiến dịch nhắn người tương tác Facebook'],
+    [/^post \/facebook\/posts\/scan-comments$/, 'Tạo chiến dịch quét bình luận Facebook'],
+    [/^post \/facebook\/posts\/reply-comments$/, 'Tạo chiến dịch trả lời bình luận Facebook'],
+    [/^post \/tasks\/batch\/approve$/, 'Duyệt và xếp hàng chiến dịch TikTok'],
+    [/^post \/tasks\/batch$/, 'Tạo chiến dịch TikTok'],
+    [/^post \/tasks\/:id\/approve$/, 'Duyệt tác vụ'],
+    [/^post \/tasks\/:id\/reject$/, 'Từ chối tác vụ'],
+    [/^post \/tasks\/:id\/retry(?:-action)?$/, 'Chạy lại tác vụ'],
+    [/^post \/tasks\/:id\/cancel$/, 'Hủy tác vụ'],
+    [/^post \/tasks\/:id\/pause$/, 'Tạm dừng tác vụ'],
+    [/^post \/tasks\/:id\/resume$/, 'Tiếp tục tác vụ'],
+    [/^post \/users$/, 'Tạo tài khoản người dùng'],
+    [/^patch \/users\/:id$/, 'Cập nhật tài khoản người dùng'],
+    [/^delete \/users\/:id$/, 'Xóa tài khoản người dùng'],
+    [/^post \/accounts$/, 'Tạo profile mạng xã hội'],
+    [/^patch \/accounts\/:id$/, 'Cập nhật profile mạng xã hội'],
+    [/^delete \/accounts\/:id$/, 'Xóa profile mạng xã hội'],
+    [/^post \/proxies$/, 'Tạo proxy'],
+    [/^patch \/proxies\/:id$/, 'Cập nhật proxy'],
+    [/^delete \/proxies\/:id$/, 'Xóa proxy'],
+    [/^post \/schedules$/, 'Tạo lịch chạy'],
+    [/^patch \/schedules\/:id$/, 'Cập nhật lịch chạy'],
+    [/^delete \/schedules\/:id$/, 'Xóa lịch chạy'],
+    [/^post \/media$/, 'Tải tệp nội dung lên'],
+    [/^delete \/media\/:id$/, 'Xóa tệp nội dung'],
+    [/^post \/login-sessions$/, 'Mở phiên trình duyệt'],
+    [/^delete \/login-sessions\/:sessionid$/, 'Đóng phiên trình duyệt'],
+  ];
+  return exact.find(([pattern]) => pattern.test(normalized))?.[1]
+    ?? (normalized.startsWith('post ') ? 'Tạo hoặc thực hiện thao tác'
+      : normalized.startsWith('patch ') ? 'Cập nhật dữ liệu'
+        : normalized.startsWith('delete ') ? 'Xóa dữ liệu'
+          : 'Thao tác hệ thống');
+}
+
+function activityResourceLabel(resourceType: string): string {
+  return ({
+    users: 'Người dùng', accounts: 'Profile', proxies: 'Proxy', facebook: 'Facebook',
+    tasks: 'Tác vụ / TikTok', schedules: 'Lịch chạy', media: 'Nội dung',
+    'login-sessions': 'Phiên trình duyệt', auth: 'Đăng nhập',
+  } as Record<string, string>)[resourceType] ?? resourceType;
+}
+
 const fingerprintPresets: Record<string, { languages: string[]; timezones: string[] }> = {
   'vi-VN': { languages: ['vi-VN', 'vi'], timezones: ['Asia/Ho_Chi_Minh'] },
   'en-US': { languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'] },
@@ -171,7 +249,6 @@ function defaultFingerprintForm(locale = 'vi-VN'): FingerprintFormValue {
   const preset = fingerprintPreset(locale);
   return {
     mode: 'auto',
-    configureLocale: true,
     locale,
     languages: [...preset.languages],
     timezoneId: preset.timezones[0] ?? 'UTC',
@@ -183,12 +260,11 @@ function fingerprintToForm(value?: BrowserFingerprintConfig): FingerprintFormVal
   const preset = fingerprintPreset(value.locale);
   return {
     mode: value.mode === 'native' ? 'native' : 'auto',
-    configureLocale: value.localeMode !== 'native',
     locale: value.locale,
-    languages: value.languages.filter((language) => preset.languages.includes(language)).length
-      ? value.languages.filter((language) => preset.languages.includes(language))
-      : [...preset.languages],
-    timezoneId: preset.timezones.includes(value.timezoneId) ? value.timezoneId : preset.timezones[0] ?? 'UTC',
+    // Locale is the source of truth. Older records may still contain these
+    // fields, but they must not override the locale-derived bundle.
+    languages: [...preset.languages],
+    timezoneId: preset.timezones[0] ?? 'UTC',
   };
 }
 
@@ -196,13 +272,14 @@ function normalizeFingerprintForm(value: Partial<FingerprintFormValue>): Browser
   const defaults = defaultFingerprintForm(value.locale ?? 'vi-VN');
   const merged = { ...defaults, ...value };
   const preset = fingerprintPreset(merged.locale);
-  const languages = merged.languages.filter((language) => preset.languages.includes(language));
   return {
     mode: merged.mode,
-    localeMode: merged.configureLocale ? 'configured' : 'native',
+    localeMode: 'auto',
     locale: merged.locale,
-    languages: languages.length ? languages : [...preset.languages],
-    timezoneId: preset.timezones.includes(merged.timezoneId) ? merged.timezoneId : preset.timezones[0] ?? 'UTC',
+    // Keep the API contract backwards-compatible while exposing only Locale
+    // in the form. Runtime code also derives these values from the same locale.
+    languages: [...preset.languages],
+    timezoneId: preset.timezones[0] ?? 'UTC',
   };
 }
 
@@ -251,6 +328,8 @@ export default function DashboardClient() {
   const [accountModalOpen, setAccountModalOpen] = useState(false);
   const [proxyModalOpen, setProxyModalOpen] = useState(false);
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
+  const [userModalOpen, setUserModalOpen] = useState(false);
+  const [userForm] = Form.useForm<UserFormValue>();
   const [accountInitialValues, setAccountInitialValues] = useState<AccountFormValue>({
     platform: 'FACEBOOK',
     label: '',
@@ -297,6 +376,12 @@ export default function DashboardClient() {
   const [scheduleCron, setScheduleCron] = useState('0 * * * *');
   const [scheduleTimezone, setScheduleTimezone] = useState('Asia/Bangkok');
   const [scheduleAction, setScheduleAction] = useState('HEALTH_CHECK');
+  const me = useQuery({
+    queryKey: ['me'],
+    queryFn: () => getJson<{ userId?: string; role: Role; email?: string }>('/api/auth/me'),
+  });
+  const canOperate = ['OWNER', 'ADMIN', 'OPERATOR'].includes(me.data?.role ?? '');
+  const canAdmin = ['OWNER', 'ADMIN'].includes(me.data?.role ?? '');
   const accounts = useQuery({
     queryKey: ['accounts'],
     queryFn: () => getJson<Account[]>('/api/control/accounts'),
@@ -318,13 +403,20 @@ export default function DashboardClient() {
     queryKey: ['tasks'],
     queryFn: () => getJson<TaskItem[]>('/api/control/tasks'),
   });
-  const me = useQuery({
-    queryKey: ['me'],
-    queryFn: () => getJson<{ role: Role; email?: string }>('/api/auth/me'),
+  const users = useQuery({
+    queryKey: ['users'],
+    queryFn: () => getJson<WorkspaceUser[]>('/api/control/users'),
+    enabled: canAdmin,
   });
-
-  const canOperate = ['OWNER', 'ADMIN', 'OPERATOR'].includes(me.data?.role ?? '');
-  const canAdmin = ['OWNER', 'ADMIN'].includes(me.data?.role ?? '');
+  const activity = useQuery({
+    queryKey: ['activity'],
+    queryFn: () => getJson<ActivityLog[]>('/api/control/audit?take=300'),
+    enabled: canAdmin,
+  });
+  const visibleNavItems = NAV_ITEMS.filter(item => canAdmin || !['users', 'activity'].includes(item.key));
+  useEffect(() => {
+    if (!me.isLoading && !canAdmin && ['users', 'activity'].includes(activeView)) navigate('overview');
+  }, [activeView, canAdmin, me.isLoading]);
   const accountRows = accounts.data ?? [];
   const activeSessions = sessions.data ?? [];
   const activeByAccount = useMemo(
@@ -515,6 +607,15 @@ export default function DashboardClient() {
 
   const submitProxy = async (values: ProxyFormValue) => {
     const hasCredentials = Boolean(values.username && values.password);
+    const credentialsChanged = !editingProxy
+      || values.username !== proxyInitialValues.username
+      || values.password !== proxyInitialValues.password;
+    const connectionChanged = Boolean(editingProxy && (
+      values.protocol !== proxyInitialValues.protocol
+      || values.host !== proxyInitialValues.host
+      || values.port !== proxyInitialValues.port
+      || credentialsChanged
+    ));
     const saved = await perform(
       editingProxy ? `proxy-edit-${editingProxy.id}` : 'proxy-create',
       () =>
@@ -525,14 +626,14 @@ export default function DashboardClient() {
           editingProxy ? 'PATCH' : 'POST',
           {
           name: values.name,
-          protocol: values.protocol,
-          host: values.host,
-          port: values.port,
-          accountIds: values.accountIds ?? [],
-          ...(hasCredentials
+          ...(!editingProxy || values.protocol !== proxyInitialValues.protocol ? { protocol: values.protocol } : {}),
+          ...(!editingProxy || values.host !== proxyInitialValues.host ? { host: values.host } : {}),
+          ...(!editingProxy || values.port !== proxyInitialValues.port ? { port: values.port } : {}),
+          ...(editingProxy && proxyReady(editingProxy) && !connectionChanged ? { accountIds: values.accountIds ?? [] } : {}),
+          ...(credentialsChanged && hasCredentials
             ? { username: values.username, password: values.password }
             : {}),
-          ...(editingProxy && !hasCredentials
+          ...(editingProxy && credentialsChanged && !hasCredentials
             ? { clearAuthentication: true }
             : {}),
           },
@@ -578,6 +679,32 @@ export default function DashboardClient() {
         );
         if (result === undefined) throw new Error('Không thể xóa proxy');
         void message.success('Đã xóa proxy');
+      },
+    });
+  };
+
+  const createWorkspaceUser = async (values: UserFormValue) => {
+    const created = await perform('user-create', () => mutate('/api/control/users', 'POST', values), ['users', 'activity']);
+    if (!created) return;
+    setUserModalOpen(false);
+    userForm.resetFields();
+    message.success('Đã tạo tài khoản người dùng');
+  };
+
+  const setWorkspaceUserStatus = async (member: WorkspaceUser, status: 'ACTIVE' | 'DISABLED') => {
+    const updated = await perform(`user-status-${member.user.id}`, () => mutate(`/api/control/users/${member.user.id}`, 'PATCH', { status }), ['users', 'activity']);
+    if (updated) message.success(status === 'ACTIVE' ? 'Đã kích hoạt tài khoản' : 'Đã vô hiệu hóa tài khoản');
+  };
+
+  const confirmDeleteWorkspaceUser = (member: WorkspaceUser) => {
+    modal.confirm({
+      title: 'Xóa tài khoản người dùng?',
+      content: `${member.user.email} sẽ mất quyền truy cập ngay lập tức. Lịch sử campaign và activity logs vẫn được giữ lại.`,
+      okText: 'Xóa tài khoản', okButtonProps: { danger: true }, cancelText: 'Hủy',
+      onOk: async () => {
+        const deleted = await perform(`user-delete-${member.user.id}`, () => mutate(`/api/control/users/${member.user.id}`, 'DELETE'), ['users', 'activity']);
+        if (!deleted) throw new Error('Không thể xóa tài khoản');
+        message.success('Đã xóa tài khoản người dùng');
       },
     });
   };
@@ -633,9 +760,9 @@ export default function DashboardClient() {
     setBusy(`test-${proxy.id}`);
     setError(undefined);
     try {
-      const result = await mutate<{ ok: boolean; error?: string }>(`/api/control-action/proxies/${proxy.id}/test`);
+      const result = await mutate<{ ok: boolean; error?: string; locale?: string; languages?: string[]; timezoneId?: string }>(`/api/control-action/proxies/${proxy.id}/test`);
       if (!result.ok) setError(result.error ?? 'Proxy không thể kết nối tới Facebook');
-      else void message.success('Proxy kết nối thành công');
+      else void message.success(`Proxy đạt kiểm tra · ${result.locale} · ${result.timezoneId}`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -648,10 +775,7 @@ export default function DashboardClient() {
     accounts.error?.message ??
     proxies.error?.message ??
     sessions.error?.message ??
-    schedules.error?.message ?? tasks.error?.message ?? me.error?.message;
-  useToastNotice(queryError, 'dashboard-load-error', 'error',
-    ![accounts, proxies, sessions, schedules, tasks, me].some(query => query.isFetching));
-
+    schedules.error?.message ?? tasks.error?.message ?? me.error?.message ?? users.error?.message ?? activity.error?.message;
   return (
     <Layout className="app-shell">
       <Layout.Sider width={240} className="sidebar">
@@ -665,7 +789,7 @@ export default function DashboardClient() {
         </div>
         <div className="nav-label">Quản trị</div>
         <nav className="nav" aria-label="Điều hướng chính">
-          {NAV_ITEMS.map((item, index) => <div key={item.key}>{index === 3 ? <div className="nav-label nav-group">Tự động hóa</div> : null}
+          {visibleNavItems.map((item, index) => <div key={item.key}>{index === 3 ? <div className="nav-label nav-group">Tự động hóa</div> : item.key === 'users' ? <div className="nav-label nav-group">Hệ thống</div> : null}
             <button
               key={item.key}
               type="button"
@@ -673,7 +797,7 @@ export default function DashboardClient() {
               aria-current={activeView === item.key ? 'page' : undefined}
               onClick={() => navigate(item.key)}
             >
-              <span className="nav-glyph" aria-hidden><Icon name={item.key} /></span>
+              <span className="nav-glyph" aria-hidden><Icon name={item.icon} /></span>
               <span><strong>{item.label}</strong></span>
               {item.key === 'tasks' && (tasks.data ?? []).filter((task) => task.status === 'RUNNING').length ? (
                 <span className="nav-count">{(tasks.data ?? []).filter((task) => task.status === 'RUNNING').length}</span>
@@ -697,7 +821,7 @@ export default function DashboardClient() {
             aria-label="Chọn khu vực quản trị"
             onChange={(event) => navigate(event.currentTarget.value as DashboardView)}
           >
-            {NAV_ITEMS.map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
+            {visibleNavItems.map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
           </select>
           <div className="topbar-actions">
             <ActionButton label="Làm mới dữ liệu" icon="refresh" type="text" loading={accounts.isFetching} onClick={() => void cache.invalidateQueries()} />
@@ -890,7 +1014,7 @@ export default function DashboardClient() {
             dataSource={filteredProxies}
             pagination={tablePagination('proxy')}
             size="middle"
-            scroll={{ x: 1075 }}
+            scroll={{ x: 1265 }}
             locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={proxySearch ? 'Không tìm thấy proxy phù hợp' : 'Chưa có proxy'} /> }}
             columns={[
               { title: 'Tên', width: 150, dataIndex: 'name', render: (value: string) => <strong>{value}</strong> },
@@ -898,6 +1022,7 @@ export default function DashboardClient() {
               { title: 'Xác thực', width: 105, render: (_: unknown, item: ProxyItem) => item.hasAuthentication ? <Tag>Có xác thực</Tag> : <span className="muted">Không</span> },
               { title: 'Trạng thái', width: 125, dataIndex: 'status', render: (value: string) => <StatusTag value={value} labels={{ HEALTHY: 'Kết nối được', UNHEALTHY: 'Không kết nối', UNKNOWN: 'Chưa kiểm tra' }} /> },
               { title: 'Chất lượng', width: 105, render: (_: unknown, item: ProxyItem) => <span className={item.latencyMs != null && item.latencyMs >= 1500 ? 'proxy-latency proxy-latency-warning' : 'proxy-latency'}>{formatProxyLatency(item.latencyMs)}</span> },
+              { title: 'Môi trường', width: 190, render: (_: unknown, item: ProxyItem) => proxyReady(item) ? <span>{item.locale} · {item.timezoneId}</span> : <span className="muted">Chưa xác định</span> },
               {
                 title: 'Profile đang dùng',
                 width: 200,
@@ -956,6 +1081,27 @@ export default function DashboardClient() {
           ]} />
         </Card> : null}
 
+        {activeView === 'users' && canAdmin ? <Card className="dashboard-row resource-card" title={<PageSectionTitle title="Tài khoản người dùng" description="Tạo tài khoản và kiểm soát quyền truy cập workspace." />} extra={<Button type="primary" icon={<Icon name="plus" />} onClick={() => setUserModalOpen(true)}>Tạo tài khoản</Button>}>
+          <Table<WorkspaceUser> rowKey={(item) => item.user.id} loading={users.isLoading} dataSource={users.data ?? []} pagination={tablePagination('người dùng')} scroll={{ x: 900 }} columns={[
+            { title: 'Người dùng', width: 250, render: (_, item) => <Space orientation="vertical" size={0}><Typography.Text strong>{item.user.displayName || item.user.email}</Typography.Text><Typography.Text type="secondary">{item.user.email}</Typography.Text></Space> },
+            { title: 'Quyền', width: 130, render: (_, item) => <Tag color={item.role === 'OWNER' || item.role === 'ADMIN' ? 'blue' : item.role === 'OPERATOR' ? 'green' : 'default'}>{item.role === 'OWNER' ? 'Admin chính' : item.role === 'ADMIN' ? 'Admin' : item.role === 'OPERATOR' ? 'Vận hành' : 'Chỉ xem'}</Tag> },
+            { title: 'Trạng thái', width: 130, render: (_, item) => <Tag color={item.user.status === 'ACTIVE' ? 'green' : 'red'}>{item.user.status === 'ACTIVE' ? 'Hoạt động' : 'Đã khóa'}</Tag> },
+            { title: 'Đăng nhập gần nhất', width: 180, render: (_, item) => item.user.lastLoginAt ? new Date(item.user.lastLoginAt).toLocaleString('vi-VN') : 'Chưa đăng nhập' },
+            { title: 'Thao tác', width: 180, render: (_, item) => item.role === 'OWNER' || item.user.id === me.data?.userId ? <Typography.Text type="secondary">Được bảo vệ</Typography.Text> : <Space><Button size="small" onClick={() => void setWorkspaceUserStatus(item, item.user.status === 'ACTIVE' ? 'DISABLED' : 'ACTIVE')}>{item.user.status === 'ACTIVE' ? 'Vô hiệu hóa' : 'Kích hoạt'}</Button><ActionButton label="Xóa tài khoản" icon="delete" danger onClick={() => confirmDeleteWorkspaceUser(item)} /></Space> },
+          ]} />
+        </Card> : null}
+
+        {activeView === 'activity' && canAdmin ? <Card className="dashboard-row resource-card" title={<PageSectionTitle title="Activity logs" description="Nhật ký các thao tác thay đổi dữ liệu; chỉ admin có quyền truy cập." />} extra={<Button icon={<Icon name="refresh" />} onClick={() => void activity.refetch()}>Làm mới</Button>}>
+          <Table<ActivityLog> rowKey="id" loading={activity.isLoading} dataSource={activity.data ?? []} pagination={tablePagination('hoạt động', 50)} scroll={{ x: 1050 }} columns={[
+            { title: 'Thời gian', width: 180, render: (_, item) => new Date(item.createdAt).toLocaleString('vi-VN') },
+            { title: 'Người thực hiện', width: 240, render: (_, item) => item.actor?.displayName || item.actor?.email || 'Dịch vụ hệ thống' },
+            { title: 'Hành động', width: 330, render: (_, item) => <Tooltip title={item.action}><Typography.Text>{activityActionLabel(item.action)}</Typography.Text></Tooltip> },
+            { title: 'Đối tượng', width: 180, render: (_, item) => activityResourceLabel(item.resourceType) },
+            { title: 'ID', width: 260, render: (_, item) => item.resourceId ?? '—' },
+            { title: 'IP', width: 150, render: (_, item) => item.ipAddress ?? '—' },
+          ]} />
+        </Card> : null}
+
         {activeView === 'tasks' ? <Card id="tasks" className="dashboard-row resource-card" title={<PageSectionTitle title="Tác vụ gần đây" description="Theo dõi thực thi và các tác vụ cần xử lý." />} extra={<Space className="card-toolbar"><Select aria-label="Lọc trạng thái tác vụ" className="status-filter" value={taskStatus} onChange={setTaskStatus} options={['ALL', 'DRAFT', 'PAUSED', 'SCHEDULED', 'QUEUED', 'RUNNING', 'REQUIRES_ACTION', 'SUCCEEDED', 'FAILED', 'CANCELLED'].map((value) => ({ value, label: value === 'ALL' ? 'Tất cả trạng thái' : STATUS_LABELS[value] }))} /><Select aria-label="Lọc tác vụ theo loại" className="status-filter" value={taskAction} onChange={setTaskAction} options={[{ value: 'ALL', label: 'Mọi loại tác vụ' }, ...taskActionOptions]} /><Select aria-label="Lọc tác vụ theo profile" className="status-filter" value={taskAccount} onChange={setTaskAccount} options={[{ value: 'ALL', label: 'Mọi profile' }, ...taskAccountOptions]} /><Select aria-label="Lọc tác vụ theo thời gian" className="status-filter" value={taskDateRange} onChange={setTaskDateRange} options={[{ value: 'ALL', label: 'Mọi thời gian' }, { value: '7D', label: '7 ngày qua' }, { value: '30D', label: '30 ngày qua' }]} /></Space>}>
           <Table className="tasks-table" rowKey="id" loading={tasks.isLoading} dataSource={filteredTasks} pagination={tablePagination('tác vụ')} size="middle" scroll={{ x: 1_270 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có tác vụ phù hợp" /> }} columns={[
             { title: 'Tài khoản', width: 160, ellipsis: true, render: (_: unknown, item: TaskItem) => item.account.username ?? item.account.id },
@@ -993,6 +1139,29 @@ export default function DashboardClient() {
           </div> : null}
         </Space> : null}
       </Drawer>
+
+      <Modal
+        title="Tạo tài khoản người dùng"
+        open={userModalOpen}
+        centered
+        destroyOnHidden
+        okText="Tạo tài khoản"
+        cancelText="Hủy"
+        confirmLoading={busy === 'user-create'}
+        onOk={() => userForm.validateFields().then(createWorkspaceUser).catch(() => undefined)}
+        onCancel={() => setUserModalOpen(false)}
+      >
+        <Form<UserFormValue> form={userForm} layout="vertical" initialValues={{ role: 'OPERATOR' }} preserve={false}>
+          <Form.Item name="displayName" label="Tên hiển thị"><Input placeholder="Ví dụ: Nguyễn Văn A" /></Form.Item>
+          <Form.Item name="email" label="Email đăng nhập" rules={[{ required: true, type: 'email', message: 'Nhập email hợp lệ' }]}><Input autoComplete="username" /></Form.Item>
+          <Form.Item name="password" label="Mật khẩu ban đầu" extra="Tối thiểu 12 ký tự." rules={[{ required: true, min: 12, message: 'Mật khẩu cần ít nhất 12 ký tự' }]}><Input.Password autoComplete="new-password" /></Form.Item>
+          <Form.Item name="role" label="Quyền" rules={[{ required: true }]}><Select options={[
+            { value: 'ADMIN', label: 'Admin — quản lý người dùng và xem logs' },
+            { value: 'OPERATOR', label: 'Vận hành — tạo và chạy campaign' },
+            { value: 'VIEWER', label: 'Chỉ xem — không thay đổi dữ liệu' },
+          ]} /></Form.Item>
+        </Form>
+      </Modal>
 
       <Modal
         title={editingAccount ? 'Chỉnh sửa profile' : 'Thêm profile'}
@@ -1037,7 +1206,7 @@ export default function DashboardClient() {
             </Col>
             <Col xs={24} sm={12}>
               <Form.Item name="proxyId" label="Proxy">
-                <Select allowClear placeholder="Không dùng proxy" options={(proxies.data ?? []).map((proxy) => ({ value: proxy.id, label: `${proxy.name} · ${proxy.host}:${proxy.port.toString()}` }))} />
+                <Select allowClear placeholder="Không dùng proxy" options={(proxies.data ?? []).filter(proxyReady).map((proxy) => ({ value: proxy.id, label: `${proxy.name} · ${proxy.host}:${proxy.port.toString()} · ${proxy.locale}` }))} />
               </Form.Item>
             </Col>
           </Row>
@@ -1094,45 +1263,12 @@ export default function DashboardClient() {
                 <Switch />
               </Form.Item>
             </Col>
-            <Col xs={24} sm={12}>
-              <Form.Item name={['fingerprint', 'configureLocale']} label="Locale / Languages / Timezone" valuePropName="checked">
-                <Switch />
-              </Form.Item>
-            </Col>
           </Row>
-          <Form.Item noStyle dependencies={[[ 'fingerprint', 'locale' ], [ 'fingerprint', 'configureLocale' ]] as never}>
-            {({ getFieldValue }) => {
-              const locale = String(getFieldValue(['fingerprint', 'locale']) ?? 'vi-VN');
-              const configureLocale = Boolean(getFieldValue(['fingerprint', 'configureLocale']) ?? true);
-              const preset = fingerprintPreset(locale);
-              return (
-                <Row gutter={16}>
-                  <Col xs={24} sm={8}>
-                    <Form.Item name={['fingerprint', 'locale']} label="Locale" rules={[{ required: configureLocale }]}>
-                      <Select
-                        disabled={!configureLocale}
-                        options={Object.keys(fingerprintPresets).map((value) => ({ value, label: value }))}
-                        onChange={(nextLocale: string) => {
-                          const next = fingerprintPreset(nextLocale);
-                          accountForm.setFieldsValue({ fingerprint: { ...accountForm.getFieldValue('fingerprint'), locale: nextLocale, languages: [...next.languages], timezoneId: next.timezones[0] ?? 'UTC' } });
-                        }}
-                      />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={24} sm={8}>
-                    <Form.Item name={['fingerprint', 'languages']} label="Languages" rules={[{ required: configureLocale, type: 'array', min: 1 }]}>
-                      <Select disabled={!configureLocale} mode="multiple" options={preset.languages.map((value) => ({ value, label: value }))} />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={24} sm={8}>
-                    <Form.Item name={['fingerprint', 'timezoneId']} label="Timezone" rules={[{ required: configureLocale }]}>
-                      <Select disabled={!configureLocale} options={preset.timezones.map((value) => ({ value, label: value }))} />
-                    </Form.Item>
-                  </Col>
-                </Row>
-              );
-            }}
-          </Form.Item>
+          <Alert
+            type="info"
+            showIcon
+            title="Locale, ngôn ngữ và múi giờ dùng kết quả đã lưu khi kiểm tra proxy. Profile không dùng proxy sẽ giữ nguyên môi trường native của server."
+          />
           {!editingAccount ? (
             <Form.Item name="openAfterCreate" valuePropName="checked" className="modal-checkbox">
               <Checkbox>Mở browser ngay sau khi tạo</Checkbox>
@@ -1226,28 +1362,32 @@ export default function DashboardClient() {
               />
             ) : null}
           </Form.Item>
-          <Form.Item
-            name="accountIds"
-            label="Các profile sử dụng proxy này"
-            extra="Có thể chọn nhiều profile. Nếu profile đang dùng proxy khác, hệ thống sẽ chuyển sang proxy này."
-          >
-            <Select
-              mode="multiple"
-              allowClear
-              showSearch
-              optionFilterProp="label"
-              placeholder="Chọn một hoặc nhiều profile"
-              options={accountRows.map((account) => ({
-                value: account.id,
-                label: `${account.platform} · ${account.username ?? account.id}${
-                  account.proxyBinding?.proxy.id &&
-                  account.proxyBinding.proxy.id !== editingProxy?.id
-                    ? ` · đang dùng ${account.proxyBinding.proxy.name}`
-                    : ''
-                }`,
-              }))}
-            />
-          </Form.Item>
+          {editingProxy && proxyReady(editingProxy) ? (
+            <Form.Item
+              name="accountIds"
+              label="Các profile sử dụng proxy này"
+              extra="Có thể chọn nhiều profile. Nếu profile đang dùng proxy khác, hệ thống sẽ chuyển sang proxy này."
+            >
+              <Select
+                mode="multiple"
+                allowClear
+                showSearch
+                optionFilterProp="label"
+                placeholder="Chọn một hoặc nhiều profile"
+                options={accountRows.map((account) => ({
+                  value: account.id,
+                  label: `${account.platform} · ${account.username ?? account.id}${
+                    account.proxyBinding?.proxy.id &&
+                    account.proxyBinding.proxy.id !== editingProxy?.id
+                      ? ` · đang dùng ${account.proxyBinding.proxy.name}`
+                      : ''
+                  }`,
+                }))}
+              />
+            </Form.Item>
+          ) : (
+            <Alert type="info" showIcon title="Lưu proxy và kiểm tra thành công trước khi gán vào profile." />
+          )}
           <Alert type="info" showIcon title="Để trống username và password nếu proxy không yêu cầu xác thực. Dữ liệu được mã hóa khi lưu." />
         </Form>
       </Modal>

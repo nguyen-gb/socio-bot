@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.5
+          cache: pnpm
+      - name: Reject tracked runtime secrets and browser artifacts
+        shell: bash
+        run: |
+          tracked="$(git ls-files \
+            | grep -E '(^|/)\.env(\..+)?$|^\.tmp-|^(profiles|artifacts|object-storage|secrets)/|^apps/[^/]+/(profiles|artifacts|object-storage|secrets)/|\.(har|zip|trace)$' \
+            | grep -vE '(^|/)\.env\.example$' || true)"
+          if [ -n "$tracked" ]; then
+            printf '%s\n' "$tracked"
+            exit 1
+          fi
+      - run: corepack pnpm install --frozen-lockfile
+      - run: corepack pnpm typecheck
+      - run: corepack pnpm test

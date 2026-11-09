@@ -203,6 +203,7 @@ export class LoginSessionsService {
     expiresAt: Date;
   }>(session: T) {
     let accessUrl: string | null = null;
+    let accessProtocol: string | null = null;
     let accessExpiresAt: string | null = null;
 
     if (
@@ -216,11 +217,11 @@ export class LoginSessionsService {
         60,
       );
       const url = new URL(session.debugEndpoint);
-      url.searchParams.set('token', signed.token);
       accessUrl = url.toString();
+      accessProtocol = `socio-remote.${signed.token}`;
       accessExpiresAt = signed.expiresAt.toISOString();
     }
 
-    return { ...session, accessUrl, accessExpiresAt };
+    return { ...session, accessUrl, accessProtocol, accessExpiresAt };
   }
 }

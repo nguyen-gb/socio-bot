@@ -3,12 +3,12 @@ node_modules/
 .turbo/
 dist/
 .next/
+.next-dev/
 coverage/
 *.tsbuildinfo
 
 .env
-.env.local
-.env.*.local
+.env.*
 !.env.example
 
 /profiles/
@@ -16,7 +16,17 @@ coverage/
 /object-storage/
 /secrets/
 /tmp/
+/.tmp-*/
 /.local/
+
+# Runtime data may also be created from an application's working directory.
+/apps/*/profiles/
+/apps/*/artifacts/
+/apps/*/object-storage/
+/apps/*/secrets/
+*.har
+*.zip
+*.trace
 
 playwright-report/
 test-results/

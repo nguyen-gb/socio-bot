@@ -16,7 +16,7 @@ import { ProfileSnapshotsService } from '../storage/profile-snapshots.service';
 import { WorkerRegistryService } from '../worker-registry/worker-registry.service';
 import { SecretsService } from '../secrets/secrets.service';
 import { AntiCaptchaService } from '../captcha/anticaptcha.service';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrlForProfile, platformSessionStateOrigins, profileFingerprintSettings, profileLoginSettings, PLATFORM_LOGIN, type SupportedPlatform } from './platform-login';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrl, platformSessionStateOrigins, profileFingerprintSettings, profileLoginSettings, proxyLocaleEnvironment, PLATFORM_LOGIN, type SupportedPlatform } from './platform-login';
 export { parseCookieInput } from './platform-login';
 
 @Injectable()
@@ -61,7 +61,13 @@ export class LoginSessionActivities {
       let completion: LoginSessionResult['status'] | undefined;
       const complete = (status: LoginSessionResult['status']): LoginSessionResult => { completion = status; return { status }; };
       const activityContext = Context.current();
-      const heartbeat = setInterval(() => activityContext.heartbeat({ stage: 'interactive_login', sessionId: input.sessionId }), 10_000);
+      const heartbeat = setInterval(() => {
+        activityContext.heartbeat({ stage: 'interactive_login', sessionId: input.sessionId });
+        void this.prisma.browserSession.updateMany({
+          where: { id: input.sessionId, status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } },
+          data: { lastActiveAt: new Date() },
+        }).catch(() => undefined);
+      }, 10_000);
       try {
         const initial = await this.prisma.browserSession.findUnique({ where: { id: requestedSession.id } });
         if (!initial || initial.status === 'CLOSING' || ['CLOSED', 'CRASHED', 'EXPIRED'].includes(initial.status)) return complete('CLOSED');
@@ -72,31 +78,33 @@ export class LoginSessionActivities {
         const profileFingerprint = emulateFingerprint ? profileFingerprintSettings(requestedSession.profile.metadata) : undefined;
         const profileControlsBrowser = Boolean(profileFingerprint);
         const useFingerprint = Boolean(emulateFingerprint && (!profileControlsBrowser || profileFingerprint?.mode !== 'native'));
+        const autoLocale = profileFingerprint?.localeMode === 'auto';
         const profileLocale = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.locale;
-        const profileTimezoneId = profileFingerprint?.localeMode === 'native' ? undefined : profileFingerprint?.timezoneId;
-        const localizedHomeUrl = platformHomeUrlForProfile(platform, requestedSession.profile.metadata);
+        const assignedProxy = requestedSession.profile.account.proxyBinding?.proxy;
+        const localeEnvironment = proxyLocaleEnvironment(assignedProxy);
         Context.current().heartbeat({ stage: 'restoring_profile_snapshot' });
         await this.snapshots.restore(requestedSession.profile);
         Context.current().heartbeat({ stage: 'opening_login_browser' });
         managed = await this.runtime.openProfile({
           profileId: requestedSession.profileId,
           ownerId: requestedSession.id,
-          proxy: await toRuntimeProxy(
-            requestedSession.profile.account.proxyBinding?.proxy,
-            this.secrets,
-          ),
+          proxy: await toRuntimeProxy(assignedProxy, this.secrets),
           // The web view is rendered from the remote CDP screencast, so a
           // server does not need a real desktop/X server for manual login.
           // Keep development headed for local debugging, while production
           // uses the same headless policy as campaign execution.
           headless: this.config.get('browserHeadless', { infer: true }),
           channel: this.config.get('browserChannel', { infer: true }),
-          locale: profileControlsBrowser ? profileLocale : this.config.get('browserLocale', { infer: true }),
-          timezoneId: profileControlsBrowser ? profileTimezoneId : this.config.get('browserTimezoneId', { infer: true }),
+          // Direct connections use Chrome/server-native locale and timezone.
+          locale: undefined,
+          timezoneId: undefined,
+          localeEnvironment,
           colorScheme: profileControlsBrowser ? undefined : this.config.get('browserColorScheme', { infer: true }),
           viewport: profileControlsBrowser ? undefined : this.config.get('browserViewport', { infer: true }),
           emulateFingerprint: useFingerprint,
-          fingerprint: useFingerprint ? profileFingerprint : undefined,
+          // Keep localeMode available even when the desktop bundle is off so
+          // automatic proxy-IP locale still applies to native browser mode.
+          fingerprint: profileFingerprint,
           sessionStateOrigins: platformSessionStateOrigins(platform),
         });
         const loginSettings = profileLoginSettings(
@@ -147,7 +155,12 @@ export class LoginSessionActivities {
         const openedState = await this.prisma.browserSession.findUnique({ where: { id: requestedSession.id } });
         if (openedState?.status !== 'RUNNING') return complete('CLOSED');
         await withDeadline(this.gateway.register(requestedSession.id, managed.page), 10_000, 'Remote browser startup timed out');
-        await withDeadline(initializePlatformSession(managed, platform, credentials, { locale: profileLocale, entryUrl: localizedHomeUrl }), 150_000, 'Login browser initialization timed out');
+        const effectiveLocale = managed.locale ?? (autoLocale ? undefined : profileLocale);
+        const localizedHomeUrl = platformHomeUrl(platform, effectiveLocale);
+        await withDeadline(initializePlatformSession(managed, platform, credentials, {
+          locale: effectiveLocale,
+          entryUrl: localizedHomeUrl,
+        }), 150_000, 'Login browser initialization timed out');
         if (await isPlatformChallenged(managed, platform)) {
           const captcha = await this.anticaptcha?.trySolveVisibleRecaptcha(managed.page);
           if (captcha?.solved) await cancellableDelay(750);
@@ -262,6 +275,15 @@ export class LoginSessionActivities {
           clearInterval(heartbeat);
         }
       }
+    }, {
+      // Opening a login session while a task is finishing is a normal race.
+      // Wait for the current owner instead of failing the Temporal workflow in
+      // the same millisecond that the Redis lease is observed as busy.
+      waitTimeoutMs: requestedSession.expiresAt instanceof Date
+        ? Math.max(30_000, requestedSession.expiresAt.getTime() - Date.now())
+        : 10 * 60_000,
+      onWait: () => Context.current().heartbeat({ stage: 'waiting_profile', sessionId: input.sessionId }),
+      isActive: () => this.leases.hasLiveProfileSession(requestedSession.profileId),
     });
   }
 

@@ -2,10 +2,31 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Context } from '@temporalio/activity';
 import { LoginSessionActivities, parseCookieInput } from './login-session.activities';
-import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrl } from './platform-login';
+import { initializePlatformSession, isPlatformAuthenticated, isPlatformChallenged, platformHomeUrl, profileFingerprintSettings, proxyLocaleEnvironment } from './platform-login';
+
+test('proxy locale uses only a complete environment saved by a successful check', () => {
+  assert.deepEqual(proxyLocaleEnvironment({
+    status: 'HEALTHY', locale: 'de-DE', languages: ['de-DE', 'de'], timezoneId: 'Europe/Berlin',
+  }), {
+    locale: 'de-DE', languages: ['de-DE', 'de'], timezoneId: 'Europe/Berlin', source: 'proxy-ip',
+  });
+  assert.throws(() => proxyLocaleEnvironment({
+    status: 'HEALTHY', locale: null, languages: [], timezoneId: null,
+  }), /kiểm tra lại proxy/);
+  assert.equal(proxyLocaleEnvironment(undefined), undefined);
+});
+
+test('legacy profile locale settings are upgraded to automatic IP mode', () => {
+  assert.equal(profileFingerprintSettings({ fingerprint: {
+    mode: 'auto', localeMode: 'configured', locale: 'vi-VN', languages: ['vi-VN', 'vi'], timezoneId: 'Asia/Ho_Chi_Minh',
+  } })?.localeMode, 'auto');
+  assert.equal(profileFingerprintSettings({ fingerprint: {
+    mode: 'native', localeMode: 'native', locale: 'en-US', languages: ['en-US', 'en'], timezoneId: 'America/New_York',
+  } })?.localeMode, 'auto');
+});
 
 test('profile locale selects the matching platform entry URL', () => {
-  assert.equal(platformHomeUrl('TIKTOK', 'vi-VN'), 'https://www.tiktok.com/vn');
+  assert.equal(platformHomeUrl('TIKTOK', 'vi-VN'), 'https://www.tiktok.com/vi-VN/');
   assert.equal(platformHomeUrl('TIKTOK', 'en-US'), 'https://www.tiktok.com/en');
   assert.equal(platformHomeUrl('FACEBOOK', 'vi-VN'), 'https://www.facebook.com/?locale=vi_VN');
   assert.equal(platformHomeUrl('INSTAGRAM', 'vi-VN'), 'https://www.instagram.com/?hl=vi');
@@ -102,8 +123,9 @@ test('invalid cookie input falls back to password, or remains open for manual lo
   assert.equal(manual.events.includes('close'), false);
 });
 
-test('TikTok login falls back to the English entry when the root navigation fails', async () => {
+test('TikTok login falls back to the Vietnamese entry when the English entry fails', async () => {
   const targets: string[] = [];
+  const reloads: string[] = [];
   let currentUrl = 'about:blank';
   const locator = () => ({
     first: () => locator(),
@@ -121,10 +143,60 @@ test('TikTok login falls back to the English entry when the root navigation fail
       locator,
       goto: async (target: string) => {
         targets.push(target);
-        if (target === 'https://www.tiktok.com/') {
-          throw new Error('page.goto: Timeout 45000ms exceeded. Call log: navigating to "https://www.tiktok.com/", waiting until "commit"');
+        if (target === 'https://www.tiktok.com/en') {
+          throw new Error('page.goto: Timeout 45000ms exceeded. Call log: navigating to "https://www.tiktok.com/en", waiting until "commit"');
         }
         currentUrl = target;
+      },
+      waitForNavigation: async () => {},
+      keyboard: { press: async () => { reloads.push(currentUrl); } },
+      waitForTimeout: async () => {},
+    },
+  };
+
+  await initializePlatformSession(session as never, 'TIKTOK');
+
+  assert.deepEqual(targets, ['https://www.tiktok.com/en', 'https://www.tiktok.com/vi-VN/']);
+  assert.deepEqual(reloads, ['https://www.tiktok.com/vi-VN/']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/vi-VN/');
+});
+
+test('TikTok login keeps the completed English page when goto times out after it rendered', async () => {
+  const targets: string[] = [];
+  const reloads: string[] = [];
+  let currentUrl = 'about:blank';
+  let timeOrigin = 100;
+  const locator = () => ({
+    first: () => locator(),
+    isVisible: async () => false,
+    count: async () => 0,
+  });
+  const session = {
+    profileId: 'profile',
+    slot: 0,
+    context: {
+      cookies: async () => [{ name: 'sessionid', value: 'fresh-session' }],
+      addCookies: async () => {},
+    },
+    page: {
+      url: () => currentUrl,
+      locator,
+      goto: async (target: string) => {
+        targets.push(target);
+        currentUrl = target;
+        throw new Error('page.goto: Timeout 45000ms exceeded while waiting until commit');
+      },
+      waitForLoadState: async () => new Promise<void>(() => undefined),
+      waitForNavigation: async () => {},
+      keyboard: { press: async () => { reloads.push(currentUrl); timeOrigin += 1; } },
+      evaluate: async (pageFunction: () => unknown) => {
+        const source = pageFunction.toString();
+        if (source.includes('readyState') && source.includes('href')) {
+          return { readyState: 'complete', href: currentUrl, timeOrigin };
+        }
+        if (source.includes('readyState')) return { readyState: 'complete', timeOrigin };
+        if (source.includes('performance')) return timeOrigin;
+        return false;
       },
       waitForTimeout: async () => {},
     },
@@ -132,12 +204,50 @@ test('TikTok login falls back to the English entry when the root navigation fail
 
   await initializePlatformSession(session as never, 'TIKTOK');
 
-  assert.deepEqual(targets, ['https://www.tiktok.com/', 'https://www.tiktok.com/en']);
+  assert.deepEqual(targets, ['https://www.tiktok.com/en']);
+  assert.deepEqual(reloads, ['https://www.tiktok.com/en']);
   assert.equal(currentUrl, 'https://www.tiktok.com/en');
 });
 
-test('TikTok direct-entry options still start at the root before the action opens a profile', async () => {
+test('TikTok login retries an English HTTP response failure once with Ctrl+R before fallback', async () => {
   const targets: string[] = [];
+  const reloads: string[] = [];
+  let currentUrl = 'about:blank';
+  const locator = () => ({
+    first: () => locator(),
+    isVisible: async () => false,
+    count: async () => 0,
+  });
+  const session = {
+    profileId: 'profile',
+    slot: 0,
+    context: {
+      cookies: async () => [{ name: 'sessionid', value: 'fresh-session' }],
+      addCookies: async () => {},
+    },
+    page: {
+      url: () => currentUrl,
+      locator,
+      goto: async (target: string) => {
+        targets.push(target);
+        currentUrl = target;
+        throw new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE');
+      },
+      keyboard: { press: async () => { reloads.push(currentUrl); } },
+      waitForTimeout: async () => {},
+    },
+  };
+
+  await initializePlatformSession(session as never, 'TIKTOK');
+
+  assert.deepEqual(targets, ['https://www.tiktok.com/en']);
+  assert.deepEqual(reloads, ['https://www.tiktok.com/en']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/en');
+});
+
+test('TikTok direct-entry options still start at the English entry before the action opens a profile', async () => {
+  const targets: string[] = [];
+  const reloads: string[] = [];
   let currentUrl = 'about:blank';
   const locator = () => ({
     first: () => locator(),
@@ -157,6 +267,8 @@ test('TikTok direct-entry options still start at the root before the action open
         targets.push(target);
         currentUrl = target;
       },
+      waitForNavigation: async () => {},
+      keyboard: { press: async () => { reloads.push(currentUrl); } },
       waitForTimeout: async () => {},
     },
   };
@@ -167,8 +279,98 @@ test('TikTok direct-entry options still start at the root before the action open
     allowPasswordLogin: false,
   });
 
-  assert.deepEqual(targets, ['https://www.tiktok.com/']);
-  assert.equal(currentUrl, 'https://www.tiktok.com/');
+  assert.deepEqual(targets, ['https://www.tiktok.com/en']);
+  assert.deepEqual(reloads, ['https://www.tiktok.com/en']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/en');
+});
+
+test('TikTok reload continues from the completed replacement document even when navigation events are missed', async () => {
+  const targets: string[] = [];
+  let currentUrl = 'about:blank';
+  let timeOrigin = 100;
+  let reloadPressed = false;
+  const locator = () => ({
+    first: () => locator(),
+    isVisible: async () => false,
+    count: async () => 0,
+  });
+  const session = {
+    profileId: 'profile',
+    slot: 0,
+    context: {
+      cookies: async () => [{ name: 'sessionid', value: 'fresh-session' }],
+      addCookies: async () => {},
+    },
+    page: {
+      url: () => currentUrl,
+      locator,
+      goto: async (target: string) => {
+        targets.push(target);
+        currentUrl = target;
+      },
+      waitForLoadState: async () => new Promise<void>(() => undefined),
+      waitForNavigation: async () => { throw new Error('page.waitForNavigation: Timeout 45000ms exceeded'); },
+      keyboard: {
+        press: async () => {
+          reloadPressed = true;
+          timeOrigin += 1;
+        },
+      },
+      evaluate: async (pageFunction: () => unknown) => {
+        const source = pageFunction.toString();
+        if (source.includes('readyState') && source.includes('href')) {
+          return { readyState: 'complete', href: currentUrl, timeOrigin };
+        }
+        if (source.includes('readyState')) return { readyState: 'complete', timeOrigin };
+        if (source.includes('performance')) return timeOrigin;
+        return false;
+      },
+      waitForTimeout: async () => {},
+    },
+  };
+
+  await initializePlatformSession(session as never, 'TIKTOK');
+
+  assert.equal(reloadPressed, true);
+  assert.deepEqual(targets, ['https://www.tiktok.com/en']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/en');
+});
+
+test('TikTok cookie refresh keeps the successful Vietnamese fallback instead of returning to English', async () => {
+  const targets: string[] = [];
+  const reloads: string[] = [];
+  let currentUrl = 'about:blank';
+  let passwordVisible = true;
+  const locator = (selector = ''): any => ({
+    first: () => locator(selector),
+    isVisible: async () => selector.includes('password') && passwordVisible,
+  });
+  const session = {
+    profileId: 'profile',
+    slot: 0,
+    context: {
+      cookies: async () => [{ name: 'sessionid', value: 'old-session' }],
+      addCookies: async () => { passwordVisible = false; },
+    },
+    page: {
+      url: () => currentUrl,
+      locator,
+      goto: async (target: string) => {
+        targets.push(target);
+        if (target === 'https://www.tiktok.com/en') throw new Error('page.goto: Timeout 45000ms exceeded');
+        currentUrl = target;
+      },
+      waitForNavigation: async () => {},
+      keyboard: { press: async () => { reloads.push(currentUrl); } },
+      waitForTimeout: async () => {},
+    },
+  };
+
+  await initializePlatformSession(session as never, 'TIKTOK', { cookies: 'sessionid=new-session' });
+
+  assert.deepEqual(targets, ['https://www.tiktok.com/en', 'https://www.tiktok.com/vi-VN/']);
+  assert.deepEqual(reloads, ['https://www.tiktok.com/vi-VN/', 'https://www.tiktok.com/vi-VN/']);
+  assert.equal(currentUrl, 'https://www.tiktok.com/vi-VN/');
 });
 
 test('CAPTCHA does not trigger password submission or claim READY', async () => {

@@ -8,6 +8,7 @@ import { TemporalClientService } from '../temporal/temporal-client.service';
 import { validateFacebookImages } from '../media/facebook-images';
 
 const campaignInclude = {
+  createdBy: { select: { id: true, email: true, displayName: true } },
   tasks: {
     include: { account: { select: { id: true, username: true, status: true } }, runs: { orderBy: { startedAt: 'desc' as const }, take: 1 } },
     orderBy: { createdAt: 'asc' as const },
@@ -22,7 +23,7 @@ export function retrySafety(task: { status: string; attemptCount: number; runs: 
 }
 
 interface PostTarget { accountId: string; groupUrl: string }
-interface MessageTarget { accountId: string; groupUrl: string }
+interface MessageTarget { accountId: string; groupUrl: string; profileUrl?: string; displayName?: string }
 
 export function distributePostTargets(
   accountIds: string[],
@@ -169,28 +170,29 @@ export class FacebookService {
     return { revoked: true };
   }
 
-  async campaigns(organizationId: string) {
-    const campaigns = await this.prisma.facebookCampaign.findMany({ where: { organizationId }, include: campaignInclude, orderBy: { createdAt: 'desc' }, take: 50 });
+  async campaigns(organizationId: string, requestedTake = 50) {
+    const take = Number.isFinite(requestedTake) ? Math.min(2_000, Math.max(1, Math.trunc(requestedTake))) : 50;
+    const campaigns = await this.prisma.facebookCampaign.findMany({ where: { organizationId }, include: campaignInclude, orderBy: { createdAt: 'desc' }, take });
     return campaigns.map(campaign => ({ ...campaign, tasks: campaign.tasks.map(task => ({ ...task, retrySafety: retrySafety(task) })) }));
   }
 
-  async sync(organizationId: string, input: SyncFacebookGroupsInput) {
+  async sync(organizationId: string, input: SyncFacebookGroupsInput, createdByUserId?: string) {
     input = syncFacebookGroupsSchema.parse(input);
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
     const accounts = await this.selectedAccounts(organizationId, input.accountIds);
-    return this.createSyncCampaign(organizationId, input, accounts.map(account => account.id));
+    return this.createSyncCampaign(organizationId, input, accounts.map(account => account.id), createdByUserId);
   }
 
-  async join(organizationId: string, input: JoinFacebookGroupsInput) {
+  async join(organizationId: string, input: JoinFacebookGroupsInput, createdByUserId?: string) {
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
     const accounts = await this.selectedAccounts(organizationId, input.accountIds);
     const targets = accounts.flatMap((account) => input.groupUrls.map((groupUrl) => ({ accountId: account.id, groupUrl })));
-    return this.createCampaign(organizationId, input, 'JOIN', targets);
+    return this.createCampaign(organizationId, input, 'JOIN', targets, undefined, createdByUserId);
   }
 
-  async post(organizationId: string, input: PostFacebookGroupsInput) {
+  async post(organizationId: string, input: PostFacebookGroupsInput, createdByUserId?: string) {
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
     await validateFacebookImages(this.prisma, organizationId, input.mediaAssetIds);
@@ -235,15 +237,37 @@ export class FacebookService {
     }
     const targets = distribution.targets;
     if (!targets.length) throw new BadRequestException('Không có nhóm nào có thể phân phối cho các account đã chọn.');
-    return this.createCampaign(organizationId, input, 'POST', targets, { groupUrls, ...collectionSnapshot });
+    return this.createCampaign(organizationId, input, 'POST', targets, { groupUrls, ...collectionSnapshot }, createdByUserId);
   }
 
-  async message(organizationId: string, input: MessageFacebookRecipientsInput) {
+  async message(organizationId: string, input: MessageFacebookRecipientsInput, createdByUserId?: string) {
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
     await validateFacebookImages(this.prisma, organizationId, input.mediaAssetIds);
     const accounts = await this.selectedAccounts(organizationId, input.accountIds);
     const selectedGroupUrls = input.groupUrls ?? [];
+    if (input.recipientMode === 'OPT_IN') {
+      const recipients = await this.prisma.facebookOptInRecipient.findMany({
+        where: { organizationId, revokedAt: null, ...(selectedGroupUrls.length ? { groupUrl: { in: selectedGroupUrls } } : {}) },
+        orderBy: [{ consentRecordedAt: 'asc' }, { id: 'asc' }],
+        take: 500,
+      });
+      if (!recipients.length) throw new BadRequestException('Không có người nhận đã đồng ý còn hiệu lực trong phạm vi đã chọn.');
+      const counts = new Map<string, number>();
+      const selectedRecipients = recipients.filter(recipient => {
+        const count = counts.get(recipient.groupUrl) ?? 0;
+        if (count >= input.maxRecipientsPerGroup) return false;
+        counts.set(recipient.groupUrl, count + 1);
+        return true;
+      });
+      const targets = selectedRecipients.map((recipient, index) => ({
+        accountId: accounts[index % accounts.length]!.id,
+        groupUrl: recipient.groupUrl,
+        profileUrl: recipient.profileUrl,
+        displayName: recipient.displayName,
+      }));
+      return this.createMessageCampaign(organizationId, { ...input, groupUrls: [...new Set(selectedRecipients.map(recipient => recipient.groupUrl))] }, targets, createdByUserId);
+    }
     const memberships = await this.prisma.facebookGroupMembership.findMany({
       where: {
         organizationId, accountId: { in: accounts.map(account => account.id) }, status: 'JOINED',
@@ -252,6 +276,13 @@ export class FacebookService {
       select: { accountId: true, groupUrl: true }, orderBy: [{ groupUrl: 'asc' }, { accountId: 'asc' }],
     });
     const groupUrls = selectedGroupUrls.length ? selectedGroupUrls : [...new Set(memberships.map(membership => membership.groupUrl))];
+    if (selectedGroupUrls.length) {
+      const available = new Set(memberships.map(membership => membership.groupUrl));
+      const missing = selectedGroupUrls.filter(groupUrl => !available.has(groupUrl));
+      if (missing.length) {
+        throw new BadRequestException(`${missing.length} nhóm đã chọn không thuộc profile đang chọn hoặc chưa ở trạng thái JOINED. Hãy tải lại danh sách nhóm.`);
+      }
+    }
     // Import successful recipients from older message campaigns into the
     // durable ledger before allocating this campaign. This keeps the new
     // no-duplicate rule effective even for messages sent before the ledger
@@ -259,37 +290,37 @@ export class FacebookService {
     await this.backfillMessageLedger(organizationId, groupUrls);
     const targets = distributeMessageTargets(groupUrls, memberships, input.maxRecipientsPerGroup);
     if (!targets.length) throw new BadRequestException('Các profile được chọn chưa tham gia nhóm nào đã chọn. Hãy đồng bộ nhóm trước.');
-    return this.createMessageCampaign(organizationId, { ...input, groupUrls }, targets);
+    return this.createMessageCampaign(organizationId, { ...input, groupUrls }, targets, createdByUserId);
   }
 
-  async messageReactors(organizationId: string, input: MessageFacebookReactorsInput) {
+  async messageReactors(organizationId: string, input: MessageFacebookReactorsInput, createdByUserId?: string) {
     input = messageFacebookReactorsSchema.parse(input);
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
     await validateFacebookImages(this.prisma, organizationId, input.mediaAssetIds);
     const accounts = await this.selectedAccounts(organizationId, input.accountIds);
     if (!accounts.length) throw new BadRequestException('Không có account Facebook READY được chọn.');
-    return this.createMessageReactorsCampaign(organizationId, input, accounts.map(account => account.id));
+    return this.createMessageReactorsCampaign(organizationId, input, accounts.map(account => account.id), createdByUserId);
   }
 
-  async scanComments(organizationId: string, input: ScanFacebookPostCommentsInput) {
+  async scanComments(organizationId: string, input: ScanFacebookPostCommentsInput, createdByUserId?: string) {
     input = scanFacebookPostCommentsSchema.parse(input);
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
     const accounts = await this.selectedAccounts(organizationId, input.accountIds);
-    return this.createScanCommentsCampaign(organizationId, input, accounts.map(account => account.id));
+    return this.createScanCommentsCampaign(organizationId, input, accounts.map(account => account.id), createdByUserId);
   }
 
-  async replyComments(organizationId: string, input: ReplyFacebookPostCommentsInput) {
+  async replyComments(organizationId: string, input: ReplyFacebookPostCommentsInput, createdByUserId?: string) {
     input = replyFacebookPostCommentsSchema.parse(input);
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
     await validateFacebookImages(this.prisma, organizationId, input.mediaAssetIds);
     const accounts = await this.selectedAccounts(organizationId, input.accountIds);
-    return this.createReplyCommentsCampaign(organizationId, input, accounts.map(account => account.id));
+    return this.createReplyCommentsCampaign(organizationId, input, accounts.map(account => account.id), createdByUserId);
   }
 
-  async commentGroupPosts(organizationId: string, input: CommentFacebookGroupPostsInput) {
+  async commentGroupPosts(organizationId: string, input: CommentFacebookGroupPostsInput, createdByUserId?: string) {
     input = commentFacebookGroupPostsSchema.parse(input);
     const existing = await this.existing(organizationId, input.idempotencyKey);
     if (existing) return existing;
@@ -301,9 +332,16 @@ export class FacebookService {
     });
     const available = new Set(memberships.map(membership => membership.groupUrl));
     if (input.groupUrls.some(groupUrl => !available.has(groupUrl))) throw new BadRequestException('Một số nhóm được chọn chưa được profile tham gia hoặc chưa đồng bộ.');
-    const targets = memberships.map(membership => ({ accountId: membership.accountId, groupUrl: membership.groupUrl }));
+    // One group is owned by one profile in a campaign. Creating a task for
+    // every membership would comment on the same posts repeatedly.
+    const targets = distributePostTargets(
+      accounts.map(account => account.id),
+      [...new Set(input.groupUrls)],
+      memberships,
+      input.groupUrls.length,
+    ).targets;
     if (!targets.length) throw new BadRequestException('Các profile được chọn chưa tham gia nhóm nào đã chọn. Hãy đồng bộ nhóm trước.');
-    return this.createCommentGroupPostsCampaign(organizationId, input, targets);
+    return this.createCommentGroupPostsCampaign(organizationId, input, targets, createdByUserId);
   }
 
   async approve(organizationId: string, id: string, userId?: string) {
@@ -441,7 +479,7 @@ export class FacebookService {
     for (const task of tasks) {
       const index = sequence.get(task.accountId) ?? 0; sequence.set(task.accountId, index + 1);
       const workflowId = `task/${task.id}/${randomUUID()}`, scheduledAt = new Date(now + index * intervalSeconds * 1000);
-      const claimed = await tx.task.updateMany({ where: { id: task.id, organizationId: campaign.organizationId, campaignId: campaign.id, status: task.status, workflowId: task.workflowId, attemptCount: task.attemptCount, approvalStatus: 'APPROVED' }, data: { status: 'SCHEDULED', workflowId, scheduledAt, attemptCount: 0, lastError: null } });
+      const claimed = await tx.task.updateMany({ where: { id: task.id, organizationId: campaign.organizationId, campaignId: campaign.id, status: task.status, workflowId: task.workflowId, attemptCount: task.attemptCount, approvalStatus: 'APPROVED' }, data: { status: 'SCHEDULED', workflowId, dispatchedAt: null, scheduledAt, attemptCount: 0, lastError: null } });
       if (claimed.count !== 1) throw new ConflictException('Tác vụ đã thay đổi. Tải lại chiến dịch trước khi tiếp tục.');
       dispatches.push({ id: task.id, workflowId, scheduledAt });
     }
@@ -478,18 +516,25 @@ export class FacebookService {
     }
   }
 
-  private async selectedAccounts(organizationId: string, accountIds: string[], database: Pick<PrismaService, 'platformAccount'> = this.prisma, allowActiveAutomation = false) {
+  private async selectedAccounts(organizationId: string, accountIds: string[], database: Pick<PrismaService, 'platformAccount'> = this.prisma, requireRuntimeReady = false) {
     const ids = [...new Set(accountIds)];
     const accounts = await database.platformAccount.findMany({
-      where: { organizationId, platform: 'FACEBOOK', status: allowActiveAutomation ? { in: ['READY', 'RUNNING'] } : 'READY', ...(ids.length ? { id: { in: ids } } : {}) },
+      where: {
+        organizationId,
+        platform: 'FACEBOOK',
+        status: requireRuntimeReady
+          ? { in: ['READY', 'RUNNING'] }
+          : ids.length ? { not: 'DISABLED' } : 'READY',
+        ...(ids.length ? { id: { in: ids } } : {}),
+      },
       include: { browserProfile: { include: { sessions: { where: { status: { in: ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'] } }, select: { mode: true }, take: 1 } } }, proxyBinding: { include: { proxy: true } } },
       orderBy: { createdAt: 'asc' },
     });
-    if (!accounts.length) throw new BadRequestException('Không có account Facebook READY');
-    if (ids.length && accounts.length !== ids.length) throw new BadRequestException('Các account được chọn phải thuộc workspace, là Facebook và ở trạng thái READY');
+    if (!accounts.length) throw new BadRequestException('Không có account Facebook phù hợp');
+    if (ids.length && accounts.length !== ids.length) throw new BadRequestException('Các account được chọn phải thuộc workspace, là Facebook và chưa bị vô hiệu hóa');
     if (accounts.length > 100) throw new BadRequestException('Chọn tối đa 100 account cho một chiến dịch');
-    for (const account of accounts) {
-      const blockingSession = account.browserProfile?.sessions.find(session => !allowActiveAutomation || session.mode !== 'AUTOMATION');
+    if (requireRuntimeReady) for (const account of accounts) {
+      const blockingSession = account.browserProfile?.sessions.find(session => session.mode !== 'AUTOMATION');
       if (!account.browserProfile || blockingSession) throw new ConflictException(`Đóng browser của ${account.username ?? account.id} trước khi chạy`);
       if (account.proxyBinding && account.proxyBinding.proxy.status !== 'HEALTHY') throw new ConflictException(`Kiểm tra lại proxy của ${account.username ?? account.id} trước khi chạy`);
     }
@@ -502,28 +547,22 @@ export class FacebookService {
     kind: 'JOIN' | 'POST',
     targets: Array<{ accountId: string; groupUrl: string }>,
     postSnapshot?: { groupUrls: string[]; collectionIds?: string[]; collectionNames?: string[] },
+    createdByUserId?: string,
   ) {
     if (targets.length > 500) throw new BadRequestException('Một chiến dịch tối đa 500 cặp account/nhóm. Hãy chia thành các chiến dịch nhỏ hơn.');
-    const startsImmediately = kind === 'POST';
-    const createdAt = new Date();
-    const sequence = new Map<string, number>();
     const taskCreates = targets.map((target) => {
       const id = randomUUID();
-      const index = sequence.get(target.accountId) ?? 0;
-      sequence.set(target.accountId, index + 1);
       return {
         id, organizationId, accountId: target.accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
         platform: 'FACEBOOK' as const, action: kind === 'JOIN' ? 'JOIN_FACEBOOK_GROUP' : 'POST_FACEBOOK_GROUP',
         payload: { groupUrl: target.groupUrl, ...('text' in input ? { text: input.text, mediaAssetIds: input.mediaAssetIds ?? [] } : {}) },
         maxAttempts: 1,
-        status: startsImmediately ? 'SCHEDULED' as const : 'DRAFT' as const,
-        approvalStatus: startsImmediately ? 'APPROVED' as const : 'PENDING' as const,
-        ...(startsImmediately ? { approvedAt: createdAt, scheduledAt: new Date(createdAt.getTime() + index * input.intervalSeconds * 1000) } : {}),
+        status: 'DRAFT' as const,
+        approvalStatus: 'PENDING' as const,
       };
     });
     const data = {
-      organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind,
-      ...(startsImmediately ? { approvedAt: createdAt } : {}),
+      organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind, createdByUserId,
       payload: { intervalSeconds: input.intervalSeconds, ...('text' in input ? {
         text: input.text, mediaAssetIds: input.mediaAssetIds ?? [], selection: input.selection,
         maxGroupsPerAccount: input.maxGroupsPerAccount,
@@ -536,16 +575,7 @@ export class FacebookService {
       tasks: { create: taskCreates },
     };
     try {
-      const create = (database: Pick<PrismaService, 'facebookCampaign'>) => database.facebookCampaign.create({ data, include: campaignInclude });
-      if (!startsImmediately) return await create(this.prisma);
-      // Posts are dispatched immediately, but still use the same account locks
-      // and active-task checks as the manual approval path.
-      const created = await this.prisma.$transaction(async (tx) => {
-        await this.ensureDispatchable(tx, organizationId, [...new Set(targets.map(target => target.accountId))]);
-        return create(tx);
-      });
-      await this.dispatch(created.tasks.map(task => ({ id: task.id, workflowId: task.workflowId!, scheduledAt: task.scheduledAt! })));
-      return created;
+      return await this.prisma.facebookCampaign.create({ data, include: campaignInclude });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         const existing = await this.existing(organizationId, input.idempotencyKey);
@@ -555,11 +585,11 @@ export class FacebookService {
     }
   }
 
-  private async createSyncCampaign(organizationId: string, input: SyncFacebookGroupsInput, accountIds: string[]) {
+  private async createSyncCampaign(organizationId: string, input: SyncFacebookGroupsInput, accountIds: string[], createdByUserId?: string) {
     try {
       return await this.prisma.facebookCampaign.create({
         data: {
-          organizationId, idempotencyKey: input.idempotencyKey,
+          organizationId, idempotencyKey: input.idempotencyKey, createdByUserId,
           name: input.scope === 'SELECTED' ? 'Đồng bộ nhóm đã chọn' : 'Đồng bộ tất cả nhóm Facebook',
           kind: 'SYNC', payload: { scope: input.scope ?? 'ALL', intervalSeconds: 60 },
           tasks: { create: accountIds.map(accountId => {
@@ -581,13 +611,13 @@ export class FacebookService {
     }
   }
 
-  private async createMessageCampaign(organizationId: string, input: MessageFacebookRecipientsInput, targets: MessageTarget[]) {
+  private async createMessageCampaign(organizationId: string, input: MessageFacebookRecipientsInput, targets: MessageTarget[], createdByUserId?: string) {
     try {
       return await this.prisma.facebookCampaign.create({
         data: {
-          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'MESSAGE',
+          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'MESSAGE', createdByUserId,
           payload: {
-            text: input.text, mediaAssetIds: input.mediaAssetIds, groupUrls: input.groupUrls, maxRecipientsPerGroup: input.maxRecipientsPerGroup,
+            text: input.text, mediaAssetIds: input.mediaAssetIds, groupUrls: input.groupUrls, recipientMode: input.recipientMode, maxRecipientsPerGroup: input.maxRecipientsPerGroup,
             intervalSeconds: input.intervalSeconds,
           },
           tasks: { create: targets.map(target => {
@@ -595,7 +625,7 @@ export class FacebookService {
             return {
               id, organizationId, accountId: target.accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
               platform: 'FACEBOOK', action: 'MESSAGE_FACEBOOK_RECIPIENT',
-              payload: { groupUrl: target.groupUrl, text: input.text, mediaAssetIds: input.mediaAssetIds },
+              payload: { groupUrl: target.groupUrl, ...(target.profileUrl ? { profileUrl: target.profileUrl, displayName: target.displayName } : {}), text: input.text, mediaAssetIds: input.mediaAssetIds },
               maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
             };
           }) },
@@ -610,7 +640,7 @@ export class FacebookService {
     }
   }
 
-  private async createMessageReactorsCampaign(organizationId: string, input: MessageFacebookReactorsInput, accountIds: string[]) {
+  private async createMessageReactorsCampaign(organizationId: string, input: MessageFacebookReactorsInput, accountIds: string[], createdByUserId?: string) {
     const postUrls = [...new Set([...(input.postUrls ?? []), ...(input.postUrl ? [input.postUrl] : [])])];
     if (!postUrls.length) throw new BadRequestException('Nhập ít nhất một URL bài viết Facebook');
     const allocations = distributeReplyCounts(accountIds, input.maxRecipientsPerPost);
@@ -619,7 +649,7 @@ export class FacebookService {
     try {
       return await this.prisma.facebookCampaign.create({
         data: {
-          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'MESSAGE_REACTORS',
+          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'MESSAGE_REACTORS', createdByUserId,
           payload: { postUrl: postUrls[0], postUrls, recipientSource: input.recipientSource, text: input.text, mediaAssetIds: input.mediaAssetIds, maxRecipientsPerPost: input.maxRecipientsPerPost, intervalSeconds: input.intervalSeconds },
           tasks: { create: postUrls.flatMap(postUrl => taskAccounts.map(accountId => {
             const id = randomUUID();
@@ -663,52 +693,23 @@ export class FacebookService {
     }
   }
 
-  private async createScanCommentsCampaign(organizationId: string, input: ScanFacebookPostCommentsInput, accountIds: string[]) {
+  private async createScanCommentsCampaign(organizationId: string, input: ScanFacebookPostCommentsInput, accountIds: string[], createdByUserId?: string) {
     const postUrls = [...new Set([...(input.postUrls ?? []), ...(input.postUrl ? [input.postUrl] : [])])];
     if (!postUrls.length) throw new BadRequestException('Nhập ít nhất một URL bài viết Facebook');
-    // Keep the campaign bounded even when all READY profiles are selected.
-    if (postUrls.length * accountIds.length > 500) {
-      throw new BadRequestException('Một chiến dịch tối đa 500 cặp account/bài viết. Hãy giảm số bài viết hoặc số profile.');
-    }
+    if (postUrls.length > 500) throw new BadRequestException('Một chiến dịch tối đa 500 bài viết.');
     try {
       return await this.prisma.facebookCampaign.create({
         data: {
-          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'SCAN_COMMENTS',
+          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'SCAN_COMMENTS', createdByUserId,
           // Store both forms so old clients can still display the first URL,
           // while the full list remains available after the campaign finishes.
           payload: { postUrl: postUrls[0], postUrls, intervalSeconds: input.intervalSeconds },
-          tasks: { create: accountIds.flatMap(accountId => postUrls.map(postUrl => {
+          tasks: { create: postUrls.map((postUrl, index) => {
+            const accountId = accountIds[index % accountIds.length]!;
             const id = randomUUID();
             return {
               id, organizationId, accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
               platform: 'FACEBOOK', action: 'SCAN_FACEBOOK_POST_COMMENTS', payload: { postUrl },
-              maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
-            };
-          })) },
-        }, include: campaignInclude,
-      });
-    } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-        const existing = await this.existing(organizationId, input.idempotencyKey);
-        if (existing) return existing;
-      }
-      throw error;
-    }
-  }
-
-  private async createReplyCommentsCampaign(organizationId: string, input: ReplyFacebookPostCommentsInput, accountIds: string[]) {
-    const allocations = distributeReplyCounts(accountIds, input.maxReplies);
-    const taskAccounts = accountIds.filter(accountId => (allocations.get(accountId) ?? 0) > 0);
-    try {
-      return await this.prisma.facebookCampaign.create({
-        data: {
-          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'REPLY_COMMENTS',
-          payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies, intervalSeconds: input.intervalSeconds },
-          tasks: { create: taskAccounts.map(accountId => {
-            const id = randomUUID();
-            return {
-              id, organizationId, accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
-              platform: 'FACEBOOK', action: 'REPLY_FACEBOOK_POST_COMMENTS', payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: allocations.get(accountId) },
               maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
             };
           }) },
@@ -723,12 +724,40 @@ export class FacebookService {
     }
   }
 
-  private async createCommentGroupPostsCampaign(organizationId: string, input: CommentFacebookGroupPostsInput, targets: Array<{ accountId: string; groupUrl: string }>) {
+  private async createReplyCommentsCampaign(organizationId: string, input: ReplyFacebookPostCommentsInput, accountIds: string[], createdByUserId?: string) {
+    // Replies from multiple profiles race over the same comment list and can
+    // answer one person more than once. Assign the post to one profile.
+    const accountId = accountIds[0]!;
+    try {
+      return await this.prisma.facebookCampaign.create({
+        data: {
+          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'REPLY_COMMENTS', createdByUserId,
+          payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies, intervalSeconds: input.intervalSeconds },
+          tasks: { create: [accountId].map(accountId => {
+            const id = randomUUID();
+            return {
+              id, organizationId, accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
+              platform: 'FACEBOOK', action: 'REPLY_FACEBOOK_POST_COMMENTS', payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies },
+              maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
+            };
+          }) },
+        }, include: campaignInclude,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const existing = await this.existing(organizationId, input.idempotencyKey);
+        if (existing) return existing;
+      }
+      throw error;
+    }
+  }
+
+  private async createCommentGroupPostsCampaign(organizationId: string, input: CommentFacebookGroupPostsInput, targets: Array<{ accountId: string; groupUrl: string }>, createdByUserId?: string) {
     if (targets.length > 500) throw new BadRequestException('Một chiến dịch tối đa 500 cặp profile/nhóm.');
     try {
       return await this.prisma.facebookCampaign.create({
         data: {
-          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'COMMENT_GROUP_POSTS',
+          organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'COMMENT_GROUP_POSTS', createdByUserId,
           payload: {
             groupUrls: input.groupUrls, text: input.text, mediaAssetIds: input.mediaAssetIds,
             daysRecent: input.daysRecent, minReactions: input.minReactions, maxReactions: input.maxReactions,

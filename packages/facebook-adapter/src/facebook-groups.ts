@@ -24,8 +24,13 @@ export class FacebookGroupsAutomation {
   constructor(private readonly timing: GroupSyncTiming & { mainTimeoutMs?: number; controlTimeoutMs?: number; joinConfirmationTimeoutMs?: number; postConfirmationTimeoutMs?: number; imageUploadTimeoutMs?: number } = {}) {}
   async sync(session: PlatformSession): Promise<ActionResult> {
     const page = automationPage(session);
-    const blocked = await openGroupsPage(page, 'https://www.facebook.com/groups/joins/', this.timing.mainTimeoutMs);
-    if (blocked) return blocked;
+    await gotoPlatformPage(page, 'https://www.facebook.com/groups/joins/', undefined, {
+      timeoutMs: 45_000,
+    });
+    await dismissWelcome(page);
+    await page.getByRole('main').first()
+      .waitFor({ state: 'visible', timeout: this.timing.mainTimeoutMs ?? 30_000 })
+      .catch(() => undefined);
     return scanJoinedFacebookGroups(page, () => guard(page), this.timing);
   }
 
@@ -257,12 +262,19 @@ async function joinState(page: Page, expected: string, data: Record<string, unkn
   const limited = await main.getByText(/You have limited membership|Bạn (?:có|đang có) tư cách thành viên hạn chế/i).and(page.locator(GROUP_CONTENT)).filter({ visible: true }).first().isVisible();
   const pending = await groupButtons(page, PENDING).count() > 0
     || await main.getByText(PENDING_NOTICE).and(page.locator(GROUP_CONTENT)).filter({ visible: true }).first().isVisible();
-  const management = await hasGroupManagementTools(page, expected);
-  if ((joined || limited || management) && pending) return { result: manual('Trạng thái tham gia và chờ duyệt đang mâu thuẫn. Kiểm tra thủ công, không gửi thêm yêu cầu.', { ...data, membershipStatus: 'UNKNOWN' }) };
+  // The visible membership controls are the cheapest and most reliable
+  // confirmation after clicking Join. Avoid scanning all group navigation links
+  // on every confirmation poll once Facebook has already exposed a clear state.
+  if ((joined || limited) && pending) return { result: manual('Trạng thái tham gia và chờ duyệt đang mâu thuẫn. Kiểm tra thủ công, không gửi thêm yêu cầu.', { ...data, membershipStatus: 'UNKNOWN' }) };
   if (joined) return { result: { ok: true, data: { ...data, membershipStatus: 'JOINED', ...(beforeClick ? { alreadyJoined: true } : {}) } } };
-  if (management) return { result: { ok: true, data: { ...data, membershipStatus: 'JOINED', groupRole: 'ADMIN_OR_MODERATOR', ...(beforeClick ? { alreadyJoined: true } : {}) } } };
   if (limited) return { result: { ok: true, data: { ...data, membershipStatus: 'JOINED', limitedMembership: true, ...(beforeClick ? { alreadyJoined: true } : {}) } } };
-  if (pending) return { result: { ok: true, data: { ...data, membershipStatus: 'PENDING', ...(beforeClick ? { requestAlreadyPending: true } : {}) } } };
+  if (pending) {
+    const management = await hasGroupManagementTools(page, expected);
+    if (management) return { result: manual('Trạng thái tham gia và chờ duyệt đang mâu thuẫn. Kiểm tra thủ công, không gửi thêm yêu cầu.', { ...data, membershipStatus: 'UNKNOWN' }) };
+    return { result: { ok: true, data: { ...data, membershipStatus: 'PENDING', ...(beforeClick ? { requestAlreadyPending: true } : {}) } } };
+  }
+  const management = await hasGroupManagementTools(page, expected);
+  if (management) return { result: { ok: true, data: { ...data, membershipStatus: 'JOINED', groupRole: 'ADMIN_OR_MODERATOR', ...(beforeClick ? { alreadyJoined: true } : {}) } } };
   if (await main.getByText(UNAVAILABLE).and(page.locator(GROUP_CONTENT)).filter({ visible: true }).first().isVisible()) {
     return { result: manual('Nhóm không khả dụng, đã tạm dừng/lưu trữ hoặc không cho phép tham gia.', { ...data, membershipStatus: 'UNKNOWN', groupUnavailable: true }) };
   }

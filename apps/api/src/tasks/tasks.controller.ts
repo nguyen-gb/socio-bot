@@ -1,6 +1,10 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import {
   createTaskSchema,
+  createTaskBatchSchema,
+  approveTaskBatchSchema,
+  type CreateTaskBatchInput,
+  type ApproveTaskBatchInput,
   type CreateTaskInput,
 } from '@socio/contracts';
 import { OrganizationId } from '../common/organization-id.decorator';
@@ -15,8 +19,8 @@ export class TasksController {
   constructor(private readonly tasks: TasksService) {}
 
   @Get()
-  list(@OrganizationId() organizationId: string) {
-    return this.tasks.list(organizationId);
+  list(@OrganizationId() organizationId: string, @Query('take') take?: string) {
+    return this.tasks.list(organizationId, take ? Number(take) : undefined);
   }
 
   @Get(':id')
@@ -32,8 +36,29 @@ export class TasksController {
   create(
     @OrganizationId() organizationId: string,
     @Body(new ZodValidationPipe(createTaskSchema)) input: CreateTaskInput,
+    @CurrentPrincipal() principal: AuthPrincipal,
   ) {
-    return this.tasks.create(organizationId, input);
+    return this.tasks.create(organizationId, input, principal.userId);
+  }
+
+  @Post('batch')
+  @MinimumRole('OPERATOR')
+  createBatch(
+    @OrganizationId() organizationId: string,
+    @Body(new ZodValidationPipe(createTaskBatchSchema)) input: CreateTaskBatchInput,
+    @CurrentPrincipal() principal: AuthPrincipal,
+  ) {
+    return this.tasks.createBatch(organizationId, input, principal.userId);
+  }
+
+  @Post('batch/approve')
+  @MinimumRole('ADMIN')
+  approveBatch(
+    @OrganizationId() organizationId: string,
+    @Body(new ZodValidationPipe(approveTaskBatchSchema)) input: ApproveTaskBatchInput,
+    @CurrentPrincipal() principal: AuthPrincipal,
+  ) {
+    return this.tasks.approveBatch(organizationId, input.taskIds, principal.userId);
   }
 
   @Post(':id/approve')

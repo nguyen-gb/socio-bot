@@ -1,5 +1,14 @@
 import type { ActionResult, Platform, PlatformAction } from '@socio/contracts';
 
+const PLATFORM_HUMAN_SETTLE_MIN_MS = 1_000;
+const PLATFORM_HUMAN_SETTLE_MAX_MS = 3_000;
+
+// A single navigation is observed by several layers (session bootstrap,
+// adapter dispatch and the concrete campaign flow). Remember the document
+// that already paid the human settle delay so those layers do not stack a
+// fresh 1-3 second pause while Chrome is showing the same completed page.
+const settledPlatformDocuments = new WeakMap<object, string>();
+
 export interface BrowserPage {
   url(): string;
   title(): Promise<string>;
@@ -164,64 +173,101 @@ export async function hasPlatformErrorSurface(page: BrowserPage): Promise<boolea
  * the document event fired. SPA platforms can still be replacing the shell
  * and mounting the controls that campaigns need. Wait for both the DOM and
  * full page load milestones, verify the document reports `complete`, then
- * give the client a short bounded settle window before any adapter resolves
- * locators or starts the next navigation.
+ * pause for a human-like 1-3 seconds before any adapter resolves locators or
+ * starts the next action. In Chrome terms, campaign work resumes only after
+ * the loading spinner has become the reload icon and this pause has elapsed.
  */
 export async function waitForPlatformPageReady(
   page: BrowserPage,
-  options: { timeoutMs?: number; settleMs?: number } = {},
+  options: { timeoutMs?: number } = {},
 ): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 45_000;
   const deadline = Date.now() + timeoutMs;
   const remaining = () => Math.max(1, deadline - Date.now());
   let loadStateError: unknown;
+  let loadMilestoneComplete = !page.waitForLoadState;
+  let documentKey: string | undefined;
 
-  try {
-    await page.waitForLoadState?.('domcontentloaded', { timeout: remaining() });
-  } catch {
-    // A client-side route can detach the document between the navigation and
-    // this wait. The document probe below decides whether that replacement is
-    // already complete.
-  }
-  try {
-    await page.waitForLoadState?.('load', { timeout: remaining() });
-  } catch (error) {
-    loadStateError = error;
-  }
-
-  let documentComplete = false;
-  if (page.evaluate) {
-    while (Date.now() < deadline) {
-      try {
-        const readyState = await page.evaluate(() => document.readyState);
-        // Lightweight test/remote shims may implement evaluate without a real
-        // DOM. Preserve their existing fast path instead of waiting for the
-        // full navigation budget on a value that cannot represent readyState.
-        if (typeof readyState !== 'string') {
-          documentComplete = true;
-          break;
-        }
-        if (readyState === 'complete') {
-          documentComplete = true;
-          break;
-        }
-      } catch {
-        // The SPA may be swapping documents. Keep observing the replacement
-        // until the bounded navigation budget expires.
+  const probeCurrentDocument = async (): Promise<boolean> => {
+    if (!page.evaluate) return false;
+    try {
+      const snapshot = await page.evaluate(() => ({
+        readyState: document.readyState,
+        href: window.location.href,
+        timeOrigin: window.performance?.timeOrigin,
+      })) as unknown;
+      // Lightweight test/remote shims may return the readyState string only.
+      if (typeof snapshot === 'string') return snapshot === 'complete';
+      if (!snapshot || typeof snapshot !== 'object') return true;
+      const value = snapshot as { readyState?: unknown; href?: unknown; timeOrigin?: unknown };
+      if (value.readyState !== 'complete') return false;
+      if (typeof value.href === 'string' && typeof value.timeOrigin === 'number') {
+        documentKey = `${value.timeOrigin}:${value.href}`;
       }
-      await page.waitForTimeout?.(100);
+      return true;
+    } catch {
+      // TikTok may be replacing the document while it is being probed.
+      return false;
     }
-  } else {
-    // Test/remote shims do not expose document evaluation. The load-state
-    // primitive is still authoritative when it is available.
-    documentComplete = !page.waitForLoadState || !loadStateError;
+  };
+
+  // Fast path for repeated readiness checks against the exact same document.
+  // A real reload changes performance.timeOrigin, while an SPA route change
+  // changes href, so a genuinely new page still receives its required delay.
+  let documentComplete = await probeCurrentDocument();
+  if (documentComplete && documentKey && settledPlatformDocuments.get(page) === documentKey) return;
+  if (documentComplete) loadMilestoneComplete = true;
+
+  // TikTok can replace its document while Playwright is subscribed to the
+  // previous document's load event. Keep the browser milestone in flight,
+  // but observe the *current* document concurrently. Chrome changes its
+  // loading spinner to the Reload icon when that document reaches `complete`;
+  // either signal is enough to continue immediately.
+  const loadMilestone = !documentComplete && page.waitForLoadState
+    ? (async () => {
+      try {
+        await page.waitForLoadState?.('domcontentloaded', { timeout: remaining() });
+      } catch (error) {
+        loadStateError = error;
+      }
+      try {
+        await page.waitForLoadState?.('load', { timeout: remaining() });
+        loadMilestoneComplete = true;
+      } catch (error) {
+        loadStateError = error;
+      }
+    })()
+    : Promise.resolve();
+
+  while (!loadMilestoneComplete && Date.now() < deadline) {
+    if (await probeCurrentDocument()) {
+      documentComplete = true;
+      break;
+    }
+    const poll = page.waitForTimeout
+      ? page.waitForTimeout(100)
+      : new Promise<void>((resolve) => setTimeout(resolve, 100));
+    await Promise.race([loadMilestone, poll]);
   }
 
-  if (loadStateError && page.evaluate && !documentComplete) {
-    throw loadStateError;
+  if (!loadMilestoneComplete && !documentComplete) {
+    throw loadStateError instanceof Error
+      ? loadStateError
+      : new Error(`Trang chưa tải xong sau ${timeoutMs.toString()}ms`);
   }
 
-  if (page.waitForTimeout) await page.waitForTimeout(options.settleMs ?? 400);
+  if (page.waitForTimeout) {
+    const settleMs = randomInteger(
+      PLATFORM_HUMAN_SETTLE_MIN_MS,
+      PLATFORM_HUMAN_SETTLE_MAX_MS,
+    );
+    await page.waitForTimeout(settleMs);
+  }
+  if (documentKey) settledPlatformDocuments.set(page, documentKey);
+}
+
+function randomInteger(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function isHttpResponseCodeFailure(error: unknown): boolean {
@@ -278,6 +324,16 @@ export interface PlatformSession {
   reserveMessageRecipient?: (input: { groupUrl: string; profileUrl: string; displayName?: string }) => Promise<boolean>;
   /** Release a reservation only when Facebook definitively did not send. */
   releaseMessageRecipient?: (input: { groupUrl: string; profileUrl: string }) => Promise<void>;
+  /** Reserve one Facebook target across campaigns before an external action starts. */
+  reserveFacebookTarget?: (input: { action: 'JOIN' | 'POST' | 'COMMENT' | 'REPLY' | 'MESSAGE'; targetKey: string }) => Promise<boolean>;
+  completeFacebookTarget?: (input: { action: 'JOIN' | 'POST' | 'COMMENT' | 'REPLY' | 'MESSAGE'; targetKey: string }) => Promise<void>;
+  releaseFacebookTarget?: (input: { action: 'JOIN' | 'POST' | 'COMMENT' | 'REPLY' | 'MESSAGE'; targetKey: string }) => Promise<void>;
+  /** Reserve one TikTok target across campaigns before an external action starts. */
+  reserveTikTokTarget?: (input: { action: 'COMMENT' | 'REPLY' | 'LIKE' | 'MESSAGE'; targetKey: string }) => Promise<boolean>;
+  /** Mark a reserved TikTok target as durably completed. */
+  completeTikTokTarget?: (input: { action: 'COMMENT' | 'REPLY' | 'LIKE' | 'MESSAGE'; targetKey: string }) => Promise<void>;
+  /** Release only when TikTok definitively did not start the external action. */
+  releaseTikTokTarget?: (input: { action: 'COMMENT' | 'REPLY' | 'LIKE' | 'MESSAGE'; targetKey: string }) => Promise<void>;
 }
 
 export interface PlatformAdapter {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { UnauthorizedException } from '@nestjs/common';
 import { AccessTokenService } from './access-token.service';
+import { AuthService } from './auth.service';
 import { hashPassword, verifyPassword } from './password';
 
 test('password hashes verify without storing plaintext', async () => {
@@ -37,4 +38,44 @@ test('access token is scoped to the signed user and organization', () => {
     () => service.verify(`${issued.token.slice(0, -1)}x`),
     UnauthorizedException,
   );
+});
+
+test('refresh token rotation is claimed atomically before minting a replacement', async () => {
+  const membership = {
+    organizationId: '00000000-0000-4000-8000-000000000001',
+    role: 'OWNER' as const,
+    organization: { name: 'Test' },
+  };
+  const current = {
+    id: '00000000-0000-4000-8000-000000000020',
+    organizationId: membership.organizationId,
+    revokedAt: null,
+    expiresAt: new Date(Date.now() + 60_000),
+    user: {
+      id: '00000000-0000-4000-8000-000000000010',
+      email: 'owner@socio.local',
+      displayName: 'Owner',
+      status: 'ACTIVE',
+      memberships: [membership],
+    },
+  };
+  let replacementCreated = false;
+  const transaction = {
+    refreshToken: {
+      findUnique: async () => current,
+      updateMany: async () => ({ count: 0 }),
+      create: async () => { replacementCreated = true; },
+    },
+  };
+  const prisma = {
+    $transaction: async (callback: (tx: typeof transaction) => unknown) => callback(transaction),
+  };
+  const service = new AuthService(
+    prisma as never,
+    { issue: () => ({ token: 'access', expiresAt: new Date(Date.now() + 60_000) }) } as never,
+    { get: () => 30 } as never,
+  );
+
+  await assert.rejects(() => service.refresh('already-used'), UnauthorizedException);
+  assert.equal(replacementCreated, false);
 });

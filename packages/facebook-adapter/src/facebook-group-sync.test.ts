@@ -30,6 +30,18 @@ test('full sync includes manually joined and unnamed groups, excludes recommenda
   assert.deepEqual(result.data?.groups, [{ groupUrl: 'https://www.facebook.com/groups/manual/', groupName: 'Manually joined' }, { groupUrl: 'https://www.facebook.com/groups/123/', groupName: null }]);
 }));
 
+test('pending group requests are not imported as joined groups', async () => fixture(`
+  <section><h2>Pending group requests (1)</h2><a href="/groups/pending/">Pending</a><span>Requested to join</span></section>
+  <section><h2>All groups you've joined (2)</h2><a href="/groups/first/">First</a><a href="/groups/second/">Second</a></section>
+`, async page => {
+  const result = await sync(page);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.data?.groups, [
+    { groupUrl: 'https://www.facebook.com/groups/first/', groupName: 'First' },
+    { groupUrl: 'https://www.facebook.com/groups/second/', groupName: 'Second' },
+  ]);
+}));
+
 test('sync waits through a slow loading indicator rather than calling the first batch complete', async () => fixture(`
   <a href="/groups/first/">First</a><div id="loading" role="progressbar">Loading</div>
   <script>setTimeout(()=>{document.querySelector('main').insertAdjacentHTML('beforeend','<a href="/groups/later/">Later</a>');document.querySelector('#loading').remove()},1000)</script>
@@ -89,7 +101,7 @@ test('stalled loading returns partial groups with an explicit incomplete status'
 
 test('navigation to discovery while syncing cannot import recommendations', async () => fixture(`
   <a href="/groups/real/">Real</a><div role="progressbar">Loading</div>
-  <script>setTimeout(()=>{history.replaceState({},'', '/groups/discover/');document.querySelector('main').innerHTML='<a href="/groups/recommended/">Suggested</a>'},200)</script>
+  <script>setTimeout(()=>{history.replaceState({},'', '/groups/discover/');document.querySelector('main').innerHTML='<a href="/groups/recommended/">Suggested</a>'},4000)</script>
 `, async page => {
   const result = await sync(page); assert.equal(result.ok, false); assert.equal(result.data?.groupCount, 1);
   assert.equal((result.data?.groups as any[])[0].groupName, 'Real');

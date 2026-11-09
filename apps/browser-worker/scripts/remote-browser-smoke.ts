@@ -33,7 +33,7 @@ async function main() {
     const errors: string[] = [], messages: any[] = [];
     ui.on('pageerror', error => errors.push(error.message));
     ui.on('websocket', socket => { if (socket.url().includes(':39137/')) socket.on('framereceived', frame => { const value = JSON.parse(frame.payload.toString()); if (value.type !== 'frame') messages.push(value); }); });
-    await ui.route('**/api/**', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ id: sessionId, status: 'RUNNING', expiresAt: new Date(Date.now() + 600000).toISOString(), accessUrl: `ws://127.0.0.1:39137/sessions/${sessionId}?token=${signed.token}` }) }));
+    await ui.route('**/api/**', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ id: sessionId, status: 'RUNNING', expiresAt: new Date(Date.now() + 600000).toISOString(), accessUrl: `ws://127.0.0.1:39137/sessions/${sessionId}`, accessProtocol: `socio-remote.${signed.token}` }) }));
     await ui.goto(`http://localhost:3000/sessions/${sessionId}`);
     const viewport = ui.getByRole('application'), address = ui.getByRole('textbox', { name: 'Địa chỉ trang web' });
     await ui.getByRole('tab', { name: 'Fixture one', exact: true }).waitFor();

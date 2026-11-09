@@ -9,12 +9,15 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/slot-pool.test.js dist/browser-runtime.test.js"
+    "test": "pnpm run build && node --test dist/slot-pool.test.js dist/browser-runtime.test.js"
   },
   "dependencies": {
     "@socio/object-storage": "workspace:*",
     "@socio/platform-core": "workspace:*",
+    "fingerprint-generator": "2.1.89",
+    "fingerprint-injector": "2.1.89",
     "patchright": "1.64.1",
     "playwright": "1.63.0"
   },

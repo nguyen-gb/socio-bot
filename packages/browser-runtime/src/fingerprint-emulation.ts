@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import type { BrowserContext, Route } from 'playwright';
 import type { BrowserColorScheme, BrowserViewport } from './browser-runtime';
+import { desktopLaunchOptions, installDesktopFingerprint, prepareDesktopFingerprint, type DesktopFingerprint } from './desktop-fingerprint';
 
 const FILE_NAME = 'fingerprint-emulation.json';
 const execute = promisify(execFile);
@@ -38,19 +39,20 @@ const DISABLED_FEATURES: FingerprintFeatureToggles = {
   clientHints: false,
 };
 
-// Auto profiles get stable desktop-only rendering surfaces. User-Agent and
-// Client Hints remain native-looking and are refreshed from the installed
-// Chrome version instead of being made unique per account.
+// Auto uses a persisted generated desktop. Canvas/WebGPU are not approximated
+// by the old unrelated noise and adapter-description patches.
 const AUTO_FEATURES: FingerprintFeatureToggles = {
-  canvas: true,
+  canvas: false,
   webgl: true,
-  gpu: true,
-  userAgent: false,
-  clientHints: false,
+  gpu: false,
+  userAgent: true,
+  clientHints: true,
 };
 
 export interface FingerprintEmulationConfig {
   version: 2;
+  mode: 'auto' | 'native' | 'custom';
+  desktop?: DesktopFingerprint;
   createdAt: string;
   seed: string;
   localeMode: 'configured' | 'native';
@@ -70,7 +72,7 @@ export interface FingerprintEmulationConfig {
 
 export interface FingerprintEmulationOverrides {
   mode?: 'auto' | 'native' | 'custom';
-  localeMode?: 'configured' | 'native';
+  localeMode?: 'auto' | 'configured' | 'native';
   locale?: string;
   languages?: string[];
   timezoneId?: string;
@@ -99,6 +101,36 @@ interface DevicePreset {
   gpuArchitecture: string;
   gpuDevice: string;
 }
+
+interface ChromeRelease {
+  major: number;
+  full: string;
+}
+
+interface LocaleEnvironment {
+  locale: string;
+  languages: string[];
+  timezones: readonly string[];
+  timezoneId: string;
+}
+
+// Locale is the single user-facing choice. The other values are deliberately
+// derived from this table so an old/stale languages or timezoneId value cannot
+// make a profile internally inconsistent.
+const LOCALE_PRESETS: readonly { locale: string; languages: readonly string[]; timezones: readonly string[] }[] = [
+  { locale: 'vi-VN', languages: ['vi-VN', 'vi'], timezones: ['Asia/Ho_Chi_Minh'] },
+  { locale: 'en-US', languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'] },
+  { locale: 'en-GB', languages: ['en-GB', 'en'], timezones: ['Europe/London'] },
+  { locale: 'ja-JP', languages: ['ja-JP', 'ja'], timezones: ['Asia/Tokyo'] },
+  { locale: 'ko-KR', languages: ['ko-KR', 'ko'], timezones: ['Asia/Seoul'] },
+  { locale: 'th-TH', languages: ['th-TH', 'th'], timezones: ['Asia/Bangkok'] },
+  { locale: 'id-ID', languages: ['id-ID', 'id'], timezones: ['Asia/Jakarta', 'Asia/Makassar', 'Asia/Jayapura'] },
+  { locale: 'zh-CN', languages: ['zh-CN', 'zh'], timezones: ['Asia/Shanghai'] },
+  { locale: 'zh-TW', languages: ['zh-TW', 'zh'], timezones: ['Asia/Taipei'] },
+  { locale: 'de-DE', languages: ['de-DE', 'de'], timezones: ['Europe/Berlin'] },
+  { locale: 'fr-FR', languages: ['fr-FR', 'fr'], timezones: ['Europe/Paris'] },
+  { locale: 'es-ES', languages: ['es-ES', 'es'], timezones: ['Europe/Madrid'] },
+];
 
 const WINDOWS_PRESETS: readonly DevicePreset[] = [
   { webglVendor: 'Google Inc. (Intel)', webglRenderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E92) Direct3D11 vs_5_0 ps_5_0, D3D11)', gpuVendor: 'intel', gpuArchitecture: 'gen-9', gpuDevice: '0x3e92' },
@@ -144,13 +176,25 @@ function languageBundle(locale: string): string[] {
     .filter((value, index, values) => values.indexOf(value) === index);
 }
 
+function localeEnvironment(locale: string, seed: string, preferredTimezone?: string): LocaleEnvironment {
+  const canonical = canonicalLocale(locale);
+  const preset = LOCALE_PRESETS.find((item) => item.locale === canonical);
+  const fallbackLanguages = languageBundle(canonical);
+  const languages = [...(preset?.languages ?? fallbackLanguages)];
+  const timezones = preset?.timezones ?? (preferredTimezone ? [preferredTimezone] : ['UTC']);
+  const timezoneId = preferredTimezone && timezones.includes(preferredTimezone)
+    ? preferredTimezone
+    : pick(timezones, digest(seed, `timezone:${canonical}`));
+  return { locale: canonical, languages, timezones, timezoneId };
+}
+
 function mergeFeatures(value?: Partial<FingerprintFeatureToggles>): FingerprintFeatureToggles {
   return { ...DISABLED_FEATURES, ...(value ?? {}) };
 }
 
 function createConfig(
   defaults: FingerprintEnvironmentDefaults,
-  chromeMajor: number,
+  chromeRelease: ChromeRelease,
   overrides?: FingerprintEmulationOverrides,
 ): FingerprintEmulationConfig {
   const seed = randomBytes(16).toString('hex');
@@ -159,13 +203,15 @@ function createConfig(
   const preset = pick(windows ? WINDOWS_PRESETS : LINUX_PRESETS, entropy);
   const viewport = defaults.viewport ?? pick(VIEWPORTS, entropy, 8);
   const colorScheme = defaults.colorScheme ?? (Number.parseInt(entropy.slice(16, 18), 16) % 5 === 0 ? 'dark' : 'light');
-  const fullVersion = `${chromeMajor}.0.0.0`;
-  const platform = windows ? 'Windows' : 'Linux';
+  const fullVersion = chromeRelease.full;
+  const chromeMajor = chromeRelease.major;
+  const reducedVersion = `${chromeMajor}.0.0.0`;
+  const platform = windows ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux';
   const userAgent = windows
-    ? `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`
-    : `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`;
+    ? `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${reducedVersion} Safari/537.36`
+    : `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${reducedVersion} Safari/537.36`;
   const brands = [
-    { brand: 'Not_A Brand', version: '24' },
+    { brand: 'Not:A-Brand', version: '8' },
     { brand: 'Chromium', version: String(chromeMajor) },
     { brand: 'Google Chrome', version: String(chromeMajor) },
   ];
@@ -175,17 +221,27 @@ function createConfig(
     Number.parseInt(entropy.slice(22, 24), 16) % 2,
   ];
   if (canvasNoise.every((value) => value === 0)) canvasNoise[2] = 1;
-  const locale = canonicalLocale(defaults.locale ?? new Intl.DateTimeFormat().resolvedOptions().locale ?? 'en-US');
-  const timezoneId = defaults.timezoneId ?? new Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC';
-  const localeMode = overrides?.localeMode
-    ?? (overrides?.mode === 'native' ? 'native' : defaults.locale || defaults.timezoneId ? 'configured' : 'native');
+  const locale = canonicalLocale(overrides?.locale ?? defaults.locale ?? new Intl.DateTimeFormat().resolvedOptions().locale ?? 'en-US');
+  const localeDetails = localeEnvironment(locale, seed, overrides?.mode === 'auto' ? undefined : defaults.timezoneId);
+  const timezoneId = overrides?.mode === 'auto'
+    ? localeDetails.timezoneId
+    : defaults.timezoneId && localeDetails.timezones.includes(defaults.timezoneId)
+      ? defaults.timezoneId
+      : localeDetails.timezoneId;
+  const localeMode = overrides?.localeMode === 'native'
+    ? 'native'
+    : overrides?.localeMode === 'auto'
+      ? 'configured'
+      : overrides?.localeMode
+        ?? (overrides?.mode === 'native' ? 'native' : defaults.locale || defaults.timezoneId ? 'configured' : 'native');
   const generated: FingerprintEmulationConfig = {
     version: 2,
+    mode: overrides?.mode ?? (overrides?.features ? 'custom' : 'auto'),
     createdAt: new Date().toISOString(),
     seed,
     localeMode,
     locale,
-    languages: languageBundle(locale),
+    languages: localeDetails.languages,
     timezoneId,
     viewport: { ...viewport },
     colorScheme,
@@ -200,17 +256,17 @@ function createConfig(
     userAgent,
     clientHints: {
       brands,
-      fullVersionList: brands.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : fullVersion })),
+      fullVersionList: brands.map((brand) => ({ ...brand, version: brand.brand === 'Not:A-Brand' ? '8.0.0.0' : fullVersion })),
       mobile: false,
       platform,
-      platformVersion: windows ? '19.0.0' : '6.8.0',
+      platformVersion: windows ? '15.0.0' : '6.8.0',
       architecture: 'x86',
       bitness: '64',
       model: '',
       uaFullVersion: fullVersion,
     },
   };
-  return refreshBrowserVersion(mergeFingerprintConfig(generated, overrides), chromeMajor);
+  return refreshBrowserVersion(mergeFingerprintConfig(generated, overrides), chromeRelease);
 }
 
 function validateConfig(value: unknown): FingerprintEmulationConfig {
@@ -238,6 +294,7 @@ function validateConfig(value: unknown): FingerprintEmulationConfig {
   new Intl.DateTimeFormat('en-US', { timeZone: config.timezoneId });
   return {
     ...config,
+    mode: config.mode ?? 'auto',
     localeMode: config.localeMode === 'native' ? 'native' : 'configured',
     locale,
     features: mergeFeatures(config.features),
@@ -254,19 +311,19 @@ function mergeFingerprintConfig(
   overrides?: FingerprintEmulationOverrides,
 ): FingerprintEmulationConfig {
   if (!overrides) {
-    const locale = canonicalLocale(base.locale);
-    const allowedLanguages = languageBundle(locale);
-    const storedLanguages = base.languages.filter((language) => allowedLanguages.includes(language));
+    const localeDetails = localeEnvironment(base.locale, base.seed, base.timezoneId);
     return {
       ...base,
-      locale,
+      locale: localeDetails.locale,
       localeMode: base.localeMode ?? 'configured',
-      languages: storedLanguages.length ? storedLanguages : allowedLanguages,
-      features: mergeFeatures(base.features),
+      languages: localeDetails.languages,
+      timezoneId: localeDetails.timezoneId,
+      features: base.mode === 'custom' ? mergeFeatures(base.features) : { ...DISABLED_FEATURES },
     };
   }
-  const autoMode = overrides.mode === 'auto';
-  const nativeMode = overrides.mode === 'native';
+  const mode = overrides.mode ?? (overrides.features ? 'custom' : base.mode);
+  const autoMode = mode === 'auto';
+  const nativeMode = mode === 'native';
   const managedMode = autoMode || nativeMode;
   const effectiveOverrides = managedMode
     ? {
@@ -277,19 +334,25 @@ function mergeFingerprintConfig(
     }
     : overrides;
   const locale = canonicalLocale(effectiveOverrides.locale ?? base.locale);
-  const languages = effectiveOverrides.languages?.length
-    ? languageBundle(locale).filter((language) => effectiveOverrides.languages!.includes(language))
-    : languageBundle(locale);
-  const localeMode = effectiveOverrides.localeMode ?? base.localeMode ?? 'configured';
+  const localeDetails = localeEnvironment(locale, base.seed, autoMode ? undefined : effectiveOverrides.timezoneId ?? base.timezoneId);
+  const languages = autoMode
+    ? localeDetails.languages
+    : effectiveOverrides.languages?.length
+      ? localeDetails.languages.filter((language) => effectiveOverrides.languages!.includes(language))
+      : localeDetails.languages;
+  const localeMode = effectiveOverrides.localeMode === 'auto'
+    ? 'configured'
+    : effectiveOverrides.localeMode ?? base.localeMode ?? 'configured';
   const clientHints = effectiveOverrides.clientHints
     ? { ...base.clientHints, ...effectiveOverrides.clientHints }
     : base.clientHints;
   return {
     ...base,
     ...(managedMode ? {} : effectiveOverrides),
+    mode,
     locale,
-    languages: languages.length ? languages : languageBundle(locale),
-    timezoneId: effectiveOverrides.timezoneId ?? base.timezoneId,
+    languages: languages.length ? languages : localeDetails.languages,
+    timezoneId: autoMode ? localeDetails.timezoneId : effectiveOverrides.timezoneId ?? base.timezoneId,
     localeMode,
     features: autoMode
       ? { ...AUTO_FEATURES }
@@ -310,27 +373,34 @@ function mergeFingerprintConfig(
 
 function browserPlatform(value: string): 'Windows' | 'Linux' | 'macOS' {
   if (value === 'Windows' || value === 'Linux' || value === 'macOS') return value;
-  return process.platform === 'win32' ? 'Windows' : 'Linux';
+  return process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux';
 }
 
-function refreshBrowserVersion(config: FingerprintEmulationConfig, chromeMajor: number): FingerprintEmulationConfig {
-  const fullVersion = `${chromeMajor}.0.0.0`;
+function refreshBrowserVersion(config: FingerprintEmulationConfig, chromeRelease: ChromeRelease): FingerprintEmulationConfig {
+  const chromeMajor = chromeRelease.major;
+  const fullVersion = chromeRelease.full;
+  const reducedVersion = `${chromeMajor}.0.0.0`;
   const platform = browserPlatform(config.clientHints.platform);
   const platformDetails = platform === 'Windows'
-    ? { userAgentPlatform: 'Windows NT 10.0; Win64; x64', platformVersion: '19.0.0' }
+    ? { userAgentPlatform: 'Windows NT 10.0; Win64; x64', platformVersion: '15.0.0' }
       : platform === 'macOS'
         ? { userAgentPlatform: 'Macintosh; Intel Mac OS X 10_15_7', platformVersion: '15.0.0' }
         : { userAgentPlatform: 'X11; Linux x86_64', platformVersion: '6.8.0' };
-  const userAgent = `Mozilla/5.0 (${platformDetails.userAgentPlatform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`;
-  const brands = [
-    { brand: 'Not_A Brand', version: '24' },
+  const userAgent = `Mozilla/5.0 (${platformDetails.userAgentPlatform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${reducedVersion} Safari/537.36`;
+  const brands = (config.clientHints.brands.length ? config.clientHints.brands : [
+    { brand: 'Not:A-Brand', version: '8' },
     { brand: 'Chromium', version: String(chromeMajor) },
     { brand: 'Google Chrome', version: String(chromeMajor) },
-  ];
-  const fullVersionList = brands.map((brand) => ({
-    ...brand,
-    version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : fullVersion,
-  }));
+  ]).map((brand) => (brand.brand === 'Chromium' || brand.brand === 'Google Chrome'
+    ? { ...brand, version: String(chromeMajor) }
+    : brand));
+  const fullVersionList = (config.clientHints.fullVersionList.length ? config.clientHints.fullVersionList : brands.map((brand) => ({ ...brand, version: fullVersion })))
+    .map((brand) => (brand.brand === 'Chromium' || brand.brand === 'Google Chrome'
+      ? { ...brand, version: fullVersion }
+      : brand));
+  const platformVersion = config.clientHints.platformVersion === '19.0.0'
+    ? platformDetails.platformVersion
+    : config.clientHints.platformVersion || platformDetails.platformVersion;
   return {
     ...config,
     userAgent,
@@ -338,7 +408,7 @@ function refreshBrowserVersion(config: FingerprintEmulationConfig, chromeMajor: 
       ...config.clientHints,
       mobile: false,
       platform,
-      platformVersion: platformDetails.platformVersion,
+      platformVersion,
       brands,
       fullVersionList,
       uaFullVersion: fullVersion,
@@ -363,22 +433,18 @@ export async function loadFingerprintEmulation(
   overrides?: FingerprintEmulationOverrides,
 ): Promise<FingerprintEmulationConfig> {
   const destination = join(profilePath, FILE_NAME);
-  const chromeMajor = await detectChromeMajor();
+  const chromeRelease = await detectChromeRelease();
   try {
     const stored = validateConfig(JSON.parse(await readFile(destination, 'utf8')));
-    const refreshed = refreshBrowserVersion(stored, chromeMajor);
-    if (refreshed.userAgent !== stored.userAgent
-      || refreshed.clientHints.uaFullVersion !== stored.clientHints.uaFullVersion
-      || refreshed.clientHints.platform !== stored.clientHints.platform
-      || refreshed.clientHints.platformVersion !== stored.clientHints.platformVersion
-      || refreshed.clientHints.mobile !== stored.clientHints.mobile) {
+    const refreshed = prepareDesktopFingerprint(refreshBrowserVersion(mergeFingerprintConfig(stored, overrides), chromeRelease));
+    if (JSON.stringify(refreshed) !== JSON.stringify(stored)) {
       await persistFingerprintConfig(destination, refreshed);
     }
-    return refreshBrowserVersion(mergeFingerprintConfig(refreshed, overrides), chromeMajor);
+    return refreshed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  const config = createConfig(defaults, chromeMajor, overrides);
+  const config = prepareDesktopFingerprint(createConfig(defaults, chromeRelease, overrides));
   const temporary = join(profilePath, `${FILE_NAME}.${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
@@ -389,9 +455,11 @@ export async function loadFingerprintEmulation(
   return config;
 }
 
-async function detectChromeMajor(): Promise<number> {
+async function detectChromeRelease(): Promise<ChromeRelease> {
   const configured = Number(process.env.BROWSER_FINGERPRINT_CHROME_MAJOR);
-  if (Number.isInteger(configured) && configured >= 100 && configured <= 999) return configured;
+  if (Number.isInteger(configured) && configured >= 100 && configured <= 999) {
+    return { major: configured, full: `${configured}.0.0.0` };
+  }
   const candidates = [
     process.env.CHROME_PATH,
     process.platform === 'win32' && process.env.PROGRAMFILES
@@ -409,31 +477,52 @@ async function detectChromeMajor(): Promise<number> {
   ].filter((value): value is string => Boolean(value));
   for (const executable of candidates) {
     try {
+      if (process.platform === 'win32') {
+        // GUI chrome.exe --version does not reliably write stdout on Windows.
+        const literal = executable.replace(/'/g, "''");
+        const { stdout } = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Item -LiteralPath '${literal}').VersionInfo.ProductVersion`], { windowsHide: true, timeout: 5_000 });
+        const full = /\d+\.\d+\.\d+\.\d+/.exec(stdout)?.[0];
+        if (full) return { major: Number(full.split('.')[0]), full };
+      }
       const { stdout, stderr } = await execute(executable, ['--version'], { windowsHide: true, timeout: 5_000 });
-      const match = /(?:Chrome|Chromium)\s+(\d+)\./i.exec(`${stdout} ${stderr}`);
-      if (match) return Number(match[1]);
+      const match = /(?:Chrome|Chromium)\s+(\d+\.\d+\.\d+\.\d+)/i.exec(`${stdout} ${stderr}`);
+      const full = match?.[1];
+      if (full) {
+        return { major: Number(full.split('.')[0]), full };
+      }
     } catch {
       // Try the next normal Chrome installation path.
     }
   }
   // Conservative reduced-UA fallback used only when the installed browser
   // version cannot be queried (for example in a restricted container).
-  return 155;
+  return { major: 155, full: '155.0.0.0' };
 }
 
 export function fingerprintLaunchOptions(config: FingerprintEmulationConfig) {
+  if (config.mode === 'auto' && config.desktop) return desktopLaunchOptions(config);
   return {
     ...(config.features.userAgent ? { userAgent: config.userAgent } : {}),
-    ...(config.localeMode === 'configured' ? { locale: config.locale, timezoneId: config.timezoneId } : {}),
-    viewport: config.viewport,
-    colorScheme: config.colorScheme,
-    deviceScaleFactor: config.deviceScaleFactor,
+    // Explicit undefined also clears runtime environment defaults in native mode.
+    locale: config.localeMode === 'configured' ? config.locale : undefined,
+    timezoneId: config.localeMode === 'configured' ? config.timezoneId : undefined,
+    ...(config.mode === 'custom' ? {
+      viewport: config.viewport,
+      colorScheme: config.colorScheme,
+      deviceScaleFactor: config.deviceScaleFactor,
+    } : {}),
     isMobile: false,
     hasTouch: false,
   } as const;
 }
 
-export async function installFingerprintEmulation(context: BrowserContext, config: FingerprintEmulationConfig): Promise<void> {
+export async function installFingerprintEmulation(context: BrowserContext, config: FingerprintEmulationConfig, profilePath?: string): Promise<void> {
+  if (config.mode === 'auto' && config.desktop) {
+    await installDesktopFingerprint(context, config);
+    if (profilePath) await persistFingerprintConfig(join(profilePath, FILE_NAME), config);
+    return;
+  }
+  if (config.mode !== 'custom') return;
   const brandsHeader = config.clientHints.brands.map(({ brand, version }) => `"${brand}";v="${version}"`).join(', ');
   const headers: Record<string, string> = config.localeMode === 'configured' ? {
     'accept-language': config.languages.map((language, index) => index === 0 ? language : `${language};q=${Math.max(0.1, 1 - index * 0.1).toFixed(1)}`).join(','),

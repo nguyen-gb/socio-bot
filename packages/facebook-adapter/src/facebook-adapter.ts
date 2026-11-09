@@ -1,4 +1,4 @@
-import type { ActionResult, PlatformAction } from '@socio/contracts';
+import { normalizeFacebookGroupUrl, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, type ActionResult, type PlatformAction } from '@socio/contracts';
 import {
   LoginRequiredError,
   gotoPlatformPage,
@@ -33,17 +33,28 @@ export class FacebookAdapter implements PlatformAdapter {
       case 'SYNC_FACEBOOK_GROUPS':
         return new FacebookGroupsAutomation().sync(session);
       case 'JOIN_FACEBOOK_GROUP':
-        return new FacebookGroupsAutomation().join(session, action.payload.groupUrl);
+        return executeFacebookOnce(session, 'JOIN', normalizeFacebookGroupUrl(action.payload.groupUrl),
+          () => new FacebookGroupsAutomation().join(session, action.payload.groupUrl),
+          { groupUrl: normalizeFacebookGroupUrl(action.payload.groupUrl), membershipStatus: 'SKIPPED_DUPLICATE' });
       case 'POST_FACEBOOK_GROUP':
-        return new FacebookGroupsAutomation().post(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds);
+        return executeFacebookOnce(session, 'POST', facebookPostTargetKey(action.payload.groupUrl, action.payload.text),
+          () => new FacebookGroupsAutomation().post(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds),
+          { groupUrl: normalizeFacebookGroupUrl(action.payload.groupUrl), publicationStatus: 'SKIPPED_DUPLICATE' });
       case 'MESSAGE_FACEBOOK_RECIPIENT':
-        return new FacebookMessagesAutomation().messageRandomGroupMember(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds, action.payload.excludeProfileUrls);
+        return action.payload.profileUrl
+          ? executeFacebookOnce(session, 'MESSAGE', normalizeFacebookProfileUrl(action.payload.profileUrl),
+            () => new FacebookMessagesAutomation().message(session, action.payload.profileUrl!, action.payload.text, action.payload.mediaAssetIds)
+              .then(result => ({ ...result, data: { ...result.data, groupUrl: action.payload.groupUrl, profileUrl: action.payload.profileUrl, displayName: action.payload.displayName } })),
+            { groupUrl: action.payload.groupUrl, profileUrl: normalizeFacebookProfileUrl(action.payload.profileUrl), displayName: action.payload.displayName, messageStatus: 'SKIPPED_DUPLICATE' })
+          : new FacebookMessagesAutomation().messageRandomGroupMember(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds, action.payload.excludeProfileUrls);
       case 'MESSAGE_FACEBOOK_REACTOR':
         return new FacebookMessagesAutomation().messageRandomPostReactor(session, action.payload.postUrl, action.payload.text, action.payload.mediaAssetIds, action.payload.excludeProfileUrls, action.payload.recipientSource);
       case 'SCAN_FACEBOOK_POST_COMMENTS':
         return new FacebookCommentsAutomation().scanPostComments(session, action.payload.postUrl);
       case 'REPLY_FACEBOOK_POST_COMMENTS':
-        return new FacebookCommentsAutomation().replyPostComments(session, action.payload.postUrl, action.payload.text, action.payload.maxReplies, action.payload.mediaAssetIds);
+        return executeFacebookOnce(session, 'REPLY', normalizeFacebookPostUrl(action.payload.postUrl),
+          () => new FacebookCommentsAutomation().replyPostComments(session, action.payload.postUrl, action.payload.text, action.payload.maxReplies, action.payload.mediaAssetIds),
+          { postUrl: normalizeFacebookPostUrl(action.payload.postUrl), repliesRequested: action.payload.maxReplies, repliesSent: 0, replyStatus: 'SKIPPED_DUPLICATE' });
       case 'COMMENT_FACEBOOK_GROUP_POSTS':
         return new FacebookCommentsAutomation().commentGroupPosts(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds, {
           daysRecent: action.payload.daysRecent,
@@ -91,4 +102,37 @@ export class FacebookAdapter implements PlatformAdapter {
     const passwordInputs = await session.page.locator('input[name="pass"]').count();
     return emailInputs > 0 && passwordInputs > 0;
   }
+}
+
+function facebookPostTargetKey(groupUrl: string, text: string): string {
+  return `${normalizeFacebookGroupUrl(groupUrl)}|${text.replace(/\s+/g, ' ').trim()}`;
+}
+
+async function executeFacebookOnce(
+  session: PlatformSession,
+  action: 'JOIN' | 'POST' | 'REPLY' | 'MESSAGE',
+  targetKey: string,
+  execute: () => Promise<ActionResult>,
+  duplicateData: Record<string, unknown>,
+): Promise<ActionResult> {
+  if (await session.reserveFacebookTarget?.({ action, targetKey }) === false) {
+    return { ok: true, data: { ...duplicateData, deduplicated: true, actionStatus: 'SKIPPED' } };
+  }
+  try {
+    const result = await execute();
+    if (result.ok) await session.completeFacebookTarget?.({ action, targetKey });
+    else if (!facebookResultMayHaveSideEffect(result)) await session.releaseFacebookTarget?.({ action, targetKey });
+    return result;
+  } catch (error) {
+    // A thrown error can occur after the worker's durable before-action
+    // marker. Keep the reservation so a later campaign cannot send twice.
+    throw error;
+  }
+}
+
+function facebookResultMayHaveSideEffect(result: ActionResult): boolean {
+  return result.data?.sideEffectStarted === true
+    || result.data?.publicationStatus === 'UNKNOWN'
+    || result.data?.replyStatus === 'UNKNOWN'
+    || (typeof result.data?.repliesSent === 'number' && result.data.repliesSent > 0);
 }

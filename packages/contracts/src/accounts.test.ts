@@ -38,6 +38,15 @@ test('creating without a proxy or external id accepts omitted and null optional 
 });
 
 test('auto browser profiles persist only desktop locale settings', () => {
+  const automaticLocale = browserFingerprintSchema.parse({
+    mode: 'auto',
+    localeMode: 'auto',
+    locale: 'vi-VN',
+    languages: ['vi-VN', 'vi'],
+    timezoneId: 'Asia/Ho_Chi_Minh',
+  });
+  assert.equal('localeMode' in automaticLocale && automaticLocale.localeMode, 'auto');
+
   const parsed = browserFingerprintSchema.parse({
     mode: 'auto',
     localeMode: 'configured',

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { commentFacebookGroupPostsSchema, facebookGroupCollectionSchema, facebookOptInRecipientSchema, messageFacebookRecipientsSchema, messageFacebookReactorsSchema, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, postFacebookGroupsSchema, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema } from './facebook';
+import { commentFacebookGroupPostsSchema, facebookGroupCollectionSchema, facebookOptInRecipientSchema, joinFacebookGroupsSchema, messageFacebookRecipientsSchema, messageFacebookReactorsSchema, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, postFacebookGroupsSchema, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema } from './facebook';
 import { postFacebookGroupActionSchema } from './actions';
 
 const base = { name: 'Post fixture', idempotencyKey: 'fixture-key', text: 'Fixture never published', maxGroupsPerAccount: 5 };
@@ -13,6 +13,13 @@ test('group sync explicitly distinguishes ALL from an empty SELECTED request', (
   assert.equal(syncFacebookGroupsSchema.safeParse({ ...input, scope: 'SELECTED', accountIds: [] }).success, false);
   assert.equal(syncFacebookGroupsSchema.safeParse({ ...input, scope: 'ALL', accountIds: [imageId] }).success, false);
   assert.deepEqual(syncFacebookGroupsSchema.parse(input).accountIds, []); // Existing API callers.
+});
+
+test('group join defaults to a short per-profile interval without removing the safety minimum', () => {
+  const input = { name: 'Join fixture', idempotencyKey: 'join-fixture-key', groupUrls: ['https://facebook.com/groups/123/'] };
+  assert.equal(joinFacebookGroupsSchema.parse(input).intervalSeconds, 10);
+  assert.equal(joinFacebookGroupsSchema.safeParse({ ...input, intervalSeconds: 4 }).success, false);
+  assert.equal(joinFacebookGroupsSchema.safeParse({ ...input, intervalSeconds: 5 }).success, true);
 });
 
 test('Facebook posts accept text, images or both and reject empty or invalid attachments', () => {
@@ -77,7 +84,7 @@ test('opt-in recipients require consent evidence and canonical Facebook profile 
 
 test('message campaign bounds random-member attempts per group and pacing', () => {
   const parsed = messageFacebookRecipientsSchema.parse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 10 });
-  assert.equal(parsed.intervalSeconds, 120);
+  assert.equal(parsed.intervalSeconds, 10);
   assert.deepEqual(messageFacebookRecipientsSchema.parse({ ...base, text: 'Tin nhắn', maxRecipientsPerGroup: 10 }).groupUrls, []);
   assert.equal(messageFacebookRecipientsSchema.safeParse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 51 }).success, false);
   assert.equal(messageFacebookRecipientsSchema.safeParse({ ...base, text: 'Tin nhắn', groupUrls: ['https://facebook.com/groups/123/'], maxRecipientsPerGroup: 10, intervalSeconds: 4 }).success, false);
@@ -87,7 +94,7 @@ test('message campaign bounds random-member attempts per group and pacing', () =
 test('reactor message campaigns accept one post and split the total by profile', () => {
   const parsed = messageFacebookReactorsSchema.parse({ ...base, text: 'Tin nhắn người react', postUrl: 'https://facebook.com/groups/123/posts/456', maxRecipientsPerPost: 10 });
   assert.equal(parsed.postUrl, 'https://www.facebook.com/groups/123/posts/456');
-  assert.equal(parsed.intervalSeconds, 120);
+  assert.equal(parsed.intervalSeconds, 10);
   assert.equal(parsed.recipientSource, 'REACTORS');
   assert.equal(messageFacebookReactorsSchema.parse({ ...base, text: 'Tin nhắn người bình luận', postUrl: 'https://facebook.com/groups/123/posts/456', recipientSource: 'COMMENTERS', maxRecipientsPerPost: 10 }).recipientSource, 'COMMENTERS');
   assert.deepEqual(messageFacebookReactorsSchema.parse({ ...base, text: 'Tin nhắn nhiều bài', postUrls: ['https://facebook.com/groups/123/posts/456', 'https://facebook.com/groups/123/posts/789'], maxRecipientsPerPost: 10 }).postUrls, ['https://www.facebook.com/groups/123/posts/456', 'https://www.facebook.com/groups/123/posts/789']);
@@ -96,15 +103,16 @@ test('reactor message campaigns accept one post and split the total by profile',
 });
 
 test('comment scanning accepts canonical Facebook post URLs and rejects group or external URLs', () => {
-  assert.equal(normalizeFacebookPostUrl('https://m.facebook.com/groups/123/permalink/456/?ref=share'), 'https://www.facebook.com/groups/123/permalink/456?ref=share');
+  assert.equal(normalizeFacebookPostUrl('https://m.facebook.com/groups/123/permalink/456/?ref=share'), 'https://www.facebook.com/groups/123/permalink/456');
+  assert.equal(normalizeFacebookPostUrl('https://www.facebook.com/groups/123/posts/456?comment_id=789&__cft__[0]=tracking'), 'https://www.facebook.com/groups/123/posts/456');
   assert.equal(normalizeFacebookPostUrl('https://www.facebook.com/story.php?story_fbid=456&id=123'), 'https://www.facebook.com/story.php?story_fbid=456&id=123');
   const parsed = scanFacebookPostCommentsSchema.parse({ name: 'Quét bình luận', idempotencyKey: 'scan-comments-0001', postUrl: 'https://facebook.com/groups/123/posts/456' });
   assert.equal(parsed.postUrl, 'https://www.facebook.com/groups/123/posts/456');
-  assert.equal(parsed.intervalSeconds, 60);
+  assert.equal(parsed.intervalSeconds, 10);
   const many = scanFacebookPostCommentsSchema.parse({ name: 'Quét nhiều bài', idempotencyKey: 'scan-comments-many', postUrls: [
     'https://facebook.com/groups/123/posts/456', 'https://m.facebook.com/groups/123/permalink/789/?ref=share', 'https://facebook.com/groups/123/posts/456',
   ] });
-  assert.deepEqual(many.postUrls, ['https://www.facebook.com/groups/123/posts/456', 'https://www.facebook.com/groups/123/permalink/789?ref=share']);
+  assert.deepEqual(many.postUrls, ['https://www.facebook.com/groups/123/posts/456', 'https://www.facebook.com/groups/123/permalink/789']);
   assert.equal(scanFacebookPostCommentsSchema.safeParse({ name: 'Quét bình luận', idempotencyKey: 'scan-comments-empty' }).success, false);
   for (const postUrl of ['https://www.facebook.com/groups/123/', 'https://evil.test/posts/456', 'http://facebook.com/groups/123/posts/456', 'https://facebook.com/story.php?story_fbid=abc']) {
     assert.equal(scanFacebookPostCommentsSchema.safeParse({ name: 'Quét bình luận', idempotencyKey: 'scan-comments-0002', postUrl }).success, false);
@@ -114,7 +122,7 @@ test('comment scanning accepts canonical Facebook post URLs and rejects group or
 test('comment replies require text, a bounded reply count and a Facebook post URL', () => {
   const parsed = replyFacebookPostCommentsSchema.parse({ name: 'Rep bình luận', idempotencyKey: 'reply-comments-0001', postUrl: 'https://facebook.com/groups/123/posts/456', text: 'Cảm ơn bạn', maxReplies: 10 });
   assert.equal(parsed.maxReplies, 10);
-  assert.equal(parsed.intervalSeconds, 120);
+  assert.equal(parsed.intervalSeconds, 10);
   assert.equal(replyFacebookPostCommentsSchema.safeParse({ name: 'Rep bình luận', idempotencyKey: 'reply-comments-0002', postUrl: 'https://facebook.com/groups/123/posts/456', text: '', maxReplies: 1 }).success, false);
   assert.equal(replyFacebookPostCommentsSchema.safeParse({ name: 'Rep bình luận', idempotencyKey: 'reply-comments-0003', postUrl: 'https://facebook.com/groups/123/posts/456', text: 'Rep', maxReplies: 0 }).success, false);
   assert.equal(replyFacebookPostCommentsSchema.safeParse({ name: 'Rep bình luận', idempotencyKey: 'reply-comments-0004', postUrl: 'https://facebook.com/groups/123/posts/456', text: 'Rep', maxReplies: 51 }).success, false);

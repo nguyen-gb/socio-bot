@@ -18,6 +18,8 @@ export interface ApiEnvironment {
   temporalAddress: string;
   temporalNamespace: string;
   temporalTaskQueue: string;
+  redisUrl: string;
+  trustProxyHops: number;
   allowPrivateProxyHosts: boolean;
 }
 
@@ -90,12 +92,31 @@ export function loadEnvironment(): ApiEnvironment {
       // and dotenv does not discover the workspace-root .env file: API and
       // browser workers must still submit and poll the same queue.
       process.env.TEMPORAL_TASK_QUEUE ?? 'browser-automation',
+    redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
+    trustProxyHops: parseNonNegativeInteger(
+      process.env.TRUST_PROXY_HOPS,
+      nodeEnv === 'production' ? 1 : 0,
+      'TRUST_PROXY_HOPS',
+    ),
     allowPrivateProxyHosts: booleanValue(
       process.env.ALLOW_PRIVATE_PROXY_HOSTS,
       false,
       'ALLOW_PRIVATE_PROXY_HOSTS',
     ),
   };
+}
+
+function parseNonNegativeInteger(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
 }
 
 function booleanValue(

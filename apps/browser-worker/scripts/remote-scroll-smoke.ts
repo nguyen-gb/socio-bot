@@ -28,7 +28,7 @@ async function main() {
     const errors: string[] = [], commands: any[] = [];
     ui.on('pageerror', error => errors.push(error.message));
     ui.on('websocket', socket => socket.on('framesent', frame => { commands.push(JSON.parse(frame.payload.toString())); }));
-    await ui.route('**/api/**', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ id: sessionId, status: 'RUNNING', expiresAt: new Date(Date.now() + 600000).toISOString(), accessUrl: `ws://127.0.0.1:39127/sessions/${sessionId}?token=${signed.token}` }) }));
+    await ui.route('**/api/**', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ id: sessionId, status: 'RUNNING', expiresAt: new Date(Date.now() + 600000).toISOString(), accessUrl: `ws://127.0.0.1:39127/sessions/${sessionId}`, accessProtocol: `socio-remote.${signed.token}` }) }));
     await ui.goto(`http://localhost:3000/sessions/${sessionId}`);
     // Request a fresh screencast after the relay subscriber is attached.
     await ui.getByText('Đã kết nối', { exact: true }).waitFor({ timeout: 15000 });

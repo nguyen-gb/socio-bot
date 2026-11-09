@@ -20,8 +20,6 @@ export async function scanJoinedFacebookGroups(page: Page, check: () => Promise<
     },
   });
   while (Date.now() < deadline) {
-    const interrupted = await check();
-    if (interrupted) return finish(false, String(interrupted.data?.reason ?? 'Đồng bộ bị gián đoạn'), interrupted.data);
     const current = new URL(page.url());
     if (!['facebook.com', 'www.facebook.com', 'm.facebook.com'].includes(current.hostname) || !/^\/groups\/joins\/?$/.test(current.pathname)) {
       return finish(false, 'Facebook không mở đúng danh sách nhóm đã tham gia; đã dừng đồng bộ.');
@@ -36,6 +34,8 @@ export async function scanJoinedFacebookGroups(page: Page, check: () => Promise<
       if (!visible(main)) return { entries: [], empty: false, loading: true, atBottom: false, moved: false };
       const headings = 'h1,h2,h3,h4,[role="heading"]';
       const recommendations = /^(Suggested(?: groups| for you)?|Recommended groups|Groups you may like|Discover(?: groups)?|Nhóm (?:gợi ý|đề xuất|dành cho bạn)|Gợi ý cho bạn|Khám phá nhóm)$/i;
+      const pendingRequests = /^(?:Pending group requests?(?:\s*\(\d+\))?|Requests? to join(?:\s*\(\d+\))?|Yêu cầu tham gia nhóm(?: đang chờ)?(?:\s*\(\d+\))?|Yêu cầu đang chờ(?:\s*\(\d+\))?|Nhóm đang chờ phê duyệt(?:\s*\(\d+\))?)$/i;
+      const pendingStatus = /^(?:Requested to join|Request sent|Đã yêu cầu tham gia|Đã gửi yêu cầu|Yêu cầu tham gia đã gửi)$/i;
       const excludedParents = new WeakMap<Element, boolean>();
       const eligible = (element: Element) => {
         if (!visible(element) || element.closest('nav,[role="navigation"],article,[role="article"],[role="feed"]')) return false;
@@ -44,9 +44,12 @@ export async function scanJoinedFacebookGroups(page: Page, check: () => Promise<
           let excluded = excludedParents.get(parent);
           if (excluded === undefined) {
             const heading = parent.querySelector(headings);
+            const headingCount = parent.querySelectorAll(headings).length;
             const links = [...parent.querySelectorAll<HTMLAnchorElement>('a[href*="/groups/"]')];
-            excluded = !!heading && recommendations.test((heading.textContent ?? '').trim())
-              || !!links.length && new Set(links.map(link => link.pathname.replace(/\/$/, ''))).size === 1
+            const uniqueGroups = new Set(links.map(link => link.pathname.replace(/\/$/, ''))).size;
+            excluded = !!heading && (recommendations.test((heading.textContent ?? '').trim()) || headingCount === 1 && pendingRequests.test((heading.textContent ?? '').trim()))
+              || uniqueGroups === 1 && [...parent.querySelectorAll('span,div')].some(node => pendingStatus.test((node.textContent ?? '').replace(/\s+/g, ' ').trim()))
+              || !!links.length && uniqueGroups === 1
                 && [...parent.querySelectorAll('button,[role="button"]')].some(button => /^(Join|Join group|Tham gia|Tham gia nhóm)$/i.test((button.getAttribute('aria-label') ?? button.textContent ?? '').trim()));
             excludedParents.set(parent, excluded);
           }
@@ -82,6 +85,11 @@ export async function scanJoinedFacebookGroups(page: Page, check: () => Promise<
         atBottom: [...scrollers].every(element => element.scrollTop + element.clientHeight >= element.scrollHeight - 3),
       };
     });
+    // Capture the joined-list DOM before slower cookie/challenge checks. A
+    // client-side redirect can otherwise replace the list while the guard is
+    // running and erase groups that were already visible to the operator.
+    const interrupted = await check();
+    if (interrupted) return finish(false, String(interrupted.data?.reason ?? 'Đồng bộ bị gián đoạn'), interrupted.data);
     const previousSize = groups.size;
     for (const entry of snapshot.entries) {
       try {

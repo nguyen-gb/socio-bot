@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { BrowserRuntime } from '@socio/browser-runtime';
+import type { BrowserSessionStatus } from '@socio/database';
 import { PrismaService } from '../database/prisma.service';
 import { WorkerRegistryService } from '../worker-registry/worker-registry.service';
 import { BROWSER_RUNTIME } from './runtime.providers';
@@ -16,6 +17,12 @@ export class BrowserControlService implements OnModuleDestroy {
     @Inject(BROWSER_RUNTIME) private readonly runtime: BrowserRuntime) {}
 
   async start() {
+    // A process can be restarted after its BrowserSession has already become
+    // terminal but before the activity finishes updating BrowserProfile. In
+    // that case no old code is still capturing data, so reclaim profiles
+    // owned by this stable worker ID immediately instead of leaving login
+    // blocked by LEASED/SNAPSHOTTING for the generic 2/10 minute grace period.
+    await this.recoverProfilesInterruptedByWorkerRestart();
     // Worker names are stable. Recover only sessions assigned to this worker.
     const stale = await this.prisma.browserSession.findMany({ where: { workerId: this.registry.workerId, status: { in: ['STARTING', 'RUNNING', 'CLOSING', 'IDLE'] } } });
     for (const session of stale) {
@@ -30,6 +37,41 @@ export class BrowserControlService implements OnModuleDestroy {
     this.timer.unref();
   }
 
+  private async recoverProfilesInterruptedByWorkerRestart(): Promise<void> {
+    const activeStatuses: BrowserSessionStatus[] = ['STARTING', 'RUNNING', 'AUTHENTICATED', 'IDLE', 'CLOSING'];
+    const ownedTerminalSession = {
+      some: {
+        workerId: this.registry.workerId,
+        status: { in: ['CLOSED', 'EXPIRED', 'CRASHED'] as BrowserSessionStatus[] },
+      },
+    };
+    const noActiveSession = { none: { status: { in: activeStatuses } } };
+
+    await this.prisma.browserProfile.updateMany({
+      where: {
+        status: 'LEASED',
+        AND: [
+          { sessions: noActiveSession },
+          { sessions: ownedTerminalSession },
+        ],
+      },
+      data: { status: 'AVAILABLE' },
+    });
+    await this.prisma.browserProfile.updateMany({
+      where: {
+        status: 'SNAPSHOTTING',
+        AND: [
+          { sessions: noActiveSession },
+          { sessions: ownedTerminalSession },
+        ],
+      },
+      // A snapshot interrupted mid-write must not be advertised as a valid
+      // new version. ERROR keeps the last committed snapshot untouched and
+      // still allows the operator to reopen the profile and retry.
+      data: { status: 'ERROR' },
+    });
+  }
+
   async poll() {
     await this.recoverStaleProfileStates();
     // Requests that never reached a worker have no process to kill. Claiming a
@@ -37,7 +79,7 @@ export class BrowserControlService implements OnModuleDestroy {
     await this.prisma.browserSession.updateMany({ where: { workerId: null, mode: 'LOGIN', OR: [
       { status: 'CLOSING' }, { status: 'STARTING', expiresAt: { lte: new Date() } },
     ] }, data: { status: 'CLOSED', closedAt: new Date() } });
-    const sessions = await this.prisma.browserSession.findMany({ where: { workerId: this.registry.workerId, OR: [{ status: 'CLOSING' }, { status: { in: ['RUNNING', 'STARTING'] }, expiresAt: { lte: new Date() } }] } });
+    const sessions = await this.prisma.browserSession.findMany({ where: { workerId: this.registry.workerId, OR: [{ status: 'CLOSING' }, { status: { in: ['RUNNING', 'STARTING', 'IDLE'] }, expiresAt: { lte: new Date() } }] } });
     for (const session of sessions) {
       // Force requests can interrupt a graceful close that is still pending.
       const key = `${session.id}/${session.forceCloseRequestedAt ? 'force' : 'close'}`;
@@ -45,14 +87,27 @@ export class BrowserControlService implements OnModuleDestroy {
       this.busy.add(key);
       const job = (async () => {
         try {
-          if (session.forceCloseRequestedAt) await this.runtime.forceCloseProfile(session.profileId, session.id);
-          else await this.runtime.closeProfile(session.profileId, session.id);
+          const runtimeOwnerId = session.mode === 'AUTOMATION' && session.workflowId
+            ? session.workflowId
+            : session.id;
+          if (session.forceCloseRequestedAt) await this.runtime.forceCloseProfile(session.profileId, runtimeOwnerId);
+          else await this.runtime.closeProfile(session.profileId, runtimeOwnerId);
           // Do not leave the API/UI polling CLOSING forever when the owning
           // activity has already stopped or the browser disappeared first.
-          // A live activity may still write AUTHENTICATED later; this
-          // conditional update only closes rows that are still CLOSING.
+          // A live activity may still finish after a manual close. Expired
+          // sessions are also terminal so retained batch browsers can release
+          // their profile if the following task never starts.
           await this.prisma.browserSession.updateMany({
-            where: { id: session.id, status: 'CLOSING' },
+            where: {
+              id: session.id,
+              OR: [
+                { status: 'CLOSING' },
+                {
+                  status: { in: ['STARTING', 'RUNNING', 'IDLE'] },
+                  expiresAt: { lte: new Date() },
+                },
+              ],
+            },
             data: { status: 'CLOSED', closedAt: new Date() },
           });
           await this.releaseProfileAfterSessionClose(session.profileId);
@@ -62,7 +117,16 @@ export class BrowserControlService implements OnModuleDestroy {
           // A failed cleanup must still be terminal from the API's point of
           // view. The process marker is retained for the next recovery pass.
           await this.prisma.browserSession.updateMany({
-            where: { id: session.id, status: 'CLOSING' },
+            where: {
+              id: session.id,
+              OR: [
+                { status: 'CLOSING' },
+                {
+                  status: { in: ['STARTING', 'RUNNING', 'IDLE'] },
+                  expiresAt: { lte: new Date() },
+                },
+              ],
+            },
             data: { status: 'CRASHED', closedAt: new Date(), lastError: message },
           }).catch(() => undefined);
           await this.releaseProfileAfterSessionClose(session.profileId).catch(() => undefined);

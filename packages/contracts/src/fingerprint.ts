@@ -80,7 +80,7 @@ const browserFingerprintDeviceFields = {
 /** User-facing settings. Device details are generated and maintained by the runtime. */
 const browserFingerprintAutoSchema = browserFingerprintCoreSchema.extend({
   mode: z.enum(['auto', 'native']),
-  localeMode: z.enum(['configured', 'native']),
+  localeMode: z.enum(['auto', 'configured', 'native']),
 });
 
 /** Explicit full device settings retained for advanced/legacy profiles. */

@@ -2,6 +2,61 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TasksService } from './tasks.service';
 
+test('partial TikTok checkpoints remain resumable and exclude completed inbox targets', () => {
+  const service = new TasksService({} as never, {} as never);
+  const internal = service as unknown as {
+    canContinueFromCheckpoint: (action: string, result: unknown) => boolean;
+    continuationPayload: (task: unknown) => Record<string, unknown> | undefined;
+    isLegacyIncompleteTikTokSuccess: (task: unknown) => boolean;
+  };
+  const result = {
+    sideEffectStarted: true,
+    report: {
+      entries: [
+        { action: 'MESSAGE', status: 'SENT', username: '@done' },
+        { action: 'MESSAGE', status: 'FAILED', username: '@retry', reason: 'HTTP 403' },
+      ],
+    },
+  };
+  assert.equal(internal.canContinueFromCheckpoint('MESSAGE_TIKTOK_FOLLOWERS', result), true);
+  assert.equal(internal.isLegacyIncompleteTikTokSuccess({
+    action: 'MESSAGE_TIKTOK_FOLLOWERS',
+    status: 'SUCCEEDED',
+    runs: [{ result: { ...result, totalSent: 1, totalRequested: 2 } }],
+  }), true);
+  const payload = internal.continuationPayload({
+    action: 'MESSAGE_TIKTOK_FOLLOWERS',
+    payload: { username: '@channel', text: 'Hi', maxFollowers: 2 },
+    runs: [{ result }],
+  });
+  assert.deepEqual(payload?.excludeUsernames, ['@done']);
+  assert.equal(payload?.resumeCompletedCount, 1);
+});
+
+test('partial TikTok reply checkpoints retain completed counts per video', () => {
+  const service = new TasksService({} as never, {} as never);
+  const internal = service as unknown as {
+    canContinueFromCheckpoint: (action: string, result: unknown) => boolean;
+    continuationPayload: (task: unknown) => Record<string, unknown> | undefined;
+  };
+  const videoUrl = 'https://www.tiktok.com/@creator/video/123';
+  const result = {
+    sideEffectStarted: true,
+    report: { entries: [
+      { action: 'REPLY', status: 'SENT', videoUrl },
+      { action: 'REPLY', status: 'FAILED', videoUrl, reason: 'temporary error' },
+    ] },
+  };
+  assert.equal(internal.canContinueFromCheckpoint('REPLY_TIKTOK_COMMENTS', result), true);
+  const payload = internal.continuationPayload({
+    action: 'REPLY_TIKTOK_COMMENTS',
+    payload: { videoUrls: [videoUrl], text: 'Hi', maxReplies: 2 },
+    runs: [{ result }],
+  });
+  assert.deepEqual(payload?.completedCountsByVideo, { [videoUrl]: 1 });
+  assert.equal(payload?.resumeCompletedCount, 1);
+});
+
 test('publish requests remain draft and are never dispatched before approval', async () => {
   let temporalStarted = false;
   const created = {
@@ -44,6 +99,36 @@ test('publish requests remain draft and are never dispatched before approval', a
   );
   assert.equal(result.status, 'DRAFT');
   assert.equal(temporalStarted, false);
+});
+
+test('TikTok batch creation assigns one stable campaign batch id to every profile task', async () => {
+  const createdInputs: Array<{ data: { batchId?: string; accountId: string; status: string } }> = [];
+  const prisma = {
+    platformAccount: { count: async () => 2 },
+    task: {
+      create: (input: { data: { batchId?: string; accountId: string; status: string } }) => {
+        createdInputs.push(input);
+        return Promise.resolve({ id: `task-${createdInputs.length}`, ...input.data, approvalStatus: 'PENDING' });
+      },
+    },
+    $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
+  };
+  const service = new TasksService(prisma as never, { startTask: async () => undefined } as never);
+  const taskFor = (accountId: string) => ({
+    action: { platform: 'TIKTOK' as const, accountId, action: 'AUTO_COMMENT_TIKTOK_HOME' as const, payload: { name: 'Campaign chung', text: 'Xin chào', maxVideos: 2, minLikes: 0, intervalSeconds: 120 } },
+    priority: 50,
+    maxAttempts: 1,
+  });
+
+  const result = await service.createBatch('00000000-0000-4000-8000-000000000001', {
+    idempotencyKey: 'tiktok-batch-test',
+    tasks: [taskFor('00000000-0000-4000-8000-000000000010'), taskFor('00000000-0000-4000-8000-000000000011')],
+  });
+
+  assert.equal(result.tasks.length, 2);
+  assert.ok(createdInputs[0]?.data.batchId);
+  assert.equal(createdInputs[0]?.data.batchId, createdInputs[1]?.data.batchId);
+  assert.equal(createdInputs.every(input => input.data.status === 'DRAFT'), true);
 });
 
 test('TikTok approval appends a campaign behind active work for the same profile', async () => {
@@ -135,7 +220,7 @@ test('TikTok Search retry reuses the same campaign after the profile is READY', 
   assert.equal(temporalStarted, true);
 });
 
-test('TikTok cancel immediately terminates a running task and releases an orphaned profile', async () => {
+test('TikTok cancel marks a running task and lets the worker finalize it safely', async () => {
   const running = { id: 'tiktok-running', organizationId: 'org', accountId: 'account', workflowId: 'task/running', platform: 'TIKTOK', status: 'RUNNING', approvalStatus: 'NOT_REQUIRED', cancelledAt: null, pausedAt: null, account: { browserProfile: { id: 'profile' } } };
   let updateInput: any;
   let runUpdate: any;
@@ -156,12 +241,12 @@ test('TikTok cancel immediately terminates a running task and releases an orphan
   const service = new TasksService(prisma as never, temporal as never);
 
   const result = await service.cancel('org', running.id);
-  assert.equal(result.cancelRequested, false);
+  assert.equal(result.cancelRequested, true);
   assert.equal(result.cancelled, 1);
   assert.equal(updateInput.where.status, 'RUNNING');
-  assert.equal(updateInput.data.status, 'CANCELLED');
+  assert.equal(updateInput.data.status, undefined);
   assert.ok(updateInput.data.cancelledAt instanceof Date);
-  assert.equal(runUpdate.data.status, 'CANCELLED');
+  assert.equal(runUpdate, undefined);
   assert.equal(workflowCancelled, running.workflowId);
 });
 

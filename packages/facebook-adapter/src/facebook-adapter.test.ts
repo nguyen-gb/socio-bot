@@ -42,6 +42,28 @@ test('publishing is disabled until the authorized flow is configured', async () 
   );
 });
 
+test('a direct Facebook inbox skips a profile completed by an earlier campaign', async () => {
+  let navigations = 0;
+  const page = fakePage('about:blank', 0);
+  page.goto = async () => { navigations += 1; return undefined; };
+  const result = await new FacebookAdapter().execute({
+    platform: 'FACEBOOK', accountId, action: 'MESSAGE_FACEBOOK_RECIPIENT',
+    payload: {
+      groupUrl: 'https://www.facebook.com/groups/123/',
+      profileUrl: 'https://www.facebook.com/profile.php?id=100012345678901',
+      displayName: 'Người nhận', text: 'Xin chào', mediaAssetIds: [], excludeProfileUrls: [],
+    },
+  }, {
+    ...sessionWithPage(page),
+    reserveFacebookTarget: async () => false,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.messageStatus, 'SKIPPED_DUPLICATE');
+  assert.equal(result.data?.deduplicated, true);
+  assert.equal(navigations, 0);
+});
+
 function sessionWithPage(page: BrowserPage): PlatformSession {
   return { profileId: 'profile-test', page };
 }

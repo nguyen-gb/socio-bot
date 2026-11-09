@@ -1,5 +1,8 @@
 .git
 .github
+.env
+.env.*
+!.env.example
 node_modules
 **/node_modules
 .turbo
@@ -7,4 +10,15 @@ node_modules
 **/.next
 profiles
 artifacts
+object-storage
+secrets
+apps/*/profiles
+apps/*/artifacts
+apps/*/object-storage
+apps/*/secrets
+.local
+.tmp-*
+*.har
+*.zip
+*.trace
 *.log

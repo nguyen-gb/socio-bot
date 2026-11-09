@@ -108,7 +108,6 @@ export class RemoteBrowser {
       }
     } else if (command.type === 'navigate' && page) {
       await gotoPlatformPage(page, command.url!, undefined, { timeoutMs: 20000 });
-      await waitForPlatformPageReady(page, { timeoutMs: 20000, settleMs: 250 });
     } else if (command.type === 'navigation' && page) {
       const options = { waitUntil: 'domcontentloaded' as const, timeout: 20000 };
       if (command.action === 'reload') {
@@ -117,7 +116,7 @@ export class RemoteBrowser {
         try {
           if (command.action === 'back') await page.goBack(options);
           else await page.goForward(options);
-          await waitForPlatformPageReady(page, { timeoutMs: 20000, settleMs: 250 });
+          await waitForPlatformPageReady(page, { timeoutMs: 20000 });
           if (await hasPlatformErrorSurface(page)
             && !await clickPlatformReloadButton(page, { timeoutMs: 20000 })) {
             throw new Error('Trang không tải được sau khi reload');

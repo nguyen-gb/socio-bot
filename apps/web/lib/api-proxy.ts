@@ -33,13 +33,20 @@ export async function forwardAuthenticated(
     }
   }
 
-  const outgoing = new NextResponse(await response.arrayBuffer(), {
-    status: response.status,
-    headers: {
-      'content-type': response.headers.get('content-type') ?? 'application/json',
-      'cache-control': 'private, no-store',
-    },
-  });
+  const responseBody = await response.arrayBuffer();
+  const outgoing = !response.ok && responseBody.byteLength === 0
+    ? NextResponse.json(
+        { message: `Dịch vụ API trả về lỗi ${response.status.toString()} nhưng không có nội dung phản hồi.` },
+        { status: response.status },
+      )
+    : new NextResponse(responseBody, {
+        status: response.status,
+        headers: {
+          'content-type': response.headers.get('content-type') ?? 'application/json',
+          'cache-control': 'private, no-store',
+        },
+      });
+  outgoing.headers.set('cache-control', 'private, no-store');
   if (refreshed) setAuthCookies(outgoing, refreshed);
   if (response.status === 401) clearAuthCookies(outgoing);
   return outgoing;
@@ -75,7 +82,14 @@ export async function callApi(
   const apiUrl = process.env.API_INTERNAL_URL ?? 'http://localhost:3001';
   const headers = new Headers(init.headers);
   if (accessToken) headers.set('authorization', `Bearer ${accessToken}`);
-  return fetch(`${apiUrl}${path}`, { ...init, headers, cache: 'no-store' });
+  try {
+    return await fetch(`${apiUrl}${path}`, { ...init, headers, cache: 'no-store' });
+  } catch {
+    return Response.json(
+      { message: 'Không thể kết nối dịch vụ API. Hãy kiểm tra API đã khởi động và thử lại.' },
+      { status: 503, headers: { 'cache-control': 'private, no-store' } },
+    );
+  }
 }
 
 export function setAuthCookies(response: NextResponse, tokens: TokenPayload) {

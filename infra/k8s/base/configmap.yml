@@ -9,6 +9,7 @@ data:
   WEB_ORIGIN: https://socio.example.com
   API_INTERNAL_URL: http://socio-api:3001
   REDIS_URL: redis://redis-master.data.svc.cluster.local:6379
+  TRUST_PROXY_HOPS: "1"
   TEMPORAL_ADDRESS: temporal-frontend.temporal.svc.cluster.local:7233
   TEMPORAL_NAMESPACE: default
   TEMPORAL_TASK_QUEUE: browser-automation

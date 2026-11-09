@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { LoginInput } from '@socio/contracts';
+import type { Prisma } from '@socio/database';
 import type { ApiEnvironment } from '../config/environment';
 import { PrismaService } from '../database/prisma.service';
 import { AccessTokenService } from './access-token.service';
@@ -40,29 +41,38 @@ export class AuthService {
   }
 
   async refresh(rawToken: string) {
-    const current = await this.prisma.refreshToken.findUnique({
-      where: { tokenHash: hashToken(rawToken) },
-      include: {
-        user: {
-          include: {
-            memberships: { include: { organization: true } },
+    return this.prisma.$transaction(async (transaction) => {
+      const current = await transaction.refreshToken.findUnique({
+        where: { tokenHash: hashToken(rawToken) },
+        include: {
+          user: {
+            include: {
+              memberships: { include: { organization: true } },
+            },
           },
         },
-      },
-    });
-    if (!current || current.revokedAt || current.expiresAt <= new Date() || current.user.status !== 'ACTIVE') {
-      throw new UnauthorizedException('Invalid or expired refresh token');
-    }
-    const membership = current.user.memberships.find(
-      (item) => item.organizationId === current.organizationId,
-    );
-    if (!membership) throw new UnauthorizedException('Organization membership no longer exists');
+      });
+      const now = new Date();
+      if (!current || current.revokedAt || current.expiresAt <= now || current.user.status !== 'ACTIVE') {
+        throw new UnauthorizedException('Invalid or expired refresh token');
+      }
+      const membership = current.user.memberships.find(
+        (item) => item.organizationId === current.organizationId,
+      );
+      if (!membership) throw new UnauthorizedException('Organization membership no longer exists');
 
-    await this.prisma.refreshToken.update({
-      where: { id: current.id },
-      data: { revokedAt: new Date() },
+      // Conditional revocation is the single-use claim. Under concurrent
+      // refreshes PostgreSQL rechecks revokedAt after waiting on the row lock,
+      // so exactly one request can mint the replacement token.
+      const claimed = await transaction.refreshToken.updateMany({
+        where: { id: current.id, revokedAt: null, expiresAt: { gt: now } },
+        data: { revokedAt: now },
+      });
+      if (claimed.count !== 1) {
+        throw new UnauthorizedException('Refresh token has already been used');
+      }
+      return this.issueSession(current.user, membership, transaction);
     });
-    return this.issueSession(current.user, membership);
   }
 
   async logout(rawToken: string): Promise<void> {
@@ -79,6 +89,7 @@ export class AuthService {
       role: 'OWNER' | 'ADMIN' | 'OPERATOR' | 'VIEWER';
       organization: { name: string };
     },
+    store: Pick<Prisma.TransactionClient, 'refreshToken'> = this.prisma,
   ) {
     const access = this.tokens.issue({
       userId: user.id,
@@ -90,7 +101,7 @@ export class AuthService {
     const refreshExpiresAt = new Date(
       Date.now() + this.config.get('refreshTokenTtlDays', { infer: true }) * 86_400_000,
     );
-    await this.prisma.refreshToken.create({
+    await store.refreshToken.create({
       data: {
         userId: user.id,
         organizationId: membership.organizationId,

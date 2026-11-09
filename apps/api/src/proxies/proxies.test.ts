@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isPrivateAddress } from './proxies.service';
+import { isPrivateAddress, isUsableProxy } from './proxies.service';
+
+test('only a healthy proxy with a complete saved locale environment is assignable', () => {
+  const complete = { status: 'HEALTHY', locale: 'de-DE', languages: ['de-DE', 'de'], timezoneId: 'Europe/Berlin' };
+  assert.equal(isUsableProxy(complete), true);
+  assert.equal(isUsableProxy({ ...complete, status: 'CREATED' }), false);
+  assert.equal(isUsableProxy({ ...complete, locale: null }), false);
+  assert.equal(isUsableProxy({ ...complete, languages: [] }), false);
+  assert.equal(isUsableProxy({ ...complete, timezoneId: null }), false);
+});
 
 test('proxy host guard blocks non-public addresses', () => {
   for (const address of [

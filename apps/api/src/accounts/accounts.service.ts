@@ -73,9 +73,12 @@ export class AccountsService {
     if (input.proxyId) {
       const proxy = await this.prisma.proxy.findFirst({
         where: { id: input.proxyId, organizationId },
-        select: { id: true },
+        select: { id: true, status: true, locale: true, languages: true, timezoneId: true },
       });
       if (!proxy) throw new NotFoundException('Proxy not found');
+      if (!proxyReadyForAssignment(proxy)) {
+        throw new ConflictException('Kiểm tra proxy thành công trước khi gán profile');
+      }
     }
 
     const accountId = randomUUID();
@@ -131,11 +134,11 @@ export class AccountsService {
     if (input.proxyId) {
       const proxy = await this.prisma.proxy.findFirst({
         where: { id: input.proxyId, organizationId },
-        select: { id: true, status: true },
+        select: { id: true, status: true, locale: true, languages: true, timezoneId: true },
       });
       if (!proxy) throw new NotFoundException('Proxy not found');
-      if (proxy.status === 'DISABLED') {
-        throw new ConflictException('Cannot assign a disabled proxy');
+      if (!proxyReadyForAssignment(proxy)) {
+        throw new ConflictException('Kiểm tra proxy thành công trước khi gán profile');
       }
     }
 
@@ -262,6 +265,18 @@ export class AccountsService {
       proxyBinding: safeBinding,
     };
   }
+}
+
+function proxyReadyForAssignment(proxy: {
+  status: string;
+  locale: string | null;
+  languages?: string[];
+  timezoneId: string | null;
+}): boolean {
+  return proxy.status === 'HEALTHY'
+    && Boolean(proxy.locale)
+    && Boolean(proxy.languages?.length)
+    && Boolean(proxy.timezoneId);
 }
 
 function authenticationMetadata(

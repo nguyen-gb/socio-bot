@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { platformSchema } from './status';
-import { facebookGroupUrlSchema, facebookPostRecipientSourceSchema, facebookPostUrlSchema } from './facebook';
+import { facebookGroupUrlSchema, facebookPostRecipientSourceSchema, facebookPostUrlSchema, facebookProfileUrlSchema } from './facebook';
 import { facebookMediaIdsSchema } from './media';
 import {
   autoCommentTikTokHomePayloadSchema,
@@ -58,6 +58,8 @@ export const messageFacebookRecipientActionSchema = baseActionSchema.extend({
   action: z.literal('MESSAGE_FACEBOOK_RECIPIENT'),
   payload: z.object({
     groupUrl: facebookGroupUrlSchema,
+    profileUrl: facebookProfileUrlSchema.optional(),
+    displayName: z.string().trim().max(120).optional(),
     text: z.string().trim().max(5_000).default(''),
     mediaAssetIds: facebookMediaIdsSchema,
     excludeProfileUrls: z.array(z.string().max(2048)).max(500).default([]),
@@ -173,6 +175,17 @@ export const createTaskSchema = z.object({
   maxAttempts: z.number().int().min(1).max(5).default(3),
 });
 export type CreateTaskInput = z.infer<typeof createTaskSchema>;
+
+export const createTaskBatchSchema = z.object({
+  idempotencyKey: z.string().trim().min(8).max(100),
+  tasks: z.array(createTaskSchema.omit({ idempotencyKey: true })).min(1).max(100),
+});
+export type CreateTaskBatchInput = z.infer<typeof createTaskBatchSchema>;
+
+export const approveTaskBatchSchema = z.object({
+  taskIds: z.array(z.uuid()).min(1).max(100).refine(ids => new Set(ids).size === ids.length, 'taskIds must be unique'),
+});
+export type ApproveTaskBatchInput = z.infer<typeof approveTaskBatchSchema>;
 
 export const executeTaskWorkflowInputSchema = z.object({
   taskId: z.uuid(),

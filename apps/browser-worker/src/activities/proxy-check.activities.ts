@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import type { ProxyCheckResult, ProxyCheckWorkflowInput } from '@socio/contracts';
+import { resolveProxyLocale, type RuntimeProxy } from '@socio/browser-runtime';
 import { chromium } from 'playwright';
 import { PrismaService } from '../database/prisma.service';
 import { SecretsService } from '../secrets/secrets.service';
@@ -49,10 +50,19 @@ export class ProxyCheckActivities {
         waitUntil: 'load',
         timeout: 25_000,
       });
+      const runtimeProxy: RuntimeProxy = {
+        server: `${proxy.protocol.toLowerCase()}://${proxy.host}:${proxy.port.toString()}`,
+        username: credentials?.username,
+        password: credentials?.password,
+      };
+      const environment = await resolveProxyLocale(runtimeProxy);
       return {
         ok: true,
         check: 'playwright_navigation',
         latencyMs: Date.now() - startedAt,
+        locale: environment.locale,
+        languages: environment.languages,
+        timezoneId: environment.timezoneId,
       };
     } catch (error) {
       return {

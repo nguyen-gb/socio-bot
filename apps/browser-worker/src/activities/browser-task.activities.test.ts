@@ -52,6 +52,69 @@ test('successful random-member messages are persisted and reserved recipients ar
   assert.equal(row.status, 'SENT');
   assert.equal(await (service as any).reserveMessageRecipient({ organizationId: 'org', accountId: id, taskId: 'another-task', groupUrl: 'https://www.facebook.com/groups/123/', profileUrl: 'https://www.facebook.com/100028475506542' }), false);
 });
+
+test('TikTok targets are normalized and cannot be reused by another campaign', async () => {
+  let row: any;
+  const model = {
+    findUnique: async () => row,
+    create: async ({ data }: any) => { row = { id: 'target', ...data, reservedAt: new Date() }; return row; },
+    updateMany: async ({ where, data }: any) => {
+      if (!row || row.taskId !== where.taskId || row.status !== where.status || row.targetKey !== where.targetKey) return { count: 0 };
+      row = { ...row, ...data };
+      return { count: 1 };
+    },
+    deleteMany: async ({ where }: any) => {
+      if (!row || row.taskId !== where.taskId || row.status !== where.status || row.targetKey !== where.targetKey) return { count: 0 };
+      row = undefined;
+      return { count: 1 };
+    },
+  };
+  const service = new BrowserTaskActivities({ tikTokActionTarget: model } as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  const first = { organizationId: 'org', accountId: id, taskId: id, action: 'MESSAGE', targetKey: '@Target.User' };
+  assert.equal(await (service as any).reserveTikTokTarget(first), true);
+  assert.equal(row.targetKey, 'target.user');
+  assert.equal(await (service as any).reserveTikTokTarget({ ...first, taskId: 'another-task', targetKey: 'target.user' }), false);
+  await (service as any).completeTikTokTarget(first);
+  assert.equal(row.status, 'COMPLETED');
+  assert.equal(await (service as any).reserveTikTokTarget({ ...first, taskId: 'third-task' }), false);
+});
+
+test('TikTok reservation is released only before an action starts', async () => {
+  let row: any;
+  const model = {
+    findUnique: async () => row,
+    create: async ({ data }: any) => { row = { id: 'target', ...data, reservedAt: new Date() }; return row; },
+    deleteMany: async ({ where }: any) => {
+      if (row?.taskId === where.taskId && row?.status === where.status && row?.targetKey === where.targetKey) row = undefined;
+      return { count: row ? 0 : 1 };
+    },
+  };
+  const service = new BrowserTaskActivities({ tikTokActionTarget: model } as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  const input = { organizationId: 'org', accountId: id, taskId: id, action: 'COMMENT', targetKey: 'https://www.tiktok.com/@a/video/1?lang=vi#x' };
+  assert.equal(await (service as any).reserveTikTokTarget(input), true);
+  assert.equal(row.targetKey, 'https://www.tiktok.com/@a/video/1');
+  await (service as any).releaseTikTokTarget(input);
+  assert.equal(row, undefined);
+});
+
+test('Facebook action targets prevent another campaign from reusing the same normalized profile', async () => {
+  let row: any;
+  const model = {
+    findUnique: async () => row,
+    create: async ({ data }: any) => { row = { id: 'facebook-target', ...data, reservedAt: new Date() }; return row; },
+    updateMany: async ({ where, data }: any) => {
+      if (row?.taskId !== where.taskId || row?.targetKey !== where.targetKey || row?.status !== where.status) return { count: 0 };
+      row = { ...row, ...data }; return { count: 1 };
+    },
+    deleteMany: async () => ({ count: 0 }),
+  };
+  const service = new BrowserTaskActivities({ facebookActionTarget: model } as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never);
+  const first = { organizationId: 'org', accountId: id, taskId: id, action: 'MESSAGE', targetKey: 'https://facebook.com/profile.php?id=100012345678901&utm_source=test' };
+  assert.equal(await (service as any).reserveFacebookTarget(first), true);
+  await (service as any).completeFacebookTarget(first);
+  assert.equal(row.status, 'COMPLETED');
+  assert.equal(await (service as any).reserveFacebookTarget({ ...first, taskId: 'another-task', targetKey: 'https://www.facebook.com/profile.php?id=100012345678901' }), false);
+});
 const task = (override: Record<string, unknown> = {}) => ({ id, accountId: id, action: 'JOIN_FACEBOOK_GROUP', platform: 'FACEBOOK', payload: { groupUrl: 'https://www.facebook.com/groups/123/' }, status: 'QUEUED', approvalStatus: 'APPROVED', attemptCount: 0, maxAttempts: 1, account: { status: 'READY', browserProfile: { id: 'profile', sessions: [] } }, ...override });
 type ScenarioContext = { result: any; error?: unknown; opened: boolean; updates: any[]; leased: boolean };
 async function scenario(row: any, attempt = 1, claim = 0, workflowId?: string): Promise<ScenarioContext> {
@@ -166,7 +229,7 @@ test('challenge appearing after an adapter result becomes manual action and mark
       url: () => pageUrl,
       title: async () => 'TikTok challenge',
       goto: async (target: string) => {
-        pageUrl = target === 'https://www.tiktok.com/'
+        pageUrl = target === 'https://www.tiktok.com/en'
           ? 'https://www.tiktok.com/challenge/123'
           : target;
       },
@@ -270,5 +333,93 @@ test('worker restores the current snapshot and seeds legacy cookies before check
     assert.equal(result.data?.alreadyJoined, true);
     assert.equal(updates.at(-1).data.status, 'SUCCEEDED');
     assert.deepEqual(events, ['restore-current-snapshot', 'import-cookies', 'navigate-home', 'navigate-group', 'close', 'snapshot']);
+  } finally { Context.current = original; }
+});
+
+test('campaign keeps one browser open while the same profile still has following tasks', async () => {
+  const original = Context.current;
+  Context.current = () => ({ heartbeat: () => {}, info: { attempt: 1 } }) as unknown as Context;
+  try {
+    const campaignId = '00000000-0000-4000-8000-000000000099';
+    const reuseKey = `campaign/${campaignId}/account/${id}`;
+    const row = task({ organizationId: 'org', campaignId });
+    const current = task({
+      organizationId: 'org',
+      campaignId,
+      campaign: {},
+      account: {
+        status: 'READY',
+        browserProfile: { id: 'profile', sessions: [], metadata: { credentialsRef: 'fixture-reference' }, snapshotVersion: 3 },
+      },
+    });
+    let cookies: any[] = [];
+    let url = 'about:blank';
+    let closeCount = 0;
+    let snapshotCount = 0;
+    const sessionUpdates: any[] = [];
+    const accountUpdates: any[] = [];
+    const profileUpdates: any[] = [];
+    const context = {
+      cookies: async () => cookies,
+      addCookies: async (input: any[]) => { cookies = input; },
+      tracing: { start: async () => {}, stop: async () => {} },
+    };
+    const roleLocator = (visible = false): any => ({
+      filter: () => roleLocator(visible), and: () => roleLocator(visible), first: () => roleLocator(visible),
+      waitFor: async () => {}, count: async () => visible ? 1 : 0, isVisible: async () => visible,
+      getByRole: (role: string, options: any) => roleLocator(role === 'button' && !!options?.name?.test('Joined')),
+      getByText: () => roleLocator(false), locator: () => roleLocator(false), evaluateAll: async () => [],
+    });
+    const page = {
+      url: () => url, title: async () => 'Fixture group', context: () => context,
+      goto: async (target: string) => { url = target; }, on: () => {}, off: () => {},
+      locator: (selector: string): any => ({ first() { return this; }, filter() { return this; }, waitFor: async () => {}, count: async () => 0, isVisible: async () => selector.includes('navigation') && cookies.some(cookie => cookie.name === 'c_user') }),
+      getByRole: (role: string) => roleLocator(role === 'main'), getByText: () => roleLocator(false),
+    };
+    const prisma = {
+      task: {
+        findUnique: async () => row,
+        findUniqueOrThrow: async () => current,
+        findFirst: async () => ({ scheduledAt: new Date(Date.now() + 10_000) }),
+        updateMany: async () => ({ count: 1 }),
+        update: async () => ({}),
+      },
+      platformAccount: { update: async ({ data }: any) => { accountUpdates.push(data); } },
+      browserProfile: { update: async ({ data }: any) => { profileUpdates.push(data); } },
+      browserSession: {
+        findUnique: async () => null,
+        create: async ({ data }: any) => { assert.equal(data.workflowId, reuseKey); return { id: 'shared-browser-session' }; },
+        updateMany: async () => ({ count: 1 }),
+        update: async ({ data }: any) => { sessionUpdates.push(data); return { id: 'shared-browser-session', ...data }; },
+      },
+      taskRun: { create: async () => ({ id: 'run' }), update: async () => ({}) },
+      facebookGroupMembership: { upsert: async () => ({}) },
+      $transaction: async (input: any) => typeof input === 'function' ? input(prisma) : Promise.all(input),
+    };
+    const service = new BrowserTaskActivities(
+      prisma as never,
+      { withLease: async (_: string, callback: any) => callback() } as never,
+      { workerId: 'worker' } as never,
+      { restore: async () => {}, capture: async () => { snapshotCount += 1; } } as never,
+      { temporaryPath: async () => 'fixture.har', captureScreenshot: async () => {}, captureFailure: async () => {}, captureTrace: async () => {}, captureConsoleLog: async () => {}, captureHar: async () => {} } as never,
+      { profileCredentials: async () => ({ cookies: 'c_user=fixture-valid; xs=fixture-valid' }) } as never,
+      { get: (name: string) => name === 'browserCloseDelayMs' ? 0 : undefined } as never,
+      {
+        withProfile: async (options: any, callback: any) => {
+          assert.equal(options.ownerId, reuseKey);
+          return callback({ page, context, profileId: 'profile', slot: 0 });
+        },
+        closeProfile: async () => { closeCount += 1; },
+      } as never,
+      {} as never,
+    );
+
+    const result = await service.executeBrowserTask({ taskId: id });
+    assert.equal(result.ok, true);
+    assert.equal(closeCount, 0);
+    assert.equal(snapshotCount, 0);
+    assert.ok(sessionUpdates.some(update => update.status === 'IDLE'));
+    assert.equal(accountUpdates.at(-1)?.status, 'RUNNING');
+    assert.equal(profileUpdates.at(-1)?.status, 'LEASED');
   } finally { Context.current = original; }
 });

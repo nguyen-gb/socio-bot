@@ -8,9 +8,11 @@
   },
   "scripts": {
     "build": "corepack pnpm -r --sort build",
-    "dev": "corepack pnpm -r --parallel dev",
+    "dev": "node scripts/dev.mjs",
+    "dev:apps": "corepack pnpm -r --parallel dev",
     "test": "corepack pnpm -r --sort test",
     "typecheck": "corepack pnpm -r --sort typecheck",
+    "check": "corepack pnpm typecheck && corepack pnpm test",
     "db:generate": "corepack pnpm --filter @socio/database prisma:generate",
     "db:migrate": "corepack pnpm --filter @socio/database prisma:migrate",
     "db:studio": "corepack pnpm --filter @socio/database prisma:studio"

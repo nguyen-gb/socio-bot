@@ -15,6 +15,11 @@ async function bootstrap(): Promise<void> {
   const config = app.get(ConfigService<ApiEnvironment, true>);
   app.useLogger(new JsonLogger());
 
+  const trustProxyHops = config.get('trustProxyHops', { infer: true });
+  if (trustProxyHops > 0) {
+    app.getHttpAdapter().getInstance().set('trust proxy', trustProxyHops);
+  }
+
   app.setGlobalPrefix('api');
   app.use((request: Request, response: Response, next: NextFunction) => {
     const candidate = request.header('x-request-id');

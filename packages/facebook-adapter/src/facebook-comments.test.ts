@@ -70,6 +70,102 @@ test('does not send beyond available comments', async () => fixture(`
   assert.equal(result.data?.repliesSent, 1);
 }));
 
+test('discovers group posts when Facebook reserves role=article for comments', async () => fixture(`
+  <div class="post-card">
+    <a href="/groups/123/">Người đăng</a>
+    <a href="/groups/123/">2h</a>
+    <p>Bài viết không còn role article</p>
+    <div role="button" aria-label="Like this post">12</div>
+    <div role="button" aria-label="Comment on Người đăng's post, 3 comments">3</div>
+    <div role="article" aria-label="Comment by Người đọc">
+      <a href="/groups/123/posts/456/?comment_id=789">Người đọc</a>
+      <span>Bình luận con</span>
+    </div>
+  </div>
+`, async page => {
+  const result = await new FacebookCommentsAutomation({ mainTimeoutMs: 700, controlTimeoutMs: 900 }).commentGroupPosts({
+    page,
+    profileId: 'fixture',
+  }, 'https://facebook.com/groups/123/', 'Nội dung chưa gửi', [], {
+    daysRecent: 1,
+    minReactions: 0,
+    minComments: 0,
+    maxPosts: 1,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.data?.postsFound, 1);
+  assert.equal(result.data?.postsCommented, 0);
+}));
+
+test('discovers a newly published group post with a plain Comment control and Just now timestamp', async () => fixture(`
+  <div id="discussion-feed" class="post-card">
+    <a href="/groups/123/posts/999/">Just now</a>
+    <p>Bài viết vừa đăng</p>
+    <button>Comment</button>
+  </div>
+`, async page => {
+  const requestedUrls: string[] = [];
+  page.on('request', request => requestedUrls.push(request.url()));
+  const result = await new FacebookCommentsAutomation({ mainTimeoutMs: 700, controlTimeoutMs: 900 }).commentGroupPosts({
+    page,
+    profileId: 'fixture',
+  }, 'https://facebook.com/groups/123/', 'Nội dung chưa gửi', [], {
+    daysRecent: 1,
+    minReactions: 0,
+    minComments: 0,
+    maxPosts: 1,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.data?.postsFound, 1);
+  assert.match(requestedUrls[0] ?? '', /sorting_setting=CHRONOLOGICAL/);
+}));
+
+test('discovers a recent post from its canonical link when the Comment action label is absent', async () => fixture(`
+  <div class="post-card">
+    <a href="/groups/123/posts/1001/">about a minute ago</a>
+    <p>Bài viết Facebook mới</p>
+    <div role="textbox" contenteditable="true" aria-label="Comment as Nguyên"></div>
+  </div>
+`, async page => {
+  const result = await new FacebookCommentsAutomation({ mainTimeoutMs: 700, controlTimeoutMs: 900 }).commentGroupPosts({
+    page,
+    profileId: 'fixture',
+  }, 'https://facebook.com/groups/123/', 'Nội dung chưa gửi', [], {
+    daysRecent: 1,
+    minReactions: 0,
+    minComments: 0,
+    maxPosts: 1,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.data?.postsFound, 1);
+}));
+
+test('comments a feed card whose timestamp link hides the post permalink', async () => fixture(`
+  <div class="post-card">
+    <a href="/groups/123/?__cft__[0]=stable-post-token&amp;__tn__=%2CO%2CP-R#?ffc">3 m</a>
+    <p>Bài viết dùng link feed bị làm mờ</p>
+    <div role="button" aria-label="Comment on Người đăng's post">Comment</div>
+    <div role="textbox" contenteditable="true" aria-label="Write a public comment…" onkeydown="if(event.key==='Enter'){event.preventDefault();const out=document.createElement('div');out.textContent=this.textContent;this.closest('.post-card').append(out);this.textContent=''}"></div>
+  </div>
+`, async page => {
+  let markers = 0;
+  const result = await new FacebookCommentsAutomation({ mainTimeoutMs: 700, controlTimeoutMs: 2_000 }).commentGroupPosts({
+    page,
+    profileId: 'fixture',
+    beforeExternalAction: async () => { markers += 1; },
+  }, 'https://facebook.com/groups/123/', 'Bình luận kiểm thử', [], {
+    daysRecent: 1,
+    minReactions: 0,
+    minComments: 0,
+    maxPosts: 1,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.postsFound, 1);
+  assert.equal(result.data?.postsCommented, 1);
+  assert.equal(markers, 1);
+  assert.equal(await page.getByText('Bình luận kiểm thử', { exact: true }).count(), 1);
+}));
+
 test('skips comments authored by the logged-in profile', async () => fixture(`
   <div class="comment"><a href="/tran.van.nguyen.768806">Trần Văn Nguyên</a><div data-ad-preview="message">Bình luận của tôi</div><button onclick="const p=this.parentElement;const box=document.createElement('div');box.setAttribute('role','textbox');box.contentEditable='true';const send=document.createElement('button');send.setAttribute('aria-label','Comment');send.textContent='Comment';send.onclick=()=>{const out=document.createElement('div');out.textContent=box.textContent;p.append(out);box.remove();send.remove()};p.append(box,send)">Reply</button></div>
   <div class="comment"><a href="/other.person">Người khác</a><div data-ad-preview="message">Bình luận của người khác</div><button onclick="const p=this.parentElement;const box=document.createElement('div');box.setAttribute('role','textbox');box.contentEditable='true';const send=document.createElement('button');send.setAttribute('aria-label','Comment');send.textContent='Comment';send.onclick=()=>{const out=document.createElement('div');out.textContent=box.textContent;p.append(out);box.remove();send.remove()};p.append(box,send)">Reply</button></div>

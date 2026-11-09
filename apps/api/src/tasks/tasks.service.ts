@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { requiresExternalApproval, type CreateTaskInput } from '@socio/contracts';
-import { Prisma, type Task } from '@socio/database';
+import { requiresExternalApproval, type CreateTaskBatchInput, type CreateTaskInput } from '@socio/contracts';
+import { Prisma, type Task, type TaskStatus } from '@socio/database';
 import { PrismaService } from '../database/prisma.service';
 import { TemporalClientService } from '../temporal/temporal-client.service';
 import { validateFacebookImages } from '../media/facebook-images';
@@ -30,15 +30,17 @@ export class TasksService {
     private readonly temporal: TemporalClientService,
   ) {}
 
-  list(organizationId: string) {
+  list(organizationId: string, requestedTake = 100) {
+    const take = Number.isFinite(requestedTake) ? Math.min(2_000, Math.max(1, Math.trunc(requestedTake))) : 100;
     return this.prisma.task.findMany({
       where: { organizationId },
       include: {
       account: { select: { id: true, username: true, platform: true, status: true } },
+        createdBy: { select: { id: true, email: true, displayName: true } },
         runs: { orderBy: { startedAt: 'desc' }, take: 1 },
       },
       orderBy: { createdAt: 'desc' },
-      take: 100,
+      take,
     });
   }
 
@@ -54,6 +56,7 @@ export class TasksService {
   async create(
     organizationId: string,
     input: CreateTaskInput,
+    createdByUserId?: string,
   ): Promise<Task> {
     const account = await this.prisma.platformAccount.findFirst({
       where: {
@@ -65,7 +68,7 @@ export class TasksService {
     });
     if (!account) throw new NotFoundException('Account not found');
 
-    if (input.action.action === 'POST_FACEBOOK_GROUP' || input.action.action === 'MESSAGE_FACEBOOK_RECIPIENT' || input.action.action === 'MESSAGE_FACEBOOK_REACTOR' || input.action.action === 'REPLY_FACEBOOK_POST_COMMENTS' || input.action.action === 'AUTO_COMMENT_TIKTOK_HOME' || input.action.action === 'COMMENT_TIKTOK_VIDEOS' || input.action.action === 'REPLY_TIKTOK_COMMENTS' || input.action.action === 'MESSAGE_TIKTOK_FOLLOWERS') {
+    if (input.action.action === 'POST_FACEBOOK_GROUP' || input.action.action === 'MESSAGE_FACEBOOK_RECIPIENT' || input.action.action === 'MESSAGE_FACEBOOK_REACTOR' || input.action.action === 'REPLY_FACEBOOK_POST_COMMENTS' || input.action.action === 'MESSAGE_TIKTOK_FOLLOWERS') {
       await validateFacebookImages(this.prisma, organizationId, input.action.payload.mediaAssetIds);
     }
 
@@ -105,6 +108,7 @@ export class TasksService {
           scheduledAt,
           maxAttempts: requiresApproval ? 1 : input.maxAttempts,
           approvalStatus: requiresApproval ? 'PENDING' : 'NOT_REQUIRED',
+          createdByUserId,
           status: requiresApproval
             ? 'DRAFT'
             : scheduledAt && scheduledAt.getTime() > Date.now()
@@ -143,6 +147,111 @@ export class TasksService {
     }
 
     return task;
+  }
+
+  async createBatch(organizationId: string, input: CreateTaskBatchInput, createdByUserId?: string) {
+    const actions = input.tasks.map(task => task.action);
+    if (actions.some(action => action.platform !== 'TIKTOK')) {
+      throw new BadRequestException('Batch campaign hiện chỉ hỗ trợ TikTok.');
+    }
+    if (new Set(actions.map(action => action.action)).size !== 1) {
+      throw new BadRequestException('Các tác vụ trong một batch phải cùng loại campaign.');
+    }
+    const accountIds = [...new Set(actions.map(action => action.accountId))];
+    const accounts = await this.prisma.platformAccount.count({
+      where: { organizationId, platform: 'TIKTOK', id: { in: accountIds } },
+    });
+    if (accounts !== accountIds.length) throw new NotFoundException('Một số profile TikTok không còn tồn tại.');
+
+    for (const action of actions) {
+      if (action.action === 'MESSAGE_TIKTOK_FOLLOWERS') {
+        await validateFacebookImages(this.prisma, organizationId, action.payload.mediaAssetIds);
+      }
+    }
+
+    const keys = input.tasks.map((_, index) => `${input.idempotencyKey}:${index}`);
+    const batchId = randomUUID();
+    const create = async () => this.prisma.$transaction(input.tasks.map((task, index) => {
+      const id = randomUUID();
+      const approval = requiresExternalApproval(task.action.action);
+      const scheduledAt = task.scheduledAt ? new Date(task.scheduledAt) : undefined;
+      return this.prisma.task.create({
+        data: {
+          id,
+          organizationId,
+          accountId: task.action.accountId,
+          idempotencyKey: keys[index]!,
+          workflowId: `task/${id}`,
+          platform: task.action.platform,
+          action: task.action.action,
+          payload: task.action.payload,
+          batchId,
+          createdByUserId,
+          priority: task.priority,
+          scheduledAt,
+          maxAttempts: approval ? 1 : task.maxAttempts,
+          approvalStatus: approval ? 'PENDING' : 'NOT_REQUIRED',
+          status: approval ? 'DRAFT' : scheduledAt && scheduledAt.getTime() > Date.now() ? 'SCHEDULED' : 'QUEUED',
+        },
+      });
+    }));
+
+    let created;
+    try {
+      created = await create();
+    } catch (error) {
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') throw error;
+      created = await this.prisma.task.findMany({
+        where: { organizationId, idempotencyKey: { in: keys } },
+        orderBy: { idempotencyKey: 'asc' },
+      });
+      if (created.length !== input.tasks.length) throw new ConflictException('Batch cũ chưa đầy đủ; hãy tạo campaign mới.');
+    }
+
+    for (const task of created.filter(task => task.approvalStatus === 'NOT_REQUIRED' && !task.dispatchedAt)) {
+      try {
+        await this.temporal.startTask(task.id, task.workflowId!, task.scheduledAt ?? undefined);
+      } catch (error) {
+        await this.prisma.task.update({ where: { id: task.id }, data: { lastError: `Workflow dispatch pending: ${error instanceof Error ? error.message : String(error)}` } });
+      }
+    }
+    return { idempotencyKey: input.idempotencyKey, tasks: created };
+  }
+
+  async approveBatch(organizationId: string, taskIds: string[], userId?: string) {
+    const pending = await this.prisma.task.findMany({ where: { id: { in: taskIds }, organizationId } });
+    if (pending.length !== taskIds.length) throw new NotFoundException('Một số campaign TikTok không còn tồn tại.');
+    if (pending.some(task => task.platform !== 'TIKTOK' || task.campaignId || task.approvalStatus !== 'PENDING')) {
+      throw new ConflictException('Batch đã thay đổi hoặc có tác vụ không còn chờ duyệt.');
+    }
+    const now = Date.now();
+    const dispatches = await this.prisma.$transaction(async tx => {
+      const accountIds = [...new Set(pending.map(task => task.accountId))].sort();
+      for (const accountId of accountIds) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`tiktok/account/${accountId}`}))`;
+      const active = await tx.task.findMany({
+        where: { organizationId, accountId: { in: accountIds }, status: { in: ['QUEUED', 'SCHEDULED', 'RUNNING'] }, id: { notIn: taskIds } },
+        select: { accountId: true, scheduledAt: true, payload: true },
+      });
+      const tails = new Map<string, number>();
+      for (const task of active) tails.set(task.accountId, Math.max(tails.get(task.accountId) ?? now, this.estimatedTikTokTaskEnd(task, now)));
+      const result: Array<{ id: string; workflowId: string; scheduledAt: Date }> = [];
+      for (const task of pending) {
+        const scheduledAt = new Date(tails.get(task.accountId) ?? now);
+        tails.set(task.accountId, this.estimatedTikTokTaskEnd({ scheduledAt, payload: task.payload }, now));
+        const claimed = await tx.task.updateMany({
+          where: { id: task.id, organizationId, approvalStatus: 'PENDING', status: 'DRAFT' },
+          data: { approvalStatus: 'APPROVED', approvedByUserId: userId, approvedAt: new Date(now), scheduledAt, status: scheduledAt.getTime() > now ? 'SCHEDULED' : 'QUEUED', lastError: null },
+        });
+        if (claimed.count !== 1) throw new ConflictException('Batch đã thay đổi trong lúc duyệt.');
+        result.push({ id: task.id, workflowId: task.workflowId!, scheduledAt });
+      }
+      return result;
+    });
+    for (const task of dispatches) {
+      try { await this.temporal.startTask(task.id, task.workflowId, task.scheduledAt); }
+      catch (error) { await this.prisma.task.update({ where: { id: task.id }, data: { lastError: `Workflow dispatch pending: ${error instanceof Error ? error.message : String(error)}` } }); }
+    }
+    return { approved: dispatches.length, taskIds: dispatches.map(task => task.id) };
   }
 
   async approve(organizationId: string, id: string, userId?: string) {
@@ -226,19 +335,17 @@ export class TasksService {
       if (task.status === 'RUNNING') {
         const updated = await tx.task.updateMany({
           where: { id, organizationId, status: 'RUNNING' },
-          data: { status: 'CANCELLED', cancelledAt: task.cancelledAt ?? now, pausedAt: null, lastError: null },
+          // Keep RUNNING until the worker has closed Chromium, persisted the
+          // profile and finalized the active TaskRun.
+          data: { cancelledAt: task.cancelledAt ?? now, pausedAt: null, lastError: null },
         });
         if (updated.count !== 1) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
-        await tx.taskRun.updateMany({
-          where: { taskId: id, status: 'RUNNING' },
-          data: { status: 'CANCELLED', finishedAt: now, errorCode: 'TASK_CANCELLED', error: null },
-        });
         const browserCloseRequested = await this.requestTaskBrowserStop(tx, task.accountId, task.account.browserProfile?.id, now);
         return {
           workflowId: task.workflowId,
           response: {
             cancelled: 1,
-            cancelRequested: false,
+            cancelRequested: true,
             browserCloseRequested,
             message: 'Đã hủy campaign và yêu cầu dừng browser đang chạy.',
           },
@@ -283,19 +390,17 @@ export class TasksService {
       if (task.status === 'RUNNING') {
         const updated = await tx.task.updateMany({
           where: { id, organizationId, status: 'RUNNING', cancelledAt: null },
-          data: { status: 'PAUSED', pausedAt: task.pausedAt ?? now, lastError: null },
+          // The marker is observed by the worker after the current atomic
+          // browser action; only then is the task made PAUSED.
+          data: { pausedAt: task.pausedAt ?? now, lastError: null },
         });
         if (updated.count !== 1) throw new ConflictException('Campaign đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
-        await tx.taskRun.updateMany({
-          where: { taskId: id, status: 'RUNNING' },
-          data: { status: 'CANCELLED', finishedAt: now, errorCode: 'TASK_PAUSED', error: null },
-        });
         const browserCloseRequested = await this.requestTaskBrowserStop(tx, task.accountId, task.account.browserProfile?.id, now);
         return {
           workflowId: task.workflowId,
           response: {
             paused: 1,
-            pauseRequested: false,
+            pauseRequested: true,
             browserCloseRequested,
             message: 'Đã tạm dừng campaign và yêu cầu đóng browser đang chạy.',
           },
@@ -358,6 +463,7 @@ export class TasksService {
         where: { id, organizationId, status: 'PAUSED', cancelledAt: null },
         data: {
           workflowId,
+          dispatchedAt: null,
           attemptCount: 0,
           scheduledAt,
           status: scheduledAt.getTime() > now ? 'SCHEDULED' : 'QUEUED',
@@ -387,7 +493,7 @@ export class TasksService {
     attemptCount: number;
     runs: Array<{ result: Prisma.JsonValue | null }>;
   }, allowVerifiedRetry = false) {
-    if (!['FAILED', 'REQUIRES_ACTION'].includes(task.status)) {
+    if (!['FAILED', 'REQUIRES_ACTION'].includes(task.status) && !this.isLegacyIncompleteTikTokSuccess(task)) {
       throw new ConflictException('Campaign này hiện không ở trạng thái có thể chạy lại.');
     }
     if (task.action !== 'SEARCH_TIKTOK_VIDEOS' && task.account.status !== 'READY') {
@@ -411,11 +517,14 @@ export class TasksService {
     let scheduledAt = new Date();
     const now = Date.now();
     const workflowId = `task/${task.id}/retry/${randomUUID()}`;
+    const retryableStatuses: TaskStatus[] = this.isLegacyIncompleteTikTokSuccess(task)
+      ? ['FAILED', 'REQUIRES_ACTION', 'SUCCEEDED']
+      : ['FAILED', 'REQUIRES_ACTION'];
     await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`tiktok/account/${task.accountId}`}))`;
       const current = await tx.task.findFirst({ where: { id: task.id, organizationId } });
       if (!current) throw new NotFoundException('Task not found');
-      if (!['FAILED', 'REQUIRES_ACTION'].includes(current.status)) {
+      if (!retryableStatuses.includes(current.status)) {
         throw new ConflictException('Campaign này đã thay đổi trạng thái. Hãy tải lại danh sách campaign.');
       }
       const activeTasks = await tx.task.findMany({
@@ -436,9 +545,10 @@ export class TasksService {
       const actionRequiresApproval = requiresExternalApproval(current.action);
       const continuationPayload = this.continuationPayload(task, allowVerifiedRetry);
       const updated = await tx.task.updateMany({
-        where: { id: task.id, organizationId, status: { in: ['FAILED', 'REQUIRES_ACTION'] } },
+        where: { id: task.id, organizationId, status: { in: retryableStatuses } },
         data: {
           workflowId,
+          dispatchedAt: null,
           ...(continuationPayload ? { payload: continuationPayload } : {}),
           attemptCount: 0,
           scheduledAt,
@@ -464,18 +574,42 @@ export class TasksService {
   }
 
   private canContinueFromCheckpoint(action: string, result: Prisma.JsonValue | null | undefined): boolean {
-    if (!['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action)) return false;
+    if (!['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(action)) return false;
     if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
     if ((result as Record<string, unknown>).checkpointUncertain === true) return false;
     const report = (result as Record<string, unknown>).report;
     if (!report || typeof report !== 'object' || Array.isArray(report)) return false;
     const entries = (report as Record<string, unknown>).entries;
     if (!Array.isArray(entries) || entries.length === 0) return false;
-    return entries.every((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
-      const status = (entry as Record<string, unknown>).status;
-      return status === 'SENT' || status === 'LIKED';
-    });
+    const statuses = entries.map((entry) => entry && typeof entry === 'object' && !Array.isArray(entry)
+      ? (entry as Record<string, unknown>).status
+      : undefined);
+    const hasCompletedCheckpoint = statuses.some(status => status === 'SENT' || status === 'LIKED');
+    const hasUncertainCheckpoint = statuses.some(status => status === 'IN_PROGRESS' || status === 'UNKNOWN' || status == null);
+    // FAILED entries are expected in a partial campaign. Successful entries
+    // are durable checkpoints; the failed targets are precisely the work that
+    // must remain eligible on the next run.
+    return hasCompletedCheckpoint && !hasUncertainCheckpoint;
+  }
+
+  private isLegacyIncompleteTikTokSuccess(task: { action: string; status: string; runs: Array<{ result: Prisma.JsonValue | null }> }): boolean {
+    if (task.status !== 'SUCCEEDED' || task.action === 'SEARCH_TIKTOK_VIDEOS') return false;
+    const result = task.runs[0]?.result;
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+    const data = result as Record<string, unknown>;
+    const completed = typeof data.totalSent === 'number'
+      ? data.totalSent
+      : typeof data.sent === 'number'
+        ? data.sent
+        : typeof data.liked === 'number'
+          ? data.liked
+          : undefined;
+    const requested = typeof data.totalRequested === 'number'
+      ? data.totalRequested
+      : typeof data.requested === 'number'
+        ? data.requested
+        : undefined;
+    return completed != null && requested != null && requested > 0 && completed < requested;
   }
 
   private continuationPayload(task: RetryableTikTokTask, allowUncertainCheckpoint = false): Prisma.InputJsonValue | undefined {
@@ -510,6 +644,24 @@ export class TasksService {
       const newlyCompleted = [...new Set(completedUsernames)].filter(username => !existing.includes(username));
       payload.excludeUsernames = [...new Set([...existing, ...completedUsernames])];
       payload.resumeCompletedCount = priorCompleted + newlyCompleted.length;
+    }
+    if (completedVideoUrls.length > 0 && ['REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS'].includes(task.action)) {
+      const existingCounts = payload.completedCountsByVideo && typeof payload.completedCountsByVideo === 'object' && !Array.isArray(payload.completedCountsByVideo)
+        ? payload.completedCountsByVideo as Record<string, unknown>
+        : {};
+      const reportedCounts = completedVideoUrls.reduce<Record<string, number>>((counts, videoUrl) => {
+        counts[videoUrl] = (counts[videoUrl] ?? 0) + 1;
+        return counts;
+      }, {});
+      const completedCountsByVideo: Record<string, number> = {};
+      for (const videoUrl of new Set([...Object.keys(existingCounts), ...Object.keys(reportedCounts)])) {
+        const existing = typeof existingCounts[videoUrl] === 'number' && Number.isFinite(existingCounts[videoUrl])
+          ? Math.max(0, Math.floor(existingCounts[videoUrl] as number))
+          : 0;
+        completedCountsByVideo[videoUrl] = Math.max(existing, reportedCounts[videoUrl] ?? 0);
+      }
+      payload.completedCountsByVideo = completedCountsByVideo;
+      payload.resumeCompletedCount = Object.values(completedCountsByVideo).reduce((total, count) => total + count, 0);
     }
     return payload as Prisma.InputJsonValue;
   }

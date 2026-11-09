@@ -42,6 +42,9 @@ export class ProxiesService {
 
   async create(organizationId: string, input: CreateProxyDto) {
     validateCredentials(input);
+    if (input.accountIds?.length) {
+      throw new ConflictException('Kiểm tra proxy thành công trước khi gán profile');
+    }
     await this.validateAccounts(organizationId, input.accountIds);
     await this.ensureNoActiveBindings(undefined, input.accountIds);
     const credentialsRef =
@@ -105,6 +108,9 @@ export class ProxiesService {
       input.port !== undefined ||
       replaceCredentials ||
       Boolean(input.clearAuthentication);
+    if (accountIds?.length && (connectionChanged || !isUsableProxy(proxy))) {
+      throw new ConflictException('Kiểm tra proxy thành công trước khi gán profile');
+    }
 
     await this.prisma.$transaction(async (transaction) => {
       await transaction.proxy.update({
@@ -118,11 +124,13 @@ export class ProxiesService {
             ? { credentialsRef }
             : {}),
           ...(connectionChanged
-            ? { status: 'CREATED', latencyMs: null, lastCheckedAt: null }
+            ? { status: 'CREATED', latencyMs: null, lastCheckedAt: null, locale: null, languages: [], timezoneId: null }
             : {}),
         },
       });
-      if (accountIds !== undefined) {
+      if (connectionChanged) {
+        await transaction.accountProxyBinding.deleteMany({ where: { proxyId: id } });
+      } else if (accountIds !== undefined) {
         await transaction.accountProxyBinding.deleteMany({
           where: {
             proxyId: id,
@@ -165,12 +173,24 @@ export class ProxiesService {
       }
       const result = await this.temporal.checkProxy({ organizationId, proxyId: proxy.id });
       if (!result.ok) throw new Error(result.error ?? 'Proxy test failed');
+      if (!result.locale || !result.languages?.length || !result.timezoneId) {
+        throw new Error('Proxy test did not return a valid locale environment');
+      }
+      Intl.getCanonicalLocales(result.locale);
+      for (const language of result.languages) Intl.getCanonicalLocales(language);
+      new Intl.DateTimeFormat('en-US', { timeZone: result.timezoneId });
       const latencyMs = result.latencyMs ?? Date.now() - startedAt;
       await this.prisma.proxy.update({
         where: { id: proxy.id },
-        data: { status: 'HEALTHY', latencyMs, lastCheckedAt: new Date() },
+        data: {
+          status: 'HEALTHY', latencyMs, lastCheckedAt: new Date(),
+          locale: result.locale, languages: result.languages, timezoneId: result.timezoneId,
+        },
       });
-      return { ok: true, check: result.check, latencyMs };
+      return {
+        ok: true, check: result.check, latencyMs,
+        locale: result.locale, languages: result.languages, timezoneId: result.timezoneId,
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.prisma.proxy.update({
@@ -179,6 +199,9 @@ export class ProxiesService {
           status: 'UNHEALTHY',
           latencyMs: null,
           lastCheckedAt: new Date(),
+          locale: null,
+          languages: [],
+          timezoneId: null,
         },
       });
       return { ok: false, check: 'playwright_navigation', error: proxyErrorMessage(message) };
@@ -211,8 +234,8 @@ export class ProxiesService {
     if (account.browserProfile?.sessions.length) {
       throw new ConflictException('Cannot change proxy during an active session');
     }
-    if (proxy.status === 'DISABLED') {
-      throw new ConflictException('Cannot assign a disabled proxy');
+    if (!isUsableProxy(proxy)) {
+      throw new ConflictException('Kiểm tra proxy thành công trước khi gán profile');
     }
     const binding = await this.prisma.accountProxyBinding.upsert({
       where: { accountId },
@@ -337,6 +360,18 @@ export class ProxiesService {
       );
     }
   }
+}
+
+export function isUsableProxy(proxy: {
+  status: string;
+  locale?: string | null;
+  languages?: string[];
+  timezoneId?: string | null;
+}): boolean {
+  return proxy.status === 'HEALTHY'
+    && Boolean(proxy.locale)
+    && Boolean(proxy.languages?.length)
+    && Boolean(proxy.timezoneId);
 }
 
 function validateCredentials(input: {

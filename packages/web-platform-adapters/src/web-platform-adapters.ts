@@ -109,7 +109,7 @@ export class TikTokAdapter extends WebPlatformAdapter {
 
   protected readonly definition: AdapterDefinition = {
     platform: this.platform,
-    homeUrl: 'https://www.tiktok.com/',
+    homeUrl: 'https://www.tiktok.com/en',
     fallbackUrl: 'https://www.tiktok.com/login',
     loginUrlFragments: ['/login', '/passport/'],
     loginSelectors: ['a[href*="/login"]', 'button[data-e2e*="login"]'],
@@ -122,8 +122,8 @@ export class TikTokAdapter extends WebPlatformAdapter {
     if (action.action === 'HEALTH_CHECK' || action.action === 'GET_PROFILE') {
       return super.execute(action, session);
     }
-    // TikTok owns the first route transition: always start at its ordinary
-    // root and use commit so a client-side redirect is not mistaken for a
+    // TikTok owns the first route transition: always start at /en (falling
+    // back to /vi-VN/) and use commit so a client-side redirect is not mistaken for a
     // failed navigation. The action itself decides which surface to open
     // next (search, For You, profile, or video).
     await enterTikTokRoot(session.page, session.platformHomeUrl);
@@ -169,12 +169,12 @@ export class TikTokAdapter extends WebPlatformAdapter {
       case 'AUTO_COMMENT_TIKTOK_HOME':
         {
           const data = await autoCommentTikTokHome(session, action.payload, this.options.captchaSolver);
-          return { ok: typeof data.sent === 'number' && data.sent > 0, data };
+          return { ok: isTikTokCampaignComplete(data, 'sent'), data };
         }
       case 'COMMENT_TIKTOK_VIDEOS':
         {
           const data = await commentTikTokVideos(session, action.payload, this.options.captchaSolver);
-          return { ok: typeof data.sent === 'number' && data.sent > 0, data };
+          return { ok: isTikTokCampaignComplete(data, 'sent'), data };
         }
       case 'REPLY_TIKTOK_COMMENTS':
         {
@@ -183,7 +183,7 @@ export class TikTokAdapter extends WebPlatformAdapter {
           // sent. Returning success for a partial run made the UI show
           // "Hoàn tất" while still carrying a failure reason from a later
           // video, which was misleading and unsafe to retry blindly.
-          return { ok: typeof data.sent === 'number' && typeof data.requested === 'number' && data.sent >= data.requested, data };
+          return { ok: isTikTokCampaignComplete(data, 'sent'), data };
         }
       case 'LIKE_TIKTOK_COMMENTS':
         {
@@ -191,12 +191,12 @@ export class TikTokAdapter extends WebPlatformAdapter {
           // A video navigation without opening the comment drawer used to
           // return a successful task with zero likes. Treat that as a failed
           // action so the report/manual retry path is visible to the user.
-          return { ok: typeof data.liked === 'number' && data.liked > 0, data };
+          return { ok: isTikTokCampaignComplete(data, 'liked'), data };
         }
       case 'MESSAGE_TIKTOK_FOLLOWERS':
         {
           const data = await messageTikTokFollowers(session, action.payload, this.options.captchaSolver);
-          return { ok: typeof data.sent === 'number' && data.sent > 0, data };
+          return { ok: isTikTokCampaignComplete(data, 'sent'), data };
         }
       default:
         throw new UnsupportedPlatformActionError(this.platform, action.action);
@@ -224,4 +224,18 @@ export class TikTokAdapter extends WebPlatformAdapter {
       },
     };
   }
+}
+
+export function isTikTokCampaignComplete(data: Record<string, unknown>, completedField: 'sent' | 'liked'): boolean {
+  const completed = typeof data.totalSent === 'number'
+    ? data.totalSent
+    : typeof data[completedField] === 'number'
+      ? data[completedField]
+      : undefined;
+  const requested = typeof data.totalRequested === 'number'
+    ? data.totalRequested
+    : typeof data.requested === 'number'
+      ? data.requested
+      : undefined;
+  return completed != null && requested != null && requested > 0 && completed >= requested;
 }

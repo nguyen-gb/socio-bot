@@ -21,6 +21,8 @@ import { TemporalModule } from './temporal/temporal.module';
 import { SchedulesModule } from './schedules/schedules.module';
 import { CredentialsModule } from './credentials/credentials.module';
 import { FacebookModule } from './facebook/facebook.module';
+import { UsersModule } from './users/users.module';
+import { AuditModule } from './audit/audit.module';
 
 @Module({
   imports: [
@@ -52,6 +54,8 @@ import { FacebookModule } from './facebook/facebook.module';
     TasksModule,
     SchedulesModule,
     FacebookModule,
+    UsersModule,
+    AuditModule,
   ],
   providers: [
     {

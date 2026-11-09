@@ -15,6 +15,7 @@ interface LoginSession {
   status: string;
   expiresAt: string;
   accessUrl: string | null;
+  accessProtocol: string | null;
   accessExpiresAt: string | null;
   lastError?: string | null;
 }
@@ -48,6 +49,7 @@ export default function LoginSessionPage() {
   const router = useRouter();
   const socketRef = useRef<WebSocket | null>(null);
   const latestAccessUrl = useRef<string | null>(null);
+  const latestAccessProtocol = useRef<string | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -91,6 +93,7 @@ export default function LoginSessionPage() {
   });
 
   latestAccessUrl.current = session.data?.accessUrl ?? null;
+  latestAccessProtocol.current = session.data?.accessProtocol ?? null;
   const terminal = ['AUTHENTICATED', 'CLOSED', 'EXPIRED', 'CRASHED'].includes(session.data?.status ?? '');
   const stopping = closeRequested || closing || session.data?.status === 'CLOSING';
   useEffect(() => {
@@ -98,7 +101,7 @@ export default function LoginSessionPage() {
   }, [terminal, stopping, toast]);
   useToastNotice(session.error?.message ?? session.data?.lastError, 'browser-session-error', 'error', !session.isFetching);
   useToastNotice(terminal ? 'Phiên browser đã kết thúc. Bạn có thể mở phiên mới từ Profiles.' : undefined, 'browser-session-ended', 'info');
-  const canConnect = Boolean(session.data?.accessUrl) && !terminal && !stopping;
+  const canConnect = Boolean(session.data?.accessUrl && session.data?.accessProtocol) && !terminal && !stopping;
   useToastNotice(!terminal && !stopping && ['error', 'disconnected'].includes(connection)
     ? 'Mất kết nối màn hình browser. Hệ thống sẽ thử kết nối lại.' : undefined,
     'browser-connection-error', 'error', terminal || stopping || connection === 'connected');
@@ -106,10 +109,11 @@ export default function LoginSessionPage() {
   useEffect(() => {
     if (!canConnect) return;
     const accessUrl = latestAccessUrl.current;
-    if (!accessUrl) return;
+    const accessProtocol = latestAccessProtocol.current;
+    if (!accessUrl || !accessProtocol) return;
 
     let disposed = false;
-    const socket = new WebSocket(accessUrl);
+    const socket = new WebSocket(accessUrl, accessProtocol);
     socketRef.current = socket;
     setConnection('connecting');
     socket.onopen = () => { if (!disposed && !closeRequestedRef.current) setConnection('connected'); };

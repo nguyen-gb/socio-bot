@@ -20,6 +20,24 @@ export const refreshTokenSchema = z.object({
 });
 export type RefreshTokenInput = z.infer<typeof refreshTokenSchema>;
 
+export const manageableOrganizationRoleSchema = z.enum(['ADMIN', 'OPERATOR', 'VIEWER']);
+
+export const createUserSchema = z.object({
+  email: z.email().transform((value) => value.trim().toLowerCase()),
+  displayName: z.string().trim().min(1).max(120).optional(),
+  password: z.string().min(12).max(256),
+  role: manageableOrganizationRoleSchema.default('OPERATOR'),
+});
+export type CreateUserInput = z.infer<typeof createUserSchema>;
+
+export const updateUserSchema = z.object({
+  displayName: z.string().trim().min(1).max(120).nullable().optional(),
+  password: z.string().min(12).max(256).optional(),
+  role: manageableOrganizationRoleSchema.optional(),
+  status: z.enum(['ACTIVE', 'DISABLED']).optional(),
+}).refine((value) => Object.keys(value).length > 0, 'Provide at least one change');
+export type UpdateUserInput = z.infer<typeof updateUserSchema>;
+
 export interface AuthTokenResponse {
   accessToken: string;
   accessTokenExpiresAt: string;

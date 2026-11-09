@@ -8,6 +8,47 @@ import { BrowserRuntime } from './browser-runtime';
 import { LocalObjectStorage, ProfileSnapshotStore } from '@socio/object-storage';
 import { BrowserProcessRegistry } from './browser-process';
 import { fingerprintLaunchOptions, loadFingerprintEmulation } from './fingerprint-emulation';
+import { localeForCountry, parseIpLocationResponse, resolveBrowserLocale } from './ip-locale';
+
+test('IP locale follows the proxy country and exact IANA timezone', async () => {
+  assert.deepEqual(parseIpLocationResponse({
+    success: true,
+    data: { countryCode: 'DE', timezone: { time_zone: 'Europe/Berlin' } },
+  }), { countryCode: 'DE', timezoneId: 'Europe/Berlin' });
+  const proxy = { server: 'http://proxy.example:8080', username: 'user', password: 'secret' };
+  const resolved = await resolveBrowserLocale(proxy, {
+    locale: 'vi-VN',
+    timezoneId: 'Asia/Ho_Chi_Minh',
+  }, async (receivedProxy) => {
+    assert.equal(receivedProxy, proxy);
+    return { countryCode: 'DE', timezoneId: 'Europe/Berlin' };
+  });
+  assert.deepEqual(resolved, {
+    locale: 'de-DE',
+    languages: ['de-DE', 'de'],
+    timezoneId: 'Europe/Berlin',
+    source: 'proxy-ip',
+  });
+  assert.equal(localeForCountry('VN'), 'vi-VN');
+});
+
+test('IP locale uses worker defaults without proxy and on lookup failure', async () => {
+  let lookups = 0;
+  const defaults = { locale: 'th-TH', timezoneId: 'Asia/Bangkok' };
+  const direct = await resolveBrowserLocale(undefined, defaults, async () => {
+    lookups += 1;
+    throw new Error('must not run');
+  });
+  assert.equal(lookups, 0);
+  assert.deepEqual(direct, {
+    locale: 'th-TH', languages: ['th-TH', 'th'], timezoneId: 'Asia/Bangkok', source: 'default',
+  });
+
+  const fallback = await resolveBrowserLocale({ server: 'http://proxy.example:8080' }, defaults, async () => {
+    throw new Error('provider unavailable');
+  });
+  assert.deepEqual(fallback, direct);
+});
 
 test('fingerprint bundle is complete, coherent and stable for each profile', async () => {
   const root = await mkdtemp(join(tmpdir(), 'socio-fingerprint-'));
@@ -35,9 +76,15 @@ test('fingerprint bundle is complete, coherent and stable for each profile', asy
     assert.notEqual(second.seed, first.seed, 'Profiles must have independent bundles');
     assert.equal(first.locale, 'vi-VN');
     assert.deepEqual(first.languages, ['vi-VN', 'vi']);
-    assert.deepEqual(first.features, { canvas: true, webgl: true, gpu: true, userAgent: false, clientHints: false });
+    assert.deepEqual(first.features, { canvas: false, webgl: true, gpu: false, userAgent: true, clientHints: true });
     assert.equal(first.timezoneId, 'Asia/Ho_Chi_Minh');
-    assert.deepEqual(first.viewport, { width: 1536, height: 864 });
+    assert.ok(first.desktop);
+    assert.equal(first.desktop.schema, 2);
+    assert.deepEqual(first.desktop.coverage.applied, ['navigator', 'userAgentData', 'screen', 'window', 'intl', 'webgl', 'codecs', 'battery']);
+    assert.ok(first.desktop.coverage.native.includes('history'));
+    assert.ok(first.desktop.coverage.native.includes('sharedArrayBuffer'));
+    assert.ok(first.viewport.width <= first.desktop.bundle.fingerprint.screen.width);
+    assert.equal(first.desktop.bundle.fingerprint.navigator.userAgent, first.userAgent);
     assert.match(first.userAgent, /Chrome\/\d+\.0\.0\.0/);
     assert.equal(first.clientHints.platform, process.platform === 'win32' ? 'Windows' : 'Linux');
     assert.equal(first.clientHints.brands.find(brand => brand.brand === 'Google Chrome')?.version,
@@ -80,6 +127,27 @@ test('language fallback follows the selected locale without synthetic English', 
   }
 });
 
+test('auto locale is the source of truth for languages and timezone', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-locale-source-'));
+  try {
+    const profile = join(root, 'profile');
+    await mkdir(profile, { recursive: true });
+    const config = await loadFingerprintEmulation(profile, {
+      locale: 'en-US',
+      timezoneId: 'UTC',
+    }, {
+      mode: 'auto',
+      locale: 'en-US',
+      languages: ['de-DE'],
+      timezoneId: 'Europe/Berlin',
+    });
+    assert.deepEqual(config.languages, ['en-US', 'en']);
+    assert.ok(['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'].includes(config.timezoneId));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('auto profile settings keep a desktop bundle and refresh Chrome version fields', async () => {
   const root = await mkdtemp(join(tmpdir(), 'socio-auto-profile-'));
   const profile = join(root, 'profile');
@@ -95,21 +163,21 @@ test('auto profile settings keep a desktop bundle and refresh Chrome version fie
       timezoneId: 'Asia/Ho_Chi_Minh',
     });
     assert.equal(first.clientHints.mobile, false);
-    assert.equal(first.features.canvas, true);
+    assert.equal(first.features.canvas, false);
     assert.equal(first.features.webgl, true);
-    assert.equal(first.features.gpu, true);
-    assert.equal(first.features.userAgent, false);
-    assert.equal(first.features.clientHints, false);
+    assert.equal(first.features.gpu, false);
+    assert.equal(first.features.userAgent, true);
+    assert.equal(first.features.clientHints, true);
     assert.ok(first.viewport.width >= 1_000);
-    assert.ok(first.viewport.height >= 700);
+    assert.ok(first.viewport.height >= 600);
 
     const stale = {
       ...first,
       userAgent: first.userAgent.replace(/Chrome\/\d+\.0\.0\.0/, 'Chrome/1.0.0.0'),
       clientHints: {
         ...first.clientHints,
-        brands: first.clientHints.brands.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24' : '1' })),
-        fullVersionList: first.clientHints.fullVersionList.map((brand) => ({ ...brand, version: brand.brand === 'Not_A Brand' ? '24.0.0.0' : '1.0.0.0' })),
+        brands: first.clientHints.brands.map((brand) => ({ ...brand, version: brand.brand === 'Not:A-Brand' ? '8' : '1' })),
+        fullVersionList: first.clientHints.fullVersionList.map((brand) => ({ ...brand, version: brand.brand === 'Not:A-Brand' ? '8.0.0.0' : '1.0.0.0' })),
         uaFullVersion: '1.0.0.0',
       },
     };
@@ -123,9 +191,11 @@ test('auto profile settings keep a desktop bundle and refresh Chrome version fie
       languages: ['vi-VN', 'vi'],
       timezoneId: 'Asia/Ho_Chi_Minh',
     });
-    const major = /Chrome\/(\d+)\.0\.0\.0/.exec(refreshed.userAgent)?.[1];
+    const major = /Chrome\/(\d+)\./.exec(refreshed.userAgent)?.[1];
     assert.ok(major && major !== '1');
-    assert.equal(refreshed.clientHints.uaFullVersion, `${major}.0.0.0`);
+    assert.match(refreshed.clientHints.uaFullVersion, /^\d+\.\d+\.\d+\.\d+$/);
+    assert.equal(refreshed.clientHints.fullVersionList.find(brand => brand.brand === 'Google Chrome')?.version,
+      refreshed.clientHints.uaFullVersion);
     assert.equal(refreshed.clientHints.mobile, false);
     assert.deepEqual(refreshed.viewport, first.viewport);
     assert.deepEqual(refreshed.gpu, first.gpu);
@@ -151,11 +221,227 @@ test('native profile settings do not override locale or mobile surfaces', async 
     });
     const options = fingerprintLaunchOptions(native);
     assert.equal(native.localeMode, 'native');
-    assert.equal('locale' in options, false);
-    assert.equal('timezoneId' in options, false);
+    assert.equal(options.locale, undefined);
+    assert.equal(options.timezoneId, undefined);
+    assert.equal('viewport' in options, false);
+    assert.equal('deviceScaleFactor' in options, false);
     assert.equal(options.isMobile, false);
     assert.equal(options.hasTouch, false);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('browser applies the locale environment already saved by a tested proxy', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-proxy-locale-'));
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 19));
+  try {
+    const session = await runtime.openProfile({
+      profileId: 'proxy-locale',
+      headless: true,
+      emulateFingerprint: true,
+      fingerprint: {
+        mode: 'auto', localeMode: 'auto', locale: 'vi-VN',
+        languages: ['vi-VN', 'vi'], timezoneId: 'Asia/Ho_Chi_Minh',
+      },
+      localeEnvironment: {
+        locale: 'de-DE', languages: ['de-DE', 'de'], timezoneId: 'Europe/Berlin', source: 'proxy-ip',
+      },
+    });
+    assert.equal(session.locale, 'de-DE');
+    assert.equal(session.timezoneId, 'Europe/Berlin');
+    assert.deepEqual(await session.page.evaluate(() => ({
+      language: navigator.language,
+      languages: [...navigator.languages],
+      timezoneId: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    })), {
+      language: 'de-DE', languages: ['de-DE', 'de'], timezoneId: 'Europe/Berlin',
+    });
+    const saved = JSON.parse(await readFile(join(root, 'proxy-locale', 'fingerprint-emulation.json'), 'utf8'));
+    assert.equal(saved.localeMode, 'configured');
+    assert.equal(saved.locale, 'de-DE');
+    assert.equal(saved.timezoneId, 'Europe/Berlin');
+    await session.close();
+  } finally {
+    await runtime.closeAll();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('auto migrates legacy rendering overrides and persists the effective settings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-fingerprint-migration-'));
+  try {
+    const initial = await loadFingerprintEmulation(root, {});
+    const legacy = { ...initial, mode: undefined, desktop: undefined, features: { canvas: true, webgl: true, gpu: true, userAgent: true, clientHints: true } };
+    await writeFile(join(root, 'fingerprint-emulation.json'), JSON.stringify(legacy));
+    const migrated = await loadFingerprintEmulation(root, {}, { mode: 'auto', localeMode: 'native' });
+    assert.equal(migrated.seed, initial.seed);
+    assert.equal(migrated.mode, 'auto');
+    assert.ok(migrated.desktop);
+    assert.equal(migrated.features.userAgent, true);
+    assert.equal(migrated.features.webgl, true);
+    assert.deepEqual(JSON.parse(await readFile(join(root, 'fingerprint-emulation.json'), 'utf8')), migrated);
+    assert.deepEqual(await loadFingerprintEmulation(root, {}), migrated);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('auto upgrades a saved Apify schema without resampling its device', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-fingerprint-schema-'));
+  try {
+    const initial = await loadFingerprintEmulation(root, {}, { mode: 'auto' });
+    const legacy = { ...initial, desktop: { ...initial.desktop, schema: 1, coverage: undefined } };
+    await writeFile(join(root, 'fingerprint-emulation.json'), JSON.stringify(legacy));
+    const upgraded = await loadFingerprintEmulation(root, {}, { mode: 'auto' });
+    assert.equal(upgraded.desktop?.schema, 2);
+    assert.equal(upgraded.desktop?.bundle.fingerprint.videoCard.renderer,
+      initial.desktop?.bundle.fingerprint.videoCard.renderer);
+    assert.equal(upgraded.desktop?.bundle.fingerprint.navigator.hardwareConcurrency,
+      initial.desktop?.bundle.fingerprint.navigator.hardwareConcurrency);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('auto injects its generated device across tabs and frames while preserving navigation and CSP', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'socio-native-navigation-'));
+  const runtime = new BrowserRuntime(root, 1, Buffer.alloc(32, 7));
+  const requests: string[] = [];
+  const requestHeaders: Array<Record<string, string | string[] | undefined>> = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? '');
+    requestHeaders.push(request.headers);
+    if (request.url === '/redirect') {
+      response.writeHead(302, { location: '/final' });
+      response.end();
+      return;
+    }
+    if (request.url === '/probe') {
+      response.writeHead(200, { 'content-type': 'text/html', 'content-security-policy': "script-src 'nonce-probe'" });
+      response.end(`<script nonce="probe">document.documentElement.dataset.device=JSON.stringify({cpu:navigator.hardwareConcurrency,memory:navigator.deviceMemory,width:screen.width,ua:navigator.userAgent})</script>`);
+      return;
+    }
+    if (request.url === '/isolated') {
+      response.writeHead(200, {
+        'content-type': 'text/html',
+        'cross-origin-opener-policy': 'same-origin',
+        'cross-origin-embedder-policy': 'require-corp',
+      });
+      response.end('<!doctype html><title>isolated</title>');
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'text/html', 'content-security-policy': "script-src 'none'" });
+    response.end('<!doctype html><title>native</title><script>document.title="CSP bypassed"</script>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const session = await runtime.openProfile({
+      profileId: 'auto', headless: true, emulateFingerprint: true,
+      fingerprint: { mode: 'auto', localeMode: 'native' },
+    });
+    await session.page.goto(`http://127.0.0.1:${address.port}/redirect`);
+    assert.ok(session.page.url().endsWith('/final'), 'Browser must own the redirect chain');
+    assert.equal(await session.page.title(), 'native', 'Inline scripts must remain blocked by CSP');
+    const page = session.page as unknown as {
+      evaluate<R>(fn: () => R, arg: undefined, options: undefined, isolatedContext: false): Promise<R>;
+    };
+    const observed = await page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d')!;
+      context.fillStyle = 'rgb(10, 20, 30)';
+      context.fillRect(0, 0, 1, 1);
+      const gl = document.createElement('canvas').getContext('webgl');
+      gl?.getExtension('WEBGL_debug_renderer_info');
+      return {
+        pixel: [...context.getImageData(0, 0, 1, 1).data],
+        native: CanvasRenderingContext2D.prototype.getImageData.toString().includes('[native code]'),
+        scripts: document.scripts.length,
+        cpu: navigator.hardwareConcurrency,
+        memory: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
+        width: screen.width,
+        viewportWidth: innerWidth,
+        cssWidth: matchMedia(`(width: ${innerWidth}px)`).matches,
+        ua: navigator.userAgent,
+        gpu: gl?.getParameter(0x9246),
+      };
+    }, undefined, undefined, false);
+    assert.deepEqual(observed.pixel, [10, 20, 30, 255]);
+    assert.equal(observed.native, true);
+    assert.equal(observed.scripts, 1, 'No fingerprint script is inserted into HTML');
+    const saved = JSON.parse(await readFile(join(root, 'auto', 'fingerprint-emulation.json'), 'utf8'));
+    const device = saved.desktop.bundle.fingerprint;
+    assert.equal(observed.cpu, device.navigator.hardwareConcurrency);
+    assert.equal(observed.memory, device.navigator.deviceMemory);
+    assert.equal(observed.width, device.screen.width);
+    assert.equal(observed.viewportWidth, saved.viewport.width);
+    assert.equal(observed.cssWidth, true);
+    assert.equal(observed.ua, saved.userAgent);
+    if (observed.gpu) assert.equal(observed.gpu, device.videoCard.renderer);
+    assert.equal(requestHeaders[0]?.['user-agent'], saved.userAgent);
+    assert.equal(requestHeaders[0]?.['sec-ch-ua-platform'], `"${saved.clientHints.platform}"`);
+    const secondPage = await session.context.newPage();
+    await secondPage.goto(`http://127.0.0.1:${address.port}/second`);
+    const second = secondPage as unknown as typeof page;
+    assert.equal(await second.evaluate(() => navigator.hardwareConcurrency, undefined, undefined, false), device.navigator.hardwareConcurrency);
+    await secondPage.goto(`http://127.0.0.1:${address.port}/probe`);
+    const expectedProbe = { cpu: device.navigator.hardwareConcurrency, memory: device.navigator.deviceMemory, width: device.screen.width, ua: saved.userAgent };
+    const probe = async (target: typeof page) => JSON.parse(await target.evaluate(() => document.documentElement.dataset.device!, undefined, undefined, false));
+    assert.deepEqual(await probe(second), expectedProbe, 'The first site script must see the generated device');
+    await secondPage.evaluate((port) => {
+      const frame = document.createElement('iframe');
+      frame.src = `http://localhost:${port}/probe`;
+      document.body.append(frame);
+    }, address.port);
+    await secondPage.frameLocator('iframe').locator('html[data-device]').waitFor();
+    const frame = secondPage.frames().find(value => value.url().includes('localhost'))!;
+    assert.deepEqual(await probe(frame as unknown as typeof page), expectedProbe, 'Cross-origin frame must see the same device');
+    await session.close();
+    const reopened = await runtime.openProfile({ profileId: 'auto', headless: true, emulateFingerprint: true, fingerprint: { mode: 'auto', localeMode: 'native' } });
+    await reopened.page.goto(`http://127.0.0.1:${address.port}/probe`);
+    assert.deepEqual(await probe(reopened.page as unknown as typeof page), expectedProbe, 'Reopening must reuse the device');
+    const supported = await (reopened.page as unknown as typeof page).evaluate(async () => {
+      const before = history.length;
+      history.pushState({}, '', '#safe-history');
+      const audio = document.createElement('audio');
+      const video = document.createElement('video');
+      const battery = await (navigator as Navigator & { getBattery?: () => Promise<Record<string, unknown>> }).getBattery?.();
+      const uaData = (navigator as Navigator & { userAgentData?: { getHighEntropyValues(values: string[]): Promise<Record<string, unknown>> } }).userAgentData;
+      return {
+        historyChanged: history.length === before + 1,
+        mp3: audio.canPlayType('audio/mpeg'),
+        h264: video.canPlayType('video/mp4; codecs="avc1.42E01E"'),
+        battery: battery ? { charging: battery.charging, level: battery.level } : undefined,
+        hints: await uaData?.getHighEntropyValues(['architecture', 'bitness', 'platformVersion', 'uaFullVersion']),
+        plugins: navigator.plugins.length,
+      };
+    }, undefined, undefined, false);
+    assert.equal(supported.historyChanged, true, 'History must retain native navigation behavior');
+    assert.equal(supported.mp3, device.audioCodecs.mp3);
+    assert.equal(supported.h264, device.videoCodecs.h264);
+    if (supported.battery && device.battery) {
+      assert.equal(supported.battery.charging, device.battery.charging);
+      assert.equal(supported.battery.level, device.battery.level);
+    }
+    assert.equal(supported.hints?.architecture, saved.clientHints.architecture);
+    assert.equal(supported.hints?.bitness, saved.clientHints.bitness);
+    assert.equal(supported.hints?.platformVersion, saved.clientHints.platformVersion);
+    assert.equal(supported.hints?.uaFullVersion, saved.clientHints.uaFullVersion);
+    assert.ok(supported.plugins > 0, 'Chrome-native PDF plugins remain available');
+    await reopened.page.goto(`http://127.0.0.1:${address.port}/isolated`);
+    const isolated = await (reopened.page as unknown as typeof page).evaluate(() => ({
+      isolated: crossOriginIsolated,
+      sharedArrayBuffer: typeof SharedArrayBuffer,
+    }), undefined, undefined, false);
+    assert.deepEqual(isolated, { isolated: true, sharedArrayBuffer: 'function' },
+      'Apify must not hide SharedArrayBuffer when stock Chrome exposes it');
+    assert.equal(requests.filter(url => url === '/redirect').length, 1);
+    assert.equal(requests.filter(url => url === '/final').length, 1);
+  } finally {
+    await runtime.closeAll();
+    await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -228,7 +514,7 @@ test('Patchright applies the saved fingerprint bundle before page scripts run', 
     });
     assert.equal(observed.userAgent, config.userAgent);
     assert.equal(observed.language, config.locale);
-    assert.equal(observed.timezoneId, config.timezoneId);
+    assert.equal(observed.timezoneId, new Intl.DateTimeFormat('en-US', { timeZone: config.timezoneId }).resolvedOptions().timeZone);
     assert.deepEqual(observed.viewport, config.viewport);
     assert.equal(observed.dark, true);
     assert.deepEqual(observed.brands, config.clientHints.brands);

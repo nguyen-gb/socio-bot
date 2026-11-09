@@ -1,4 +1,4 @@
-import type { FingerprintEmulationOverrides, ManagedBrowserSession } from '@socio/browser-runtime';
+import type { BrowserLocaleEnvironment, FingerprintEmulationOverrides, ManagedBrowserSession } from '@socio/browser-runtime';
 import { clickPlatformReloadButton, gotoPlatformPage, waitForPlatformPageReady } from '@socio/platform-core';
 import type { BrowserContext } from 'playwright';
 import type { ProfileCredentials } from '../secrets/secrets.service';
@@ -13,7 +13,7 @@ export const PLATFORM_LOGIN = {
   // the check so a restored Chrome profile is not mistaken for an anonymous
   // session just because it does not contain the legacy pair.
   TIKTOK: {
-    home: 'https://www.tiktok.com/',
+    home: 'https://www.tiktok.com/en',
     login: 'https://www.tiktok.com/login',
     authCookies: ['sessionid', 'sessionid_ss', 'sid_tt', 'sid_tt_ss', 'sid_guard', 'uid_tt', 'uid_tt_ss'],
   },
@@ -58,9 +58,34 @@ export function profileLoginSettings(value: unknown): { credentialsRef?: string 
 export function profileFingerprintSettings(value: unknown): FingerprintEmulationOverrides | undefined {
   const metadata = asRecord(value);
   const fingerprint = metadata.fingerprint;
-  return fingerprint && typeof fingerprint === 'object' && !Array.isArray(fingerprint)
-    ? fingerprint as FingerprintEmulationOverrides
-    : undefined;
+  if (!fingerprint || typeof fingerprint !== 'object' || Array.isArray(fingerprint)) return undefined;
+  // Locale selection was removed from the product. Normalize older
+  // configured/native records at read time so existing profiles immediately
+  // follow their proxy IP without requiring an edit or database migration.
+  return { ...(fingerprint as FingerprintEmulationOverrides), localeMode: 'auto' };
+}
+
+export function proxyLocaleEnvironment(value: unknown): BrowserLocaleEnvironment | undefined {
+  if (!value) return undefined;
+  const proxy = asRecord(value);
+  const languages = Array.isArray(proxy.languages)
+    ? proxy.languages.filter((item): item is string => typeof item === 'string' && item.length > 0)
+    : [];
+  if (proxy.status !== 'HEALTHY'
+    || typeof proxy.locale !== 'string'
+    || typeof proxy.timezoneId !== 'string'
+    || languages.length === 0) {
+    throw new Error('Proxy chưa có locale/languages/timezone hợp lệ. Hãy kiểm tra lại proxy.');
+  }
+  Intl.getCanonicalLocales(proxy.locale);
+  for (const language of languages) Intl.getCanonicalLocales(language);
+  new Intl.DateTimeFormat('en-US', { timeZone: proxy.timezoneId });
+  return {
+    locale: proxy.locale,
+    languages,
+    timezoneId: proxy.timezoneId,
+    source: 'proxy-ip',
+  };
 }
 
 function languageCode(locale?: string): string {
@@ -69,15 +94,16 @@ function languageCode(locale?: string): string {
 
 function tiktokLocalePath(locale?: string): string {
   const language = languageCode(locale);
-  // TikTok uses the country-style segment `vn` for Vietnamese while keeping
-  // the ISO language segment for English and most other locales.
-  return language === 'vi' ? 'vn' : language;
+  return language === 'vi' ? 'vi-VN' : language;
 }
 
 export function platformHomeUrl(platform: SupportedPlatform, locale?: string): string {
   if (!locale) return PLATFORM_LOGIN[platform].home;
   const language = languageCode(locale);
-  if (platform === 'TIKTOK') return `https://www.tiktok.com/${tiktokLocalePath(locale)}`;
+  if (platform === 'TIKTOK') {
+    const path = tiktokLocalePath(locale);
+    return `https://www.tiktok.com/${path}${path === 'vi-VN' ? '/' : ''}`;
+  }
   if (platform === 'FACEBOOK') {
     const region = locale?.split('-')[1]?.toUpperCase() ?? (language === 'vi' ? 'VN' : 'US');
     return `https://www.facebook.com/?locale=${encodeURIComponent(`${language}_${region}`)}`;
@@ -225,10 +251,8 @@ export async function initializePlatformSession(
   if (!settings) throw new Error(`Unsupported login platform: ${String(platform)}`);
   // TikTok must always get the same cold-start route, including login and
   // follower/profile actions. The requested surface is opened by the action
-  // only after this shared session/bootstrap step completes.
-  // TikTok campaign/login bootstrap always starts from the canonical root.
-  // Locale-specific routes such as /vn are used only for profile metadata/UI,
-  // never as the first navigation because they can hang on cold sessions.
+  // only after this shared session/bootstrap step completes. Bootstrap starts
+  // at /en and uses /vi-VN/ only as its fallback; the bare root is not used.
   const entryUrl = platform === 'TIKTOK'
     ? settings.home
     : options.entryUrl ?? platformHomeUrl(platform, options.locale);
@@ -251,7 +275,11 @@ export async function initializePlatformSession(
     try {
       const cookies = parseCookieInput(credentials.cookies, settings.home);
       await session.context.addCookies(cookies);
-      await gotoPlatformEntryPage(session, platform, entryUrl, fallbackUrl);
+      // TikTok may have reached /vi-VN/ after /en failed. Applying a newer
+      // cookie snapshot must refresh that successful document in place; a
+      // second bootstrap would incorrectly navigate /vi-VN/ back to /en.
+      if (platform === 'TIKTOK') await reloadTikTokEntryPageOnce(session.page);
+      else await gotoPlatformEntryPage(session, platform, entryUrl, fallbackUrl);
       await waitForLoginPage(session, platform);
     } catch { /* A stale/invalid import must not suppress password/manual fallback. */ }
     if (await isPlatformChallenged(session, platform) || await isPlatformAuthenticated(session, platform)) return;
@@ -271,10 +299,10 @@ async function gotoPlatformEntryPage(
   entryUrl: string,
   fallbackUrl?: string,
 ): Promise<void> {
-  // TikTok's root entry can hand the document to its feed route while
+  // TikTok's localized entry can hand the document to its feed route while
   // Chromium is still waiting for DOMContentLoaded. That client-side handoff
   // is reported as ERR_ABORTED at /foryou even though the requested navigation
-  // was the root URL. Use commit for this first navigation and accept the race
+  // was the requested URL. Use commit for this first navigation and accept the race
   // without requiring the resulting document to remain on a particular route;
   // never navigate to /foryou ourselves.
   if (platform === 'TIKTOK') {
@@ -285,37 +313,52 @@ async function gotoPlatformEntryPage(
 }
 
 async function gotoTikTokEntryPage(page: ManagedBrowserSession['page']): Promise<void> {
-  const entryUrls = ['https://www.tiktok.com/', 'https://www.tiktok.com/en'] as const;
+  const entryUrls = ['https://www.tiktok.com/en', 'https://www.tiktok.com/vi-VN/'] as const;
   let lastError: unknown;
   for (const target of entryUrls) {
     try {
-      await page.goto(target, { waitUntil: 'commit', timeout: 45_000 });
-      await waitForPlatformPageReady(page, { settleMs: 600 });
-      if (await hasUnusableTikTokEntryDocument(page)) {
-        // The browser can render a transient 403/chrome-error document even
-        // though the same entry URL succeeds after Chromium's Reload action.
-        // Retry that exact URL once before falling back or reporting failure.
-        await clickPlatformReloadButton(page, { timeoutMs: 45_000 });
-        if (!(await hasUnusableTikTokEntryDocument(page))) return;
-        await page.waitForTimeout?.(350);
-        continue;
+      let navigationError: unknown;
+      try {
+        await page.goto(target, { waitUntil: 'commit', timeout: 45_000 });
+      } catch (error) {
+        navigationError = error;
       }
+
+      // TikTok can replace the localized document with /foryou while Chromium is
+      // still resolving page.goto(). Only that known client-side navigation
+      // race counts as a successful entry; every real /en failure falls
+      // through to /vi-VN/ without navigating to the bare root.
+      if (navigationError) {
+        const message = navigationError instanceof Error ? navigationError.message : String(navigationError);
+        const navigationRace = /ERR_ABORTED|interrupted by another navigation/i.test(message);
+        const navigationTimedOut = /Timeout \d+ms exceeded|Navigation timeout/i.test(message);
+        const httpResponseFailure = /ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message);
+        if (httpResponseFailure) {
+          // Apply the same one-shot browser reload used by profile/video/search
+          // surfaces before abandoning /en for /vi-VN/. Chromium's error page
+          // may temporarily expose chrome-error:// while Ctrl+R still retries
+          // the original requested URL.
+          await reloadTikTokEntryPageOnce(page);
+          if (await hasUnusableTikTokEntryDocument(page)) throw navigationError;
+          return;
+        }
+        // Chromium can finish and display the requested TikTok document while
+        // Playwright is still waiting for the commit notification. Accept that
+        // timeout only when the browser is demonstrably on a usable TikTok
+        // entry; a timeout on about:blank/error still falls through to vi-VN.
+        if ((!navigationRace && !navigationTimedOut) || !isTikTokUsableEntrySurface(page.url())) throw navigationError;
+      }
+
+      await waitForPlatformPageReady(page);
+      if (await hasUnusableTikTokEntryDocument(page)) throw new Error(`TikTok không tải được trang bắt đầu: ${target}`);
+
+      // Required bootstrap sequence: once the selected entry is confirmed as
+      // usable, reload that current document exactly once before campaigns
+      // continue. A failed /en reload may fall back to /vi-VN/.
+      await reloadTikTokEntryPageOnce(page);
       return;
     } catch (error) {
       lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      const navigationRace = /ERR_ABORTED|interrupted by another navigation|chrome-error:\/\/chromewebdata/i.test(message);
-      if (/ERR_HTTP_RESPONSE_CODE_FAILURE|HTTP ERROR 403/i.test(message)) {
-        await clickPlatformReloadButton(page, { timeoutMs: 45_000 });
-        if (!(await hasUnusableTikTokEntryDocument(page))) return;
-      }
-      // A client-side handoff to /foryou is a usable TikTok document even
-      // though Chromium may report the root commit as aborted. Do not replace
-      // that shell with /en; only fall back when the root truly failed.
-      if (navigationRace && isTikTokUsableEntrySurface(page.url())) {
-        await waitForPlatformPageReady(page, { settleMs: 600 });
-        return;
-      }
       await page.waitForTimeout?.(350);
     }
   }
@@ -323,11 +366,42 @@ async function gotoTikTokEntryPage(page: ManagedBrowserSession['page']): Promise
   throw new Error('TikTok không mở được trang bắt đầu');
 }
 
+async function reloadTikTokEntryPageOnce(page: ManagedBrowserSession['page']): Promise<void> {
+  // Prefer the Reload control rendered by Chromium's error document. A
+  // healthy TikTok document has no DOM access to Chrome's toolbar, so use the
+  // browser's cross-platform Ctrl+R command instead of page.reload().
+  if (await clickPlatformReloadButton(page, { timeoutMs: 45_000 })) {
+    if (await hasUnusableTikTokEntryDocument(page)) {
+      throw new Error(`TikTok không tải được sau khi reload: ${page.url()}`);
+    }
+    return;
+  }
+
+  try {
+    await page.keyboard.press('Control+R');
+    // Give Chromium a short window to start replacing the old document. From
+    // this point the current document's readyState is authoritative: it maps
+    // directly to the toolbar spinner changing back to the Reload icon. Do not
+    // require a navigation event, timeOrigin change or marker disappearance;
+    // TikTok/Chromium can preserve those signals even though the visible page
+    // has already completed.
+    await page.waitForTimeout(500);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const navigationRace = /ERR_ABORTED|interrupted by another navigation/i.test(message);
+    if (!navigationRace || !isTikTokUsableEntrySurface(page.url())) throw error;
+  }
+  await waitForPlatformPageReady(page);
+  if (await hasUnusableTikTokEntryDocument(page)) {
+    throw new Error(`TikTok không tải được sau khi reload: ${page.url()}`);
+  }
+}
+
 function isTikTokUsableEntrySurface(value: string): boolean {
   try {
     const url = new URL(value);
     if (url.hostname !== 'www.tiktok.com') return false;
-    return url.pathname === '/' || url.pathname === '/en' || url.pathname === '/en/' || url.pathname === '/foryou' || url.pathname === '/foryou/';
+    return url.pathname === '/en' || url.pathname === '/en/' || url.pathname === '/vi-VN' || url.pathname === '/vi-VN/' || url.pathname === '/foryou' || url.pathname === '/foryou/';
   } catch {
     return false;
   }

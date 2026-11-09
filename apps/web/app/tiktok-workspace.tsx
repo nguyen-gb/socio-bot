@@ -3,15 +3,16 @@
 import { cloneElement, isValidElement, type ReactNode, useEffect, useId, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { App, Button, Card, Dropdown, Empty, Flex, Input, InputNumber, Modal, Select, Space, Table, Tag, Typography } from 'antd';
-import { ActionButton, PageSectionTitle, tablePagination } from './admin-ui';
+import { ActionButton, CampaignDetailOverview, CampaignStartBar, CampaignSummary, PageSectionTitle, tablePagination } from './admin-ui';
 import { Icon } from './ui';
 import { ContextNote as Alert } from './context-note';
 import { useToast, useToastError } from './toast';
+import { CampaignImagePicker } from './facebook-post-images';
 
 interface Account { id: string; username?: string; platform: string; status: string }
-interface MediaAsset { id: string; fileName: string; contentType: string; status: string }
 interface VideoRow { videoUrl: string; videoId?: string; title?: string; username?: string; profileUrl?: string; description?: string; thumbnailUrl?: string; likes?: number; publishedAt?: string; views?: number; comments?: number; statsSource?: 'TIKTOK_VIDEO_STATS' }
 interface TikTokReportEntry {
+  runId?: string;
   action?: string;
   status?: string;
   videoUrl?: string;
@@ -25,8 +26,9 @@ interface TikTokReportEntry {
   reason?: string;
   completedAt?: string;
 }
-interface TikTokPayload { name?: string; query?: string; username?: string; videoUrls?: string[]; text?: string; mediaAssetIds?: string[]; maxVideos?: number; maxFollowers?: number; maxReplies?: number; maxLikes?: number; minLikes?: number; intervalSeconds?: number; excludeVideoUrls?: string[]; excludeUsernames?: string[]; resumeCompletedCount?: number }
-interface TaskItem { id: string; action: string; status: string; approvalStatus?: string; attemptCount?: number; createdAt: string; lastError?: string; pausedAt?: string | null; cancelledAt?: string | null; account: Account; payload?: TikTokPayload; runs?: Array<{ startedAt?: string; result?: unknown }> }
+interface TikTokPayload { name?: string; query?: string; username?: string; videoUrls?: string[]; text?: string; mediaAssetIds?: string[]; maxVideos?: number; maxFollowers?: number; maxReplies?: number; maxLikes?: number; minLikes?: number; intervalSeconds?: number; excludeVideoUrls?: string[]; excludeUsernames?: string[]; resumeCompletedCount?: number; completedCountsByVideo?: Record<string, number> }
+interface TaskItem { id: string; batchId?: string | null; action: string; status: string; approvalStatus?: string; attemptCount?: number; createdAt: string; lastError?: string; pausedAt?: string | null; cancelledAt?: string | null; createdBy?: { id: string; email: string; displayName?: string | null } | null; account: Account; payload?: TikTokPayload; runs?: Array<{ startedAt?: string; result?: unknown }> }
+interface TikTokCampaign { id: string; tasks: TaskItem[]; representative: TaskItem; status: string }
 interface TikTokWorkspaceProps { accounts: Account[]; canOperate: boolean; canAdmin: boolean; onNavigateProfiles: () => void }
 type CreateMode = 'SEARCH' | 'AUTO_COMMENT' | 'ACTION' | 'MESSAGE_FOLLOWERS';
 type ActionMode = 'COMMENT' | 'REPLY' | 'LIKE';
@@ -94,6 +96,7 @@ function reportStatus(status?: string): ReactNode {
 
 function reportEntryKey(entry: TikTokReportEntry): string {
   return [
+    entry.runId ?? 'RUN',
     entry.action ?? 'ACTION',
     entry.status ?? 'STATUS',
     entry.username ?? entry.profileUrl ?? entry.videoUrl ?? entry.postUrl ?? 'TARGET',
@@ -108,10 +111,11 @@ function isStaleBrowserRun(task: TaskItem): boolean {
 }
 
 function checkpointCanContinue(task: TaskItem): boolean {
-  if (!['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(task.action)) return false;
+  if (!['AUTO_COMMENT_TIKTOK_HOME', 'COMMENT_TIKTOK_VIDEOS', 'REPLY_TIKTOK_COMMENTS', 'LIKE_TIKTOK_COMMENTS', 'MESSAGE_TIKTOK_FOLLOWERS'].includes(task.action)) return false;
   if (resultObject(task)?.checkpointUncertain === true) return false;
   const entries = reportEntries(task);
-  return entries.length > 0 && entries.every(entry => entry.status === 'SENT' || entry.status === 'LIKED');
+  const successful = entries.filter(entry => entry.status === 'SENT' || entry.status === 'LIKED');
+  return successful.length > 0 && !entries.some(entry => entry.status === 'IN_PROGRESS' || entry.status === 'UNKNOWN');
 }
 
 function resultVideos(task?: TaskItem): VideoRow[] {
@@ -123,7 +127,7 @@ function resultVideos(task?: TaskItem): VideoRow[] {
 }
 
 function retrySafety(task: TaskItem): 'SAFE' | 'VERIFY' | 'BLOCKED' {
-  if (!['FAILED', 'REQUIRES_ACTION'].includes(task.status) && !isStaleBrowserRun(task)) return 'BLOCKED';
+  if (!['FAILED', 'REQUIRES_ACTION'].includes(task.status) && !isIncompleteTikTokCampaign(task) && !isStaleBrowserRun(task)) return 'BLOCKED';
   if (task.action === 'SEARCH_TIKTOK_VIDEOS') return 'SAFE';
   const result = resultObject(task);
   return task.attemptCount === 0 || result?.sideEffectStarted === false || checkpointCanContinue(task) ? 'SAFE' : 'VERIFY';
@@ -158,9 +162,16 @@ function campaignProgress(task: TaskItem): { completed?: number; requested?: num
   return { completed, requested };
 }
 
+function isIncompleteTikTokCampaign(task: TaskItem): boolean {
+  if (task.action === 'SEARCH_TIKTOK_VIDEOS') return false;
+  const { completed, requested } = campaignProgress(task);
+  return completed != null && requested != null && requested > 0 && completed < requested;
+}
+
 function taskTag(task: TaskItem) {
   if (task.approvalStatus === 'PENDING') return <Tag color="orange">Chờ duyệt</Tag>;
   if (task.cancelledAt && task.status === 'RUNNING') return <Tag color="red">Đang hủy</Tag>;
+  if (task.status === 'SUCCEEDED' && isIncompleteTikTokCampaign(task)) return <Tag color="red">Chưa đủ chỉ tiêu</Tag>;
   if (task.status === 'SUCCEEDED') return <Tag color="green">Hoàn tất</Tag>;
   if (isStaleBrowserRun(task)) return <Tag color="red">Browser hết thời hạn</Tag>;
   if (['FAILED', 'REQUIRES_ACTION'].includes(task.status)) {
@@ -173,6 +184,32 @@ function taskTag(task: TaskItem) {
   if (task.status === 'RUNNING') return <Tag color="blue">Đang chạy</Tag>;
   if (task.status === 'QUEUED' || task.status === 'SCHEDULED') return <Tag color="blue">Đang chờ</Tag>;
   return <Tag>{task.status}</Tag>;
+}
+
+function groupedCampaignStatus(tasks: TaskItem[]): string {
+  if (tasks.some(task => task.cancelledAt && task.status === 'RUNNING')) return 'CANCELLING';
+  if (tasks.some(task => task.pausedAt && task.status === 'RUNNING')) return 'PAUSING';
+  if (tasks.some(task => task.approvalStatus === 'PENDING')) return 'PENDING';
+  if (tasks.some(task => task.status === 'RUNNING')) return 'RUNNING';
+  if (tasks.some(task => ['QUEUED', 'SCHEDULED'].includes(task.status))) return 'QUEUED';
+  if (tasks.some(task => task.status === 'REQUIRES_ACTION')) return 'REQUIRES_ACTION';
+  if (tasks.some(task => task.status === 'FAILED')) return 'FAILED';
+  if (tasks.some(isIncompleteTikTokCampaign)) return 'FAILED';
+  if (tasks.some(task => task.status === 'PAUSED')) return 'PAUSED';
+  if (tasks.every(task => task.status === 'CANCELLED')) return 'CANCELLED';
+  if (tasks.every(task => task.status === 'SUCCEEDED')) return 'SUCCEEDED';
+  return tasks[0]?.status ?? 'DRAFT';
+}
+
+const tiktokStatusLabels: Record<string, string> = {
+  ALL: 'Tất cả trạng thái', PENDING: 'Chờ duyệt', DRAFT: 'Bản nháp', QUEUED: 'Đang chờ', SCHEDULED: 'Đã lên lịch',
+  RUNNING: 'Đang chạy', PAUSING: 'Đang yêu cầu dừng', PAUSED: 'Đã tạm dừng', SUCCEEDED: 'Hoàn tất', FAILED: 'Lỗi',
+  REQUIRES_ACTION: 'Cần thao tác', CANCELLING: 'Đang yêu cầu hủy', CANCELLED: 'Đã hủy',
+};
+
+function groupedCampaignTag(campaign: TikTokCampaign) {
+  const color = campaign.status === 'SUCCEEDED' ? 'green' : ['FAILED', 'REQUIRES_ACTION', 'CANCELLING', 'CANCELLED'].includes(campaign.status) ? 'red' : ['RUNNING', 'QUEUED'].includes(campaign.status) ? 'blue' : 'orange';
+  return <Tag color={color}>{tiktokStatusLabels[campaign.status] ?? campaign.status}</Tag>;
 }
 
 function campaignResult(task: TaskItem): string {
@@ -197,6 +234,13 @@ function campaignResultReason(task: TaskItem): string | undefined {
   // the final aggregate result, not that intermediate error beside N/N.
   if (task.status === 'SUCCEEDED' && completed != null && requested != null && completed >= requested) return undefined;
 
+  // A retry intentionally carries the previous checkpoint/report so already
+  // completed targets are not repeated. `lastError`, however, belongs to the
+  // current attempt and must win over a failed entry retained from an older
+  // run; otherwise every retry appears to show the first failure forever.
+  const currentAttemptError = task.lastError?.trim();
+  if (currentAttemptError) return currentAttemptError;
+
   // When the campaign is incomplete, the latest failed target is more useful
   // than the adapter's firstFailureReason because later targets may fail for
   // a different, more actionable reason.
@@ -219,22 +263,17 @@ function campaignResultReason(task: TaskItem): string | undefined {
   return undefined;
 }
 
-function MediaPicker({ assets, value, onChange, disabled }: { assets: MediaAsset[]; value: string[]; onChange: (value: string[]) => void; disabled?: boolean }) {
-  const options = assets.filter(asset => asset.status === 'READY' && asset.contentType.startsWith('image/')).map(asset => ({ value: asset.id, label: `${asset.fileName} · ${asset.contentType}` }));
-  return <Select mode="multiple" allowClear maxTagCount="responsive" value={value} onChange={onChange} disabled={disabled} options={options} placeholder="Không đính kèm ảnh" />;
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
+function Field({ label, children, required = false }: { label: string; children: ReactNode; required?: boolean }) {
   const id = useId();
   const control = isValidElement(children)
     ? cloneElement(children as React.ReactElement<{ id?: string }>, { id })
     : children;
-  return <div className="tiktok-field"><label htmlFor={id}>{label}</label>{control}</div>;
+  return <div className="tiktok-field"><label htmlFor={id}>{label}{required ? <span className="field-required" aria-hidden="true"> *</span> : null}</label>{control}</div>;
 }
 
-function NumberField({ label, value, onChange, min, max, placeholder }: { label: string; value?: number; onChange: (value: number | undefined) => void; min?: number; max?: number; placeholder?: string }) {
+function NumberField({ label, value, onChange, min, max, placeholder, required = false }: { label: string; value?: number; onChange: (value: number | undefined) => void; min?: number; max?: number; placeholder?: string; required?: boolean }) {
   const id = useId();
-  return <div className="tiktok-field tiktok-number-field"><label htmlFor={id}>{label}</label><InputNumber id={id} min={min} max={max} value={value} onChange={next => onChange(next ?? undefined)} placeholder={placeholder} /></div>;
+  return <div className="tiktok-field tiktok-number-field"><label htmlFor={id}>{label}{required ? <span className="field-required" aria-hidden="true"> *</span> : null}</label><InputNumber id={id} min={min} max={max} value={value} onChange={next => onChange(next ?? undefined)} placeholder={placeholder} /></div>;
 }
 
 interface TikTokTaskPlan { accountId: string; payload: Record<string, unknown> }
@@ -278,12 +317,14 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
   const setError = useToastError();
   const { modal } = App.useApp();
   const tiktokAccounts = useMemo(() => accounts.filter(account => account.platform === 'TIKTOK'), [accounts]);
+  const draftableAccounts = useMemo(() => tiktokAccounts.filter(account => account.status !== 'DISABLED'), [tiktokAccounts]);
   // Search is read-only and runs in a clean temporary browser context, so it
   // can use any TikTok account as a queue/tenant anchor without requiring a
   // logged-in account. Side-effect actions still require a READY/RUNNING one.
   const queueableAccounts = useMemo(() => tiktokAccounts.filter(account => account.status === 'READY' || account.status === 'RUNNING'), [tiktokAccounts]);
   const [createOpen, setCreateOpen] = useState(false);
   const [createMode, setCreateMode] = useState<CreateMode>('SEARCH');
+  const [accountScope, setAccountScope] = useState<'ALL' | 'SELECTED'>('ALL');
   const [accountIds, setAccountIds] = useState<string[]>([]);
   const [name, setName] = useState('');
   const [query, setQuery] = useState('');
@@ -296,50 +337,61 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
   const [homeLimit, setHomeLimit] = useState(10);
   const [homeMinLikes, setHomeMinLikes] = useState(0);
   const [homeMaxLikes, setHomeMaxLikes] = useState<number>();
-  const [homeIntervalSeconds, setHomeIntervalSeconds] = useState(120);
+  const [homeIntervalSeconds, setHomeIntervalSeconds] = useState(10);
   const [followerUsername, setFollowerUsername] = useState('');
   const [followerLimit, setFollowerLimit] = useState(20);
-  const [followerIntervalSeconds, setFollowerIntervalSeconds] = useState(120);
+  const [followerIntervalSeconds, setFollowerIntervalSeconds] = useState(10);
   const [actionMode, setActionMode] = useState<ActionMode>('COMMENT');
   const [actionText, setActionText] = useState('');
   const [actionReplyLimit, setActionReplyLimit] = useState(10);
   const [actionLikeLimit, setActionLikeLimit] = useState(10);
-  const [actionIntervalSeconds, setActionIntervalSeconds] = useState(120);
+  const [actionIntervalSeconds, setActionIntervalSeconds] = useState(10);
   const [mediaAssetIds, setMediaAssetIds] = useState<string[]>([]);
   const [selectedCampaignId, setSelectedCampaignId] = useState<string>();
   const [selectedVideoUrls, setSelectedVideoUrls] = useState<string[]>([]);
   const [campaignSearch, setCampaignSearch] = useState('');
   const [campaignFilter, setCampaignFilter] = useState('ALL');
+  const [taskLimit, setTaskLimit] = useState(100);
   const [approvingId, setApprovingId] = useState<string>();
   const [retryingId, setRetryingId] = useState<string>();
   const [cancellingId, setCancellingId] = useState<string>();
   const [pausingId, setPausingId] = useState<string>();
   const [resumingId, setResumingId] = useState<string>();
   const [creatingTask, setCreatingTask] = useState(false);
+  const [uploadingImages, setUploadingImages] = useState(false);
+  const [creationKey, setCreationKey] = useState(() => crypto.randomUUID());
   useEffect(() => {
     if (createMode === 'SEARCH') return;
-    const available = new Set(queueableAccounts.map(account => account.id));
+    const available = new Set(draftableAccounts.map(account => account.id));
     setAccountIds(current => current.filter(id => available.has(id)));
-  }, [createMode, queueableAccounts]);
+  }, [createMode, draftableAccounts]);
 
   const tasks = useQuery({
-    queryKey: ['tasks'],
-    queryFn: () => apiJson<TaskItem[]>('/api/control/tasks'),
-    refetchInterval: 5_000,
+    queryKey: ['tasks', taskLimit],
+    queryFn: () => apiJson<TaskItem[]>(`/api/control/tasks?take=${taskLimit}`),
+    refetchInterval: query => ((query.state.data as TaskItem[] | undefined) ?? []).some(task =>
+      ['QUEUED', 'SCHEDULED', 'RUNNING'].includes(task.status),
+    ) ? 5_000 : false,
   });
-  const media = useQuery({ queryKey: ['media'], queryFn: () => apiJson<MediaAsset[]>('/api/media') });
-  const campaigns = useMemo(() => {
+  const taskCampaigns = useMemo(() => {
     const needle = campaignSearch.trim().toLocaleLowerCase();
-    return (tasks.data ?? []).filter(task => task.action.startsWith('SEARCH_TIKTOK') || task.action.startsWith('AUTO_COMMENT_TIKTOK') || task.action.startsWith('COMMENT_TIKTOK') || task.action.startsWith('REPLY_TIKTOK') || task.action.startsWith('LIKE_TIKTOK') || task.action.startsWith('MESSAGE_TIKTOK')).filter(task => campaignFilter === 'ALL' || task.status === campaignFilter || campaignFilter === 'PENDING' && task.approvalStatus === 'PENDING').filter(task => !needle || [task.payload?.name, task.payload?.query, task.payload?.username, task.account.username, actionLabel(task.action)].filter(Boolean).some(value => String(value).toLocaleLowerCase().includes(needle)));
+    const relevant = (tasks.data ?? []).filter(task => task.action.startsWith('SEARCH_TIKTOK') || task.action.startsWith('AUTO_COMMENT_TIKTOK') || task.action.startsWith('COMMENT_TIKTOK') || task.action.startsWith('REPLY_TIKTOK') || task.action.startsWith('LIKE_TIKTOK') || task.action.startsWith('MESSAGE_TIKTOK'));
+    const grouped = new Map<string, TaskItem[]>();
+    for (const task of relevant) grouped.set(task.batchId ?? task.id, [...(grouped.get(task.batchId ?? task.id) ?? []), task]);
+    return [...grouped].map(([id, campaignTasks]): TikTokCampaign => ({ id, tasks: campaignTasks, representative: campaignTasks[0]!, status: groupedCampaignStatus(campaignTasks) }))
+      .filter(campaign => campaignFilter === 'ALL' || campaign.status === campaignFilter)
+      .filter(campaign => !needle || campaign.tasks.some(task => [task.payload?.name, task.payload?.query, task.payload?.username, task.account.username, actionLabel(task.action)].filter(Boolean).some(value => String(value).toLocaleLowerCase().includes(needle))))
+      .sort((left, right) => new Date(right.representative.createdAt).getTime() - new Date(left.representative.createdAt).getTime());
   }, [campaignFilter, campaignSearch, tasks.data]);
-  const selectedCampaign = campaigns.find(task => task.id === selectedCampaignId);
+  const selectedGroup = taskCampaigns.find(campaign => campaign.id === selectedCampaignId);
+  const selectedCampaign = selectedGroup?.representative;
   const selectedResults = resultVideos(selectedCampaign);
   const selectedSourceAccount = selectedCampaign?.account.id ?? tiktokAccounts[0]?.id;
   const selectedCount = selectedVideoUrls.length;
-  const selectedReportEntries = reportEntries(selectedCampaign);
-  const runningCount = campaigns.filter(task => ['RUNNING', 'QUEUED', 'SCHEDULED'].includes(task.status)).length;
-  const failedCount = campaigns.filter(task => ['FAILED', 'REQUIRES_ACTION'].includes(task.status)).length;
-  const completedCount = campaigns.filter(task => task.status === 'SUCCEEDED').length;
+  const selectedReportEntries = selectedGroup?.tasks.flatMap(reportEntries) ?? [];
+  const runningCount = taskCampaigns.filter(campaign => ['RUNNING', 'QUEUED', 'SCHEDULED'].includes(campaign.status)).length;
+  const failedCount = taskCampaigns.filter(campaign => ['FAILED', 'REQUIRES_ACTION'].includes(campaign.status)).length;
+  const completedCount = taskCampaigns.filter(campaign => campaign.status === 'SUCCEEDED').length;
 
   // Search uses an anonymous browser context and only keeps a TikTok account
   // as the technical task owner. Other campaigns follow Facebook's flow:
@@ -347,30 +399,42 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
   // limit the campaign to the selected profiles.
   const targetAccountIds = createMode === 'SEARCH'
     ? (tiktokAccounts[0] ? [tiktokAccounts[0].id] : [])
-    : accountIds.length ? accountIds : queueableAccounts.map(account => account.id);
+    : accountScope === 'SELECTED' ? accountIds : draftableAccounts.map(account => account.id);
+  const targetAccountsReady = createMode === 'SEARCH' || targetAccountIds.length > 0 && targetAccountIds.every(id => queueableAccounts.some(account => account.id === id));
 
   const resetCreate = (mode: CreateMode) => {
     setCreateMode(mode); setCreateOpen(true); setError(undefined);
-    setAccountIds([]);
+    setCreationKey(crypto.randomUUID());
+    setAccountScope('ALL'); setAccountIds([]);
     if (mode === 'SEARCH') { setName(''); setQuery(''); setSelectedCampaignId(undefined); setSelectedVideoUrls([]); }
-    if (mode === 'AUTO_COMMENT') { setName(''); setHomeText(''); setHomeIntervalSeconds(120); }
-    if (mode === 'MESSAGE_FOLLOWERS') { setName(''); setFollowerUsername(''); setFollowerLimit(20); setFollowerIntervalSeconds(120); setActionText(''); setMediaAssetIds([]); }
+    if (mode === 'AUTO_COMMENT') { setName(''); setHomeText(''); setHomeIntervalSeconds(10); }
+    if (mode === 'MESSAGE_FOLLOWERS') { setName(''); setFollowerUsername(''); setFollowerLimit(20); setFollowerIntervalSeconds(10); setActionText(''); setMediaAssetIds([]); }
   };
 
   const createTask = async (action: string, payload: Record<string, unknown>, successText: string, runImmediately = false) => {
     const taskPlans = distributeTikTokTasks(action, payload, targetAccountIds);
     if (!canOperate || !taskPlans.length) return;
     setCreatingTask(true);
-    const created: Array<{ id: string }> = [];
     try {
-      for (const plan of taskPlans) {
-        const task = await apiJson<{ id: string }>('/api/tasks', { idempotencyKey: `${action.toLowerCase()}-${crypto.randomUUID()}`, action: { platform: 'TIKTOK', accountId: plan.accountId, action, payload: plan.payload } });
-        created.push(task);
-        if (runImmediately) await apiJson(`/api/tasks/${task.id}/approve`, {});
+      const batch = await apiJson<{ tasks: Array<{ id: string; batchId?: string | null }> }>('/api/tasks/batch', {
+        idempotencyKey: creationKey,
+        tasks: taskPlans.map(plan => ({
+          action: { platform: 'TIKTOK', accountId: plan.accountId, action, payload: plan.payload },
+        })),
+      });
+      if (runImmediately) {
+        try {
+          await apiJson('/api/tasks/batch/approve', { taskIds: batch.tasks.map(task => task.id) });
+        } catch (approvalError) {
+          setCreateOpen(false);
+          await tasks.refetch();
+          const reason = approvalError instanceof Error ? approvalError.message : String(approvalError);
+          throw new Error(`Batch đã được lưu nguyên vẹn nhưng chưa thể duyệt: ${reason}. Hãy duyệt từ danh sách campaign.`);
+        }
       }
       await tasks.refetch();
       setCreateOpen(false);
-      setSelectedCampaignId(created[0]?.id);
+      setSelectedCampaignId(batch.tasks[0]?.batchId ?? batch.tasks[0]?.id);
       setSelectedVideoUrls([]);
       toast.success(action === 'SEARCH_TIKTOK_VIDEOS'
         ? `${successText} đã được đưa vào chạy ngay.`
@@ -379,7 +443,7 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
           : `${successText} đã được tạo cho ${taskPlans.length} profile và đang chờ duyệt.`);
     } catch (caught) {
       const detail = caught instanceof Error ? caught.message : String(caught);
-      setError(created.length ? `Đã tạo ${created.length}/${taskPlans.length} profile; phần còn lại lỗi: ${detail}` : detail);
+      setError(detail);
     } finally {
       setCreatingTask(false);
     }
@@ -392,7 +456,7 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
 
   const submitHomeComment = (runImmediately = false) => {
     if (!name.trim() || !homeText.trim()) return;
-    return createTask('AUTO_COMMENT_TIKTOK_HOME', { name, text: homeText, mediaAssetIds, maxVideos: homeLimit, minLikes: homeMinLikes, ...(homeMaxLikes == null ? {} : { maxLikes: homeMaxLikes }), intervalSeconds: homeIntervalSeconds }, 'Campaign auto-comment', runImmediately);
+    return createTask('AUTO_COMMENT_TIKTOK_HOME', { name, text: homeText, maxVideos: homeLimit, minLikes: homeMinLikes, ...(homeMaxLikes == null ? {} : { maxLikes: homeMaxLikes }), intervalSeconds: homeIntervalSeconds }, 'Campaign auto-comment', runImmediately);
   };
 
   const submitFollowerMessage = (runImmediately = false) => {
@@ -406,9 +470,9 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
     const shared = { name, videoUrls: selectedVideoUrls, intervalSeconds: actionIntervalSeconds };
     const action = actionMode === 'COMMENT' ? 'COMMENT_TIKTOK_VIDEOS' : actionMode === 'REPLY' ? 'REPLY_TIKTOK_COMMENTS' : 'LIKE_TIKTOK_COMMENTS';
     const payload = actionMode === 'COMMENT'
-      ? { ...shared, text: actionText, mediaAssetIds, maxVideos: selectedVideoUrls.length }
+      ? { ...shared, text: actionText, maxVideos: selectedVideoUrls.length }
       : actionMode === 'REPLY'
-        ? { ...shared, text: actionText, mediaAssetIds, maxReplies: actionReplyLimit }
+        ? { ...shared, text: actionText, maxReplies: actionReplyLimit }
         : { ...shared, maxLikes: actionLikeLimit };
     return createTask(action, payload, `Campaign ${actionLabel(action)}`, runImmediately);
   };
@@ -419,29 +483,30 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
 
   const startActionFromSelection = () => {
     if (!selectedVideoUrls.length || !selectedCampaign) return;
+    setAccountScope('SELECTED');
     setAccountIds(selectedSourceAccount && queueableAccounts.some(account => account.id === selectedSourceAccount) ? [selectedSourceAccount] : []);
-    setCreateMode('ACTION'); setCreateOpen(true); setActionMode('COMMENT'); setActionText(''); setActionIntervalSeconds(120); setMediaAssetIds([]);
+    setCreateMode('ACTION'); setCreateOpen(true); setActionMode('COMMENT'); setActionText(''); setActionIntervalSeconds(10); setMediaAssetIds([]);
     setName(`Hành động trên ${selectedVideoUrls.length.toString()} video`);
   };
 
   const createDialogTitle = createMode === 'SEARCH' ? 'Search video' : createMode === 'AUTO_COMMENT' ? 'Auto-comment For You' : createMode === 'MESSAGE_FOLLOWERS' ? 'IB follower của kênh TikTok' : 'Hành động trên video đã chọn';
   const createDialogSubmitDisabled = createMode === 'SEARCH'
-    ? creatingTask || !canOperate || !targetAccountIds.length || !name.trim() || !query.trim()
+    ? creatingTask || uploadingImages || !canOperate || !targetAccountIds.length || !name.trim() || !query.trim()
     : createMode === 'AUTO_COMMENT'
-      ? creatingTask || !canOperate || !targetAccountIds.length || !name.trim() || !homeText.trim()
+      ? creatingTask || uploadingImages || !canOperate || !targetAccountIds.length || !name.trim() || !homeText.trim()
       : createMode === 'MESSAGE_FOLLOWERS'
-        ? creatingTask || !canOperate || !targetAccountIds.length || !name.trim() || !followerUsername.trim() || (!actionText.trim() && !mediaAssetIds.length)
-        : creatingTask || !canOperate || !targetAccountIds.length || !name.trim() || !selectedVideoUrls.length || actionMode !== 'LIKE' && !actionText.trim();
+        ? creatingTask || uploadingImages || !canOperate || !targetAccountIds.length || !name.trim() || !followerUsername.trim() || (!actionText.trim() && !mediaAssetIds.length)
+        : creatingTask || uploadingImages || !canOperate || !targetAccountIds.length || !name.trim() || !selectedVideoUrls.length || actionMode !== 'LIKE' && !actionText.trim();
   const saveDraft = () => {
     if (createMode === 'AUTO_COMMENT') void submitHomeComment(false);
     else if (createMode === 'MESSAGE_FOLLOWERS') void submitFollowerMessage(false);
     else if (createMode === 'ACTION') void submitAction(false);
   };
   const runNow = () => modal.confirm({
-    title: 'Tạo và chạy campaign TikTok ngay?',
-    content: 'Campaign sẽ được duyệt ngay sau khi tạo và xếp vào hàng đợi của từng profile đã chọn. Comment, reply, tim comment hoặc IB là hành động thật và chỉ thực hiện khi đến lượt; campaign khác đang chạy vẫn được giữ nguyên thứ tự.',
-    okText: 'Tạo & chạy',
-    cancelText: 'Quay lại',
+    title: 'Kiểm tra trước khi xếp hàng campaign TikTok',
+    content: <Space orientation="vertical" size={10} style={{ width: '100%' }}><Typography.Text><strong>{name}</strong></Typography.Text><Typography.Text>{targetAccountIds.length} profile · {createMode === 'AUTO_COMMENT' ? `${homeLimit} video tối đa` : createMode === 'MESSAGE_FOLLOWERS' ? `${followerLimit} follower tối đa` : `${selectedVideoUrls.length} video đã chọn`}</Typography.Text><Alert type="warning" showIcon title="Đây là hành động thật trên TikTok" description="Campaign sẽ được duyệt và xếp hàng; comment, reply, tim hoặc tin nhắn chỉ bắt đầu khi đến lượt của từng profile." /></Space>,
+    okText: 'Duyệt & xếp hàng',
+    cancelText: 'Quay lại chỉnh sửa',
     onOk: () => createMode === 'AUTO_COMMENT' ? submitHomeComment(true) : createMode === 'MESSAGE_FOLLOWERS' ? submitFollowerMessage(true) : submitAction(true),
   });
   const approveCampaign = (task: TaskItem) => modal.confirm({
@@ -543,17 +608,44 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
       setResumingId(undefined);
     }
   };
+  const approveCampaignGroup = (campaign: TikTokCampaign) => modal.confirm({
+    title: 'Duyệt và xếp hàng toàn bộ campaign TikTok?',
+    content: `${campaign.tasks.length} tác vụ trên ${new Set(campaign.tasks.map(task => task.account.id)).size} profile sẽ được duyệt cùng nhau và xếp vào hàng đợi.`,
+    okText: 'Duyệt & xếp hàng', cancelText: 'Quay lại',
+    onOk: async () => {
+      setApprovingId(campaign.id);
+      try { await apiJson('/api/tasks/batch/approve', { taskIds: campaign.tasks.filter(task => task.approvalStatus === 'PENDING').map(task => task.id) }); await tasks.refetch(); toast.success('Đã duyệt và xếp hàng toàn bộ campaign TikTok.'); }
+      catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); throw caught; }
+      finally { setApprovingId(undefined); }
+    },
+  });
+  const controlCampaignGroup = (campaign: TikTokCampaign, action: 'pause' | 'resume' | 'cancel') => {
+    const eligible = campaign.tasks.filter(task => action === 'pause'
+      ? !task.pausedAt && !task.cancelledAt && ['RUNNING', 'SCHEDULED', 'QUEUED'].includes(task.status)
+      : action === 'resume' ? task.status === 'PAUSED' && !task.cancelledAt
+        : !['SUCCEEDED', 'CANCELLED'].includes(task.status) && !task.cancelledAt);
+    const execute = async () => {
+      const setter = action === 'pause' ? setPausingId : action === 'resume' ? setResumingId : setCancellingId;
+      setter(campaign.id);
+      try { await Promise.all(eligible.map(task => apiJson(`/api/tasks/${task.id}/${action}`, {}))); await tasks.refetch(); toast.success(action === 'pause' ? 'Đã gửi yêu cầu tạm dừng toàn bộ campaign.' : action === 'resume' ? 'Đã tiếp tục toàn bộ phần còn lại của campaign.' : 'Đã gửi yêu cầu hủy toàn bộ campaign.'); }
+      catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); throw caught; }
+      finally { setter(undefined); }
+    };
+    if (action === 'cancel') modal.confirm({ title: `Yêu cầu hủy “${campaign.representative.payload?.name ?? actionLabel(campaign.representative.action)}”?`, content: 'Các tác vụ chưa chạy sẽ bị hủy; tác vụ đang chạy sẽ dừng tại điểm an toàn và giữ checkpoint.', okText: 'Yêu cầu hủy', cancelText: 'Giữ lại', okButtonProps: { danger: true }, onOk: execute });
+    else void execute();
+  };
   const createDialogContent = <>
-    <div className="tiktok-form-grid tiktok-form-grid-2">
-    {createMode !== 'SEARCH' ? <Field label="Profile chạy campaign"><Select mode="multiple" allowClear showSearch maxTagCount="responsive" maxCount={100} value={accountIds} onChange={setAccountIds} options={queueableAccounts.map(account => ({ value: account.id, label: `${account.username ?? account.id}${account.status === 'RUNNING' ? ' · đang chạy, sẽ xếp hàng' : ''}` }))} placeholder="Để trống = tất cả profile TikTok READY" optionFilterProp="label" notFoundContent="Không có profile TikTok READY" /></Field> : null}
-      <Field label="Tên campaign"><Input value={name} onChange={event => setName(event.target.value)} placeholder="Ví dụ: Search áo khoác tháng 10" /></Field>
+    <div className={`tiktok-form-grid${createMode !== 'SEARCH' ? ' tiktok-form-grid-2' : ''}`}>
+    {createMode !== 'SEARCH' ? <Field label="Phạm vi profile" required><Select value={accountScope} onChange={setAccountScope} options={[{ value: 'ALL', label: `Tất cả profile chưa bị vô hiệu hóa (${draftableAccounts.length})` }, { value: 'SELECTED', label: 'Chọn profile cụ thể' }]} /></Field> : null}
+      <Field label="Tên chiến dịch" required><Input value={name} onChange={event => setName(event.target.value)} placeholder="Ví dụ: Search áo khoác tháng 10" /></Field>
     </div>
+    {createMode !== 'SEARCH' && accountScope === 'SELECTED' ? <Field label="Profile thực hiện" required><Select mode="multiple" allowClear showSearch maxTagCount="responsive" maxCount={100} value={accountIds} onChange={setAccountIds} options={draftableAccounts.map(account => ({ value: account.id, label: `${account.username ?? account.id}${account.status === 'RUNNING' ? ' · đang chạy, sẽ xếp hàng' : account.status === 'READY' ? '' : ` · ${account.status}`}` }))} placeholder="Chọn một hoặc nhiều profile" optionFilterProp="label" notFoundContent="Không có profile TikTok" /></Field> : null}
 
     {createMode === 'SEARCH' ? <>
       <DividerLike title="Thiết lập Search video" />
       <div className="tiktok-search-row">
-        <Field label="Từ khóa"><Input value={query} onChange={event => setQuery(event.target.value)} placeholder="Ví dụ: áo khoác nam" /></Field>
-        <NumberField label="Số video tối đa" value={maxVideos} onChange={value => setMaxVideos(value ?? 100)} min={1} max={100} />
+        <Field label="Từ khóa" required><Input value={query} onChange={event => setQuery(event.target.value)} placeholder="Ví dụ: áo khoác nam" /></Field>
+        <NumberField label="Số video tối đa" required value={maxVideos} onChange={value => setMaxVideos(value ?? 100)} min={1} max={100} />
       </div>
       <div className="tiktok-filter-grid">
         <NumberField label="Tim tối thiểu" value={minLikes} onChange={setMinLikes} min={0} placeholder="Bỏ qua" />
@@ -566,91 +658,79 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
 
     {createMode === 'AUTO_COMMENT' ? <>
       <DividerLike title="Thiết lập auto-comment For You" />
-      <Field label="Nội dung comment"><Input.TextArea rows={4} value={homeText} onChange={event => setHomeText(event.target.value)} placeholder="Nội dung comment" /></Field>
+      <Field label="Nội dung comment" required><Input.TextArea rows={4} value={homeText} onChange={event => setHomeText(event.target.value)} placeholder="Nội dung comment" /></Field>
       <div className="tiktok-filter-grid tiktok-filter-grid-3">
         <NumberField label="Số video" value={homeLimit} onChange={value => setHomeLimit(value ?? 10)} min={1} max={100} />
         <NumberField label="Tim từ" value={homeMinLikes} onChange={value => setHomeMinLikes(value ?? 0)} min={0} />
         <NumberField label="Tim đến" value={homeMaxLikes} onChange={setHomeMaxLikes} min={0} placeholder="Không giới hạn" />
       </div>
-      <NumberField label="Khoảng cách giữa tác vụ (giây)" value={homeIntervalSeconds} onChange={value => setHomeIntervalSeconds(value ?? 120)} min={5} max={86400} />
-      <Field label="Ảnh đính kèm"><MediaPicker assets={media.data ?? []} value={mediaAssetIds} onChange={setMediaAssetIds} disabled={!canOperate} /></Field>
+      <NumberField label="Khoảng cách giữa tác vụ (giây)" value={homeIntervalSeconds} onChange={value => setHomeIntervalSeconds(value ?? 10)} min={5} max={86400} />
     </> : null}
 
     {createMode === 'MESSAGE_FOLLOWERS' ? <>
       <DividerLike title="Thiết lập IB follower" />
       <Alert type="warning" showIcon title="Tin nhắn sẽ được gửi thật sau khi campaign được duyệt" description="TikTok có thể giới hạn việc nhắn tin nếu hai tài khoản không đủ điều kiện kết nối. Hệ thống chỉ thử trong giới hạn đã chọn và lưu lại kết quả từng follower." />
-      <Field label="Username kênh TikTok"><Input value={followerUsername} onChange={event => setFollowerUsername(event.target.value)} placeholder="Ví dụ: @kenh_cua_ban" /></Field>
-      <NumberField label="Số follower tối đa" value={followerLimit} onChange={value => setFollowerLimit(value ?? 20)} min={1} max={100} />
-      <NumberField label="Khoảng cách giữa tác vụ (giây)" value={followerIntervalSeconds} onChange={value => setFollowerIntervalSeconds(value ?? 120)} min={5} max={86400} />
+      <Field label="Username kênh TikTok" required><Input value={followerUsername} onChange={event => setFollowerUsername(event.target.value)} placeholder="Ví dụ: @kenh_cua_ban" /></Field>
+      <div className="tiktok-form-grid tiktok-form-grid-2">
+        <NumberField label="Số follower tối đa" required value={followerLimit} onChange={value => setFollowerLimit(value ?? 20)} min={1} max={100} />
+        <NumberField label="Khoảng cách giữa tác vụ (giây)" required value={followerIntervalSeconds} onChange={value => setFollowerIntervalSeconds(value ?? 10)} min={5} max={86400} />
+      </div>
       <Field label="Nội dung tin nhắn"><Input.TextArea rows={4} value={actionText} onChange={event => setActionText(event.target.value)} placeholder="Nội dung IB gửi tới follower" /></Field>
-      <Field label="Ảnh đính kèm"><MediaPicker assets={media.data ?? []} value={mediaAssetIds} onChange={setMediaAssetIds} disabled={!canOperate} /></Field>
+      <Field label="Ảnh đính kèm"><CampaignImagePicker platform="TikTok" context="message" value={mediaAssetIds} onChange={setMediaAssetIds} disabled={!canOperate || creatingTask} onUploadingChange={setUploadingImages} /></Field>
     </> : null}
 
     {createMode === 'ACTION' ? <>
       <DividerLike title="Danh sách video đã chọn" />
       <Alert type="info" showIcon title={`${selectedVideoUrls.length} video đã chọn`} description="Đây là campaign riêng cho các video bạn vừa chọn từ một Search campaign. Bạn có thể lưu nháp hoặc tạo, duyệt và xếp hàng chạy ngay sau bước xác nhận." />
       <DividerLike title="Chọn hành động" />
-      <Field label="Loại hành động"><Select value={actionMode} onChange={value => setActionMode(value as ActionMode)} options={[{ value: 'COMMENT', label: 'Comment video' }, { value: 'REPLY', label: 'Reply comment trên video' }, { value: 'LIKE', label: 'Tim comment trên video' }]} /></Field>
+      <Field label="Loại hành động" required><Select value={actionMode} onChange={value => setActionMode(value as ActionMode)} options={[{ value: 'COMMENT', label: 'Comment video' }, { value: 'REPLY', label: 'Reply comment trên video' }, { value: 'LIKE', label: 'Tim comment trên video' }]} /></Field>
       {actionMode !== 'LIKE' ? <>
-        <Field label={actionMode === 'COMMENT' ? 'Nội dung comment' : 'Nội dung reply'}><Input.TextArea rows={4} value={actionText} onChange={event => setActionText(event.target.value)} placeholder={actionMode === 'COMMENT' ? 'Nội dung comment' : 'Nội dung reply'} /></Field>
-        <Field label="Ảnh đính kèm"><MediaPicker assets={media.data ?? []} value={mediaAssetIds} onChange={setMediaAssetIds} disabled={!canOperate} /></Field>
+        <Field label={actionMode === 'COMMENT' ? 'Nội dung comment' : 'Nội dung reply'} required><Input.TextArea rows={4} value={actionText} onChange={event => setActionText(event.target.value)} placeholder={actionMode === 'COMMENT' ? 'Nội dung comment' : 'Nội dung reply'} /></Field>
       </> : null}
       <div className="tiktok-action-limit">{actionMode === 'REPLY' ? <NumberField label="Số reply / video" value={actionReplyLimit} onChange={value => setActionReplyLimit(value ?? 10)} min={1} max={50} /> : null}{actionMode === 'LIKE' ? <NumberField label="Số tim comment / video" value={actionLikeLimit} onChange={value => setActionLikeLimit(value ?? 10)} min={1} max={50} /> : null}</div>
-      <NumberField label="Khoảng cách giữa tác vụ (giây)" value={actionIntervalSeconds} onChange={value => setActionIntervalSeconds(value ?? 120)} min={5} max={86400} />
+      <NumberField label="Khoảng cách giữa tác vụ (giây)" value={actionIntervalSeconds} onChange={value => setActionIntervalSeconds(value ?? 10)} min={5} max={86400} />
     </> : null}
   </>;
 
   return <div className="tiktok-workspace">
-    {!tiktokAccounts.length ? <Card><Empty description="Chưa có profile TikTok"><Button type="primary" onClick={onNavigateProfiles}>Mở Profiles</Button></Empty></Card> : null}
+    <CampaignSummary items={[
+      { label: 'Tổng chiến dịch', value: taskCampaigns.length, icon: 'tasks' },
+      { label: 'Đang chạy / chờ chạy', value: runningCount, icon: 'play' },
+      { label: 'Lỗi / cần xử lý', value: failedCount, icon: 'reject' },
+      { label: 'Đã hoàn tất', value: completedCount, icon: 'approve' },
+    ]} />
+    {!tiktokAccounts.length ? <Alert type="info" showIcon title="Chưa có profile TikTok" description="Thêm profile để Search video hoặc tạo chiến dịch hành động." action={<Button type="primary" onClick={onNavigateProfiles}>Mở Profiles</Button>} /> : null}
 
-    <div className="tiktok-summary">
-      <div><span className="summary-icon"><Icon name="tasks" /></span><span><strong>{campaigns.length}</strong><small>campaign TikTok</small></span></div>
-      <div><span className="summary-icon"><Icon name="play" /></span><span><strong>{runningCount}</strong><small>đang chạy / chờ chạy</small></span></div>
-      <div><span className="summary-icon"><Icon name="reject" /></span><span><strong>{failedCount}</strong><small>lỗi / cần xử lý</small></span></div>
-      <div><span className="summary-icon"><Icon name="play" /></span><span><strong>{completedCount}</strong><small>đã hoàn tất</small></span></div>
-    </div>
-
-    <div className="facebook-actions">
-      <div><strong>Quản lý campaign TikTok</strong><p>Chọn một loại campaign để tạo, xem tiến độ và xử lý kết quả theo từng lần chạy.</p></div>
-      <Dropdown trigger={['click']} disabled={!canOperate || !tiktokAccounts.length} menu={{ items: [
+    <CampaignStartBar title="Quản lý chiến dịch TikTok" description="Tạo chiến dịch mới, theo dõi tiến độ và xử lý kết quả theo từng profile." action={<Dropdown trigger={['click']} disabled={!canOperate || !tiktokAccounts.length} menu={{ items: [
         { key: 'SEARCH', label: 'Search video', icon: <Icon name="search" /> },
         { key: 'AUTO_COMMENT', label: 'Auto-comment For You', icon: <Icon name="edit" />, disabled: !queueableAccounts.length },
         { key: 'MESSAGE_FOLLOWERS', label: 'IB follower của kênh', icon: <Icon name="edit" />, disabled: !queueableAccounts.length },
       ], onClick: ({ key }) => resetCreate(key as CreateMode) }}>
         <Button type="primary" icon={<Icon name="plus" />} disabled={!canOperate || !tiktokAccounts.length}>Tạo chiến dịch</Button>
-      </Dropdown>
-    </div>
+      </Dropdown>} />
 
-      <Card className="resource-card" title={<PageSectionTitle title="Danh sách campaign TikTok" description="Theo dõi kết quả, trạng thái và thao tác trên từng campaign" />} extra={<Space className="card-toolbar"><Input.Search aria-label="Tìm campaign TikTok" allowClear value={campaignSearch} onChange={event => setCampaignSearch(event.target.value)} placeholder="Tìm tên hoặc từ khóa..." /><Select aria-label="Lọc campaign TikTok" className="status-filter" value={campaignFilter} onChange={setCampaignFilter} options={['ALL', 'PENDING', 'DRAFT', 'QUEUED', 'RUNNING', 'PAUSED', 'SUCCEEDED', 'FAILED', 'REQUIRES_ACTION', 'CANCELLED'].map(value => ({ value, label: value === 'ALL' ? 'Tất cả trạng thái' : value === 'PENDING' ? 'Chờ duyệt' : value }))} /><ActionButton label="Làm mới campaign" icon="refresh" onClick={() => void tasks.refetch()} /></Space>}>
-          <Table<TaskItem> className="campaign-table" size="middle" rowKey="id" loading={tasks.isLoading} dataSource={campaigns} pagination={tablePagination('campaign')} scroll={{ x: 1_270 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có campaign TikTok" /> }} columns={[
-            { title: 'Chiến dịch', width: 240, render: (_: unknown, task: TaskItem) => <div className="campaign-name"><strong>{task.payload?.name ?? actionLabel(task.action)}</strong><small>{task.payload?.query ?? actionLabel(task.action)}</small></div> },
-            { title: 'Loại', width: 180, render: (_: unknown, task: TaskItem) => <Tag>{actionLabel(task.action)}</Tag> },
-            { title: 'Profile', width: 110, render: (_: unknown, task: TaskItem) => task.action === 'SEARCH_TIKTOK_VIDEOS' ? <Typography.Text type="secondary">Không cần login</Typography.Text> : task.account.username ?? task.account.id },
-            { title: 'Kết quả', width: 280, render: (_: unknown, task: TaskItem) => { const completed = task.status === 'SUCCEEDED'; const reason = completed ? undefined : campaignResultReason(task); const lastError = completed ? undefined : task.lastError?.trim(); return <div className="campaign-result-cell"><span className="campaign-result-primary">{campaignResult(task)}</span>{reason ? <Typography.Text type="secondary" className="campaign-result-detail" title={reason}>{reason}</Typography.Text> : null}{lastError && lastError !== reason ? <Typography.Text type="secondary" className="campaign-result-detail" title={lastError}>{lastError}</Typography.Text> : null}</div>; } },
-            { title: 'Trạng thái', width: 130, render: (_: unknown, task: TaskItem) => taskTag(task) },
-            { title: 'Ngày tạo', width: 150, render: (_: unknown, task: TaskItem) => new Date(task.createdAt).toLocaleString('vi-VN') },
-            { title: 'Thao tác', width: 180, fixed: 'right', render: (_: unknown, task: TaskItem) => {
-              const finished = ['SUCCEEDED', 'CANCELLED'].includes(task.status);
-              const reportable = terminalStatuses.has(task.status) || reportEntries(task).length > 0 || isStaleBrowserRun(task);
-              const retryState = retrySafety(task);
-              const pauseable = !finished && !task.pausedAt && !task.cancelledAt && ['RUNNING', 'SCHEDULED', 'QUEUED'].includes(task.status);
-              const pauseRequested = task.status === 'RUNNING' && Boolean(task.pausedAt);
-              const resumable = task.status === 'PAUSED' && !task.cancelledAt;
-              return <Space wrap size={6}>
-                {reportable ? <ActionButton label="Xem kết quả" icon="view" onClick={() => setSelectedCampaignId(task.id)} /> : null}
-                {!finished && task.approvalStatus === 'PENDING' ? <ActionButton label="Duyệt & chạy" icon="play" type="primary" disabled={!canAdmin || approvingId === task.id} loading={approvingId === task.id} onClick={() => approveCampaign(task)} /> : null}
-                {!finished && retryState !== 'BLOCKED' ? <ActionButton label={retryState === 'VERIFY' ? 'Tôi đã kiểm tra, chạy lại' : checkpointCanContinue(task) ? 'Tiếp tục phần còn lại' : task.action === 'SEARCH_TIKTOK_VIDEOS' || task.account.status === 'READY' || isStaleBrowserRun(task) ? 'Chạy lại' : 'Mở Profiles'} icon="refresh" disabled={(task.action === 'SEARCH_TIKTOK_VIDEOS' ? !canOperate : !canAdmin) || retryingId === task.id} loading={retryingId === task.id} onClick={() => retryTask(task)} /> : null}
-                {pauseable ? <ActionButton label={task.status === 'RUNNING' ? 'Dừng ngay campaign' : 'Tạm dừng campaign'} icon="pause" disabled={!canAdmin || pausingId === task.id} loading={pausingId === task.id} onClick={() => void pauseTask(task)} /> : null}
-                {pauseRequested ? <ActionButton label="Đang chờ tác vụ hiện tại kết thúc để tạm dừng" icon="pause" disabled /> : null}
-                {resumable ? <ActionButton label="Tiếp tục campaign" icon="play" disabled={!canAdmin || resumingId === task.id} loading={resumingId === task.id} onClick={() => void resumeTask(task)} /> : null}
-                {!finished && !task.cancelledAt ? <ActionButton label={task.status === 'RUNNING' ? 'Hủy ngay campaign' : 'Hủy campaign'} icon="close" danger disabled={!canAdmin || cancellingId === task.id} loading={cancellingId === task.id} onClick={() => cancelTask(task)} /> : null}
-                {!finished && task.cancelledAt ? <ActionButton label="Đang chờ tác vụ hiện tại kết thúc để hủy" icon="close" danger disabled /> : null}
-              </Space>;
-            } },
+      <Card className="resource-card" title={<PageSectionTitle title="Danh sách chiến dịch TikTok" description="Mỗi dòng là một chiến dịch; mở chi tiết để xem kết quả của từng profile" />} extra={<Space className="card-toolbar"><Input.Search aria-label="Tìm chiến dịch TikTok" allowClear value={campaignSearch} onChange={event => setCampaignSearch(event.target.value)} placeholder="Tìm tên hoặc từ khóa..." /><Select aria-label="Lọc chiến dịch TikTok" className="status-filter" value={campaignFilter} onChange={setCampaignFilter} options={['ALL', 'PENDING', 'DRAFT', 'QUEUED', 'RUNNING', 'PAUSED', 'SUCCEEDED', 'FAILED', 'REQUIRES_ACTION', 'CANCELLED'].map(value => ({ value, label: tiktokStatusLabels[value] ?? value }))} /><ActionButton label="Làm mới chiến dịch" icon="refresh" onClick={() => void tasks.refetch()} /></Space>}>
+          <Table<TikTokCampaign> className="campaign-table" size="middle" rowKey="id" loading={tasks.isLoading} dataSource={taskCampaigns} pagination={tablePagination('chiến dịch')} scroll={{ x: 1_180 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có chiến dịch TikTok" /> }} columns={[
+            { title: 'Chiến dịch', width: 240, render: (_: unknown, campaign) => <div className="campaign-name"><strong>{campaign.representative.payload?.name ?? actionLabel(campaign.representative.action)}</strong><small>{campaign.representative.payload?.query ?? actionLabel(campaign.representative.action)}</small></div> },
+            { title: 'Loại', width: 180, render: (_: unknown, campaign) => <Tag>{actionLabel(campaign.representative.action)}</Tag> },
+            { title: 'Profile', width: 120, render: (_: unknown, campaign) => campaign.representative.action === 'SEARCH_TIKTOK_VIDEOS' ? <Typography.Text type="secondary">Không cần login</Typography.Text> : `${new Set(campaign.tasks.map(task => task.account.id)).size} profile` },
+            { title: 'Tiến độ', width: 220, render: (_: unknown, campaign) => { const completedTasks = campaign.tasks.filter(task => task.status === 'SUCCEEDED' && !isIncompleteTikTokCampaign(task)).length; const pendingTasks = campaign.tasks.filter(task => ['FAILED', 'REQUIRES_ACTION'].includes(task.status) || isIncompleteTikTokCampaign(task)).length; return <div className="campaign-result-cell"><span className="campaign-result-primary">{completedTasks}/{campaign.tasks.length} tác vụ hoàn tất</span><Typography.Text type="secondary">{pendingTasks ? `${pendingTasks} tác vụ cần xử lý` : 'Theo dõi chi tiết theo profile'}</Typography.Text></div>; } },
+            { title: 'Trạng thái', width: 150, render: (_: unknown, campaign) => groupedCampaignTag(campaign) },
+            { title: 'Người tạo', width: 180, ellipsis: true, render: (_: unknown, campaign) => campaign.representative.createdBy?.displayName || campaign.representative.createdBy?.email || 'Dữ liệu cũ' },
+            { title: 'Ngày tạo', width: 150, render: (_: unknown, campaign) => new Date(campaign.representative.createdAt).toLocaleString('vi-VN') },
+            { title: 'Thao tác', width: 180, fixed: 'right', render: (_: unknown, campaign) => { const finished = ['SUCCEEDED', 'CANCELLED'].includes(campaign.status); return <Space wrap size={6}>
+              <ActionButton label="Xem chi tiết" icon="view" onClick={() => setSelectedCampaignId(campaign.id)} />
+              {campaign.status === 'PENDING' ? <ActionButton label="Duyệt & xếp hàng" icon="play" type="primary" disabled={!canAdmin || approvingId === campaign.id} loading={approvingId === campaign.id} onClick={() => approveCampaignGroup(campaign)} /> : null}
+              {['RUNNING', 'QUEUED'].includes(campaign.status) ? <ActionButton label="Yêu cầu tạm dừng" icon="pause" disabled={!canAdmin || pausingId === campaign.id} loading={pausingId === campaign.id} onClick={() => controlCampaignGroup(campaign, 'pause')} /> : null}
+              {campaign.status === 'PAUSED' ? <ActionButton label="Tiếp tục chiến dịch" icon="play" disabled={!canAdmin || resumingId === campaign.id} loading={resumingId === campaign.id} onClick={() => controlCampaignGroup(campaign, 'resume')} /> : null}
+              {!finished ? <ActionButton label="Yêu cầu hủy" icon="close" danger disabled={!canAdmin || cancellingId === campaign.id} loading={cancellingId === campaign.id} onClick={() => controlCampaignGroup(campaign, 'cancel')} /> : null}
+            </Space>; } },
           ]} />
+          {(tasks.data?.length ?? 0) >= taskLimit && taskLimit < 2_000 ? <Flex justify="center" style={{ marginTop: 16 }}><Button loading={tasks.isFetching} onClick={() => setTaskLimit(limit => Math.min(2_000, limit + 100))}>Tải thêm chiến dịch cũ</Button></Flex> : null}
         </Card>
-    {selectedCampaign ? <Modal className="tiktok-result-modal" title={<PageSectionTitle title={selectedCampaign.payload?.name ?? actionLabel(selectedCampaign.action)} description={selectedCampaign.action === 'SEARCH_TIKTOK_VIDEOS' ? 'Chọn video trong kết quả Search nếu muốn mở campaign hành động riêng' : 'Chi tiết campaign và kết quả thực thi'} />} open onCancel={() => setSelectedCampaignId(undefined)} footer={selectedCampaign.action === 'SEARCH_TIKTOK_VIDEOS' ? <Flex className="tiktok-selection-toolbar" justify="space-between" align="center" wrap gap={12}><Typography.Text type="secondary">{selectedCount} video được chọn</Typography.Text><Button type="primary" disabled={!selectedCount || !canOperate} onClick={startActionFromSelection}>Hành động trên video đã chọn</Button></Flex> : null} destroyOnHidden width={1_100}>
+    {selectedCampaign ? <Modal className="tiktok-result-modal campaign-detail-modal" title={<PageSectionTitle title={selectedCampaign.payload?.name ?? actionLabel(selectedCampaign.action)} description={selectedCampaign.action === 'SEARCH_TIKTOK_VIDEOS' ? 'Chọn video trong kết quả Search để tạo chiến dịch hành động' : 'Chi tiết chiến dịch và kết quả theo từng profile'} />} open onCancel={() => setSelectedCampaignId(undefined)} footer={selectedCampaign.action === 'SEARCH_TIKTOK_VIDEOS' ? <Flex className="tiktok-selection-toolbar" justify="space-between" align="center" wrap gap={12}><Typography.Text type="secondary">{selectedCount} video được chọn</Typography.Text><Button type="primary" disabled={!selectedCount || !canOperate} onClick={startActionFromSelection}>Tạo chiến dịch từ video đã chọn</Button></Flex> : null} destroyOnHidden width={1_100}>
           {selectedCampaign.action === 'SEARCH_TIKTOK_VIDEOS' ? <>
+            <CampaignDetailOverview items={[{ label: 'Loại', value: actionLabel(selectedCampaign.action) }, { label: 'Profile', value: 'Không cần đăng nhập' }, { label: 'Kết quả', value: `${selectedResults.length} video` }, { label: 'Trạng thái', value: taskTag(selectedCampaign) }]} />
             <Alert type={selectedCampaign.status === 'SUCCEEDED' ? 'info' : 'warning'} showIcon title={selectedCampaign.status === 'SUCCEEDED' ? `${selectedResults.length} video đã được lưu trong campaign` : 'Campaign Search cần xử lý trước khi có kết quả'} description={selectedCampaign.status === 'SUCCEEDED' ? 'Search campaign chỉ lưu metadata. Nếu cần, chọn các video rồi mở dialog campaign hành động; nếu không thì chỉ cần đóng phần kết quả này.' : selectedCampaign.lastError ?? 'Search dùng user-data tạm và không yêu cầu profile TikTok đăng nhập; chỉ cần chạy lại nếu UI TikTok gặp lỗi.'} action={selectedCampaign.status === 'SUCCEEDED' ? undefined : <Space>{['FAILED', 'REQUIRES_ACTION'].includes(selectedCampaign.status) ? <Button type="primary" disabled={!canOperate} loading={retryingId === selectedCampaign.id} onClick={() => retryTask(selectedCampaign)}>Chạy lại Search</Button> : null}</Space>} />
             <Alert type="info" showIcon title="Nguồn số liệu Search" description="Trang Search của TikTok chỉ cung cấp số tim trên card. View và comment chỉ hiển thị khi TikTok trả về video stats xác thực; hệ thống không dùng số tim thay thế." />
             <Table<VideoRow> className="campaign-table" rowKey="videoUrl" size="small" scroll={{ x: 900 }} dataSource={selectedResults} pagination={tablePagination('video')} rowSelection={{ preserveSelectedRowKeys: true, selectedRowKeys: selectedVideoUrls, onChange: keys => setSelectedVideoUrls(current => { const visibleKeys = new Set(selectedResults.map(video => video.videoUrl)); const preserved = current.filter(key => !visibleKeys.has(key)); return [...preserved, ...keys.map(String)]; }) }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có video metadata" /> }} columns={[
@@ -660,11 +740,13 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
               { title: 'Cmt', dataIndex: 'comments', render: (value: number) => numberLabel(value) },
             ]} />
           </> : <Space orientation="vertical" size={12} style={{ width: '100%' }}>
-            <Space orientation="vertical">
-              <Typography.Text>Loại: {actionLabel(selectedCampaign.action)}</Typography.Text>
-              <Typography.Text type="secondary">{campaignResult(selectedCampaign)}</Typography.Text>
-              {campaignResultReason(selectedCampaign) ? <Typography.Text type="secondary">{campaignResultReason(selectedCampaign)}</Typography.Text> : null}
-            </Space>
+            <CampaignDetailOverview items={[{ label: 'Loại', value: actionLabel(selectedCampaign.action) }, { label: 'Profile', value: new Set((selectedGroup?.tasks ?? []).map(task => task.account.id)).size }, { label: 'Tác vụ hoàn tất', value: `${selectedGroup?.tasks.filter(task => task.status === 'SUCCEEDED' && !isIncompleteTikTokCampaign(task)).length ?? 0}/${selectedGroup?.tasks.length ?? 0}` }, { label: 'Trạng thái', value: groupedCampaignTag(selectedGroup ?? { id: selectedCampaign.id, representative: selectedCampaign, tasks: [selectedCampaign], status: selectedCampaign.status }) }]} />
+            <Table<TaskItem> className="campaign-table" rowKey="id" size="small" pagination={false} scroll={{ x: 760 }} dataSource={selectedGroup?.tasks ?? []} columns={[
+              { title: 'Profile', render: (_: unknown, task) => task.account.username ?? task.account.id },
+              { title: 'Kết quả', render: (_: unknown, task) => <Space orientation="vertical" size={2}><span>{campaignResult(task)}</span>{campaignResultReason(task) ? <Typography.Text type="secondary">{campaignResultReason(task)}</Typography.Text> : null}</Space> },
+              { title: 'Trạng thái', render: (_: unknown, task) => taskTag(task) },
+              { title: 'Xử lý', width: 80, render: (_: unknown, task) => ['FAILED', 'REQUIRES_ACTION'].includes(task.status) || isIncompleteTikTokCampaign(task) ? <ActionButton label={retrySafety(task) === 'VERIFY' ? 'Kiểm tra rồi chạy lại' : 'Tiếp tục phần còn lại'} icon="refresh" disabled={!canAdmin} loading={retryingId === task.id} onClick={() => retryTask(task)} /> : null },
+            ]} />
             {selectedCampaign.status === 'REQUIRES_ACTION' || isStaleBrowserRun(selectedCampaign) ? <Alert
               type="warning"
               showIcon
@@ -680,17 +762,17 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
               style={{ marginBottom: 4 }}
             /> : null}
             {selectedCampaign.payload?.text ? <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>Nội dung: {selectedCampaign.payload.text}</Typography.Paragraph> : null}
-            {selectedReportEntries.length ? <Table<TikTokReportEntry> className="campaign-table" rowKey={reportEntryKey} size="small" pagination={tablePagination('báo cáo')} scroll={{ x: 760 }} dataSource={selectedReportEntries} columns={[
+            {selectedReportEntries.length ? <Table<TikTokReportEntry> className="campaign-table" rowKey={reportEntryKey} size="small" pagination={tablePagination('kết quả')} scroll={{ x: 760 }} dataSource={selectedReportEntries} columns={[
               { title: 'Thao tác', dataIndex: 'action', render: (value: string) => value === 'MESSAGE' ? 'Inbox' : value === 'REPLY' ? 'Reply comment' : value === 'LIKE' ? 'Tim comment' : 'Comment' },
               { title: 'Đối tượng', render: (_: unknown, entry: TikTokReportEntry) => reportTarget(entry) },
               { title: 'Kết quả', dataIndex: 'status', render: (value: string) => reportStatus(value) },
               { title: 'Thời điểm', dataIndex: 'completedAt', render: (value: string) => value ? new Date(value).toLocaleString('vi-VN') : '—' },
               { title: 'Chi tiết', dataIndex: 'reason', render: (value: string) => value ? <Typography.Text type="secondary">{value}</Typography.Text> : '—' },
-            ]} /> : <Alert type="info" showIcon title="Chưa có báo cáo chi tiết" description="Campaign cũ chỉ lưu số lượng tổng hợp. Các campaign chạy từ phiên bản này sẽ lưu từng người nhận hoặc từng video/bài viết cùng trạng thái thực thi." />}
+            ]} /> : <Alert type="info" showIcon title="Chưa có kết quả chi tiết" description="Chiến dịch cũ chỉ lưu số lượng tổng hợp. Các chiến dịch mới sẽ lưu từng người nhận hoặc từng video/bài viết cùng trạng thái thực thi." />}
           </Space>}
     </Modal> : null}
-    <Modal className="tiktok-create-modal" title={createDialogTitle} open={createOpen} onCancel={() => { if (!creatingTask) setCreateOpen(false); }} destroyOnHidden width={820} footer={createMode === 'SEARCH' ? <Space><Button onClick={() => setCreateOpen(false)} disabled={creatingTask}>Đóng</Button><Button type="primary" loading={creatingTask} disabled={createDialogSubmitDisabled} onClick={submitSearch}>Search video</Button></Space> : <Space><Button onClick={() => setCreateOpen(false)} disabled={creatingTask}>Đóng</Button><Button loading={creatingTask} disabled={createDialogSubmitDisabled} onClick={saveDraft}>Lưu bản nháp</Button><Button type="primary" loading={creatingTask} disabled={!canAdmin || createDialogSubmitDisabled} onClick={runNow}>Tạo & chạy ngay</Button></Space>}>
-      <div className="tiktok-dialog-body">{createDialogContent}</div>
+    <Modal className="tiktok-create-modal campaign-create-modal" title={createDialogTitle} open={createOpen} onCancel={() => { if (!creatingTask && !uploadingImages) setCreateOpen(false); }} destroyOnHidden width={820} footer={createMode === 'SEARCH' ? <Space className="campaign-modal-actions"><Button onClick={() => setCreateOpen(false)} disabled={creatingTask || uploadingImages}>Đóng</Button><Button type="primary" loading={creatingTask} disabled={createDialogSubmitDisabled} onClick={submitSearch}>Search video</Button></Space> : <Space className="campaign-modal-actions"><Button onClick={() => setCreateOpen(false)} disabled={creatingTask || uploadingImages}>Đóng</Button><Button loading={creatingTask} disabled={createDialogSubmitDisabled} onClick={saveDraft}>Lưu bản nháp</Button><Button type="primary" loading={creatingTask} disabled={!canAdmin || !targetAccountsReady || createDialogSubmitDisabled} onClick={runNow}>Duyệt & xếp hàng</Button></Space>}>
+      <div className="tiktok-dialog-body">{!targetAccountsReady ? <Alert type="info" showIcon title="Có profile chưa sẵn sàng" description="Bạn vẫn có thể lưu bản nháp. Hãy đăng nhập hoặc hoàn tất xác minh profile trước khi duyệt và xếp hàng." action={<Button onClick={onNavigateProfiles}>Mở Profiles</Button>} /> : null}{createDialogContent}</div>
     </Modal>
   </div>;
 }

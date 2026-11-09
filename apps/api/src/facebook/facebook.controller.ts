@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
 import { commentFacebookGroupPostsSchema, facebookGroupCollectionSchema, facebookOptInRecipientSchema, joinFacebookGroupsSchema, messageFacebookRecipientsSchema, messageFacebookReactorsSchema, postFacebookGroupsSchema, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema, retryFacebookCampaignSchema, type CommentFacebookGroupPostsInput, type FacebookGroupCollectionInput, type FacebookOptInRecipientInput, type JoinFacebookGroupsInput, type MessageFacebookRecipientsInput, type MessageFacebookReactorsInput, type PostFacebookGroupsInput, type ReplyFacebookPostCommentsInput, type RetryFacebookCampaignInput, type ScanFacebookPostCommentsInput, type SyncFacebookGroupsInput } from '@socio/contracts';
 import { OrganizationId } from '../common/organization-id.decorator';
 import { ZodValidationPipe } from '../common/zod-validation.pipe';
@@ -27,23 +27,23 @@ export class FacebookController {
   revokeOptInRecipient(@OrganizationId() org: string, @Param('id', new ParseUUIDPipe()) id: string) { return this.facebook.revokeOptInRecipient(org, id); }
   @Post('opt-in-recipients/:id/reactivate') @MinimumRole('OPERATOR')
   reactivateOptInRecipient(@OrganizationId() org: string, @Param('id', new ParseUUIDPipe()) id: string, @Body(new ZodValidationPipe(facebookOptInRecipientSchema)) input: FacebookOptInRecipientInput) { return this.facebook.updateOptInRecipient(org, id, input, true); }
-  @Get('campaigns') campaigns(@OrganizationId() org: string) { return this.facebook.campaigns(org); }
+  @Get('campaigns') campaigns(@OrganizationId() org: string, @Query('take') take?: string) { return this.facebook.campaigns(org, take ? Number(take) : undefined); }
   @Post('groups/sync') @MinimumRole('OPERATOR')
-  sync(@OrganizationId() org: string, @Body(new ZodValidationPipe(syncFacebookGroupsSchema)) input: SyncFacebookGroupsInput) { return this.facebook.sync(org, input); }
+  sync(@OrganizationId() org: string, @Body(new ZodValidationPipe(syncFacebookGroupsSchema)) input: SyncFacebookGroupsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.sync(org, input, principal.userId); }
   @Post('groups/join') @MinimumRole('OPERATOR')
-  join(@OrganizationId() org: string, @Body(new ZodValidationPipe(joinFacebookGroupsSchema)) input: JoinFacebookGroupsInput) { return this.facebook.join(org, input); }
+  join(@OrganizationId() org: string, @Body(new ZodValidationPipe(joinFacebookGroupsSchema)) input: JoinFacebookGroupsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.join(org, input, principal.userId); }
   @Post('groups/post') @MinimumRole('OPERATOR')
-  post(@OrganizationId() org: string, @Body(new ZodValidationPipe(postFacebookGroupsSchema)) input: PostFacebookGroupsInput) { return this.facebook.post(org, input); }
+  post(@OrganizationId() org: string, @Body(new ZodValidationPipe(postFacebookGroupsSchema)) input: PostFacebookGroupsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.post(org, input, principal.userId); }
   @Post('groups/message') @MinimumRole('OPERATOR')
-  message(@OrganizationId() org: string, @Body(new ZodValidationPipe(messageFacebookRecipientsSchema)) input: MessageFacebookRecipientsInput) { return this.facebook.message(org, input); }
+  message(@OrganizationId() org: string, @Body(new ZodValidationPipe(messageFacebookRecipientsSchema)) input: MessageFacebookRecipientsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.message(org, input, principal.userId); }
   @Post('posts/message-reactors') @MinimumRole('OPERATOR')
-  messageReactors(@OrganizationId() org: string, @Body(new ZodValidationPipe(messageFacebookReactorsSchema)) input: MessageFacebookReactorsInput) { return this.facebook.messageReactors(org, input); }
+  messageReactors(@OrganizationId() org: string, @Body(new ZodValidationPipe(messageFacebookReactorsSchema)) input: MessageFacebookReactorsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.messageReactors(org, input, principal.userId); }
   @Post('posts/scan-comments') @MinimumRole('OPERATOR')
-  scanComments(@OrganizationId() org: string, @Body(new ZodValidationPipe(scanFacebookPostCommentsSchema)) input: ScanFacebookPostCommentsInput) { return this.facebook.scanComments(org, input); }
+  scanComments(@OrganizationId() org: string, @Body(new ZodValidationPipe(scanFacebookPostCommentsSchema)) input: ScanFacebookPostCommentsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.scanComments(org, input, principal.userId); }
   @Post('posts/reply-comments') @MinimumRole('OPERATOR')
-  replyComments(@OrganizationId() org: string, @Body(new ZodValidationPipe(replyFacebookPostCommentsSchema)) input: ReplyFacebookPostCommentsInput) { return this.facebook.replyComments(org, input); }
+  replyComments(@OrganizationId() org: string, @Body(new ZodValidationPipe(replyFacebookPostCommentsSchema)) input: ReplyFacebookPostCommentsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.replyComments(org, input, principal.userId); }
   @Post('groups/comment-posts') @MinimumRole('OPERATOR')
-  commentGroupPosts(@OrganizationId() org: string, @Body(new ZodValidationPipe(commentFacebookGroupPostsSchema)) input: CommentFacebookGroupPostsInput) { return this.facebook.commentGroupPosts(org, input); }
+  commentGroupPosts(@OrganizationId() org: string, @Body(new ZodValidationPipe(commentFacebookGroupPostsSchema)) input: CommentFacebookGroupPostsInput, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.commentGroupPosts(org, input, principal.userId); }
   @Post('campaigns/:id/approve') @MinimumRole('ADMIN')
   approve(@OrganizationId() org: string, @Param('id', new ParseUUIDPipe()) id: string, @CurrentPrincipal() principal: AuthPrincipal) { return this.facebook.approve(org, id, principal.userId); }
   @Post('campaigns/:id/cancel') @MinimumRole('ADMIN')

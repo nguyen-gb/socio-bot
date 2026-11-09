@@ -74,28 +74,63 @@ export class FacebookCommentsAutomation {
   async commentGroupPosts(session: PlatformSession, inputGroupUrl: string, text: string, mediaAssetIds: string[] = [], filters: FacebookGroupPostCommentFilters): Promise<ActionResult> {
     const page = session.page as Page;
     const groupUrl = normalizeFacebookGroupUrl(inputGroupUrl);
-    try { await gotoPlatformPage(page, groupUrl, undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 }); }
+    // Open the chronological feed directly. Besides saving a brittle click on
+    // Facebook's feed-sort menu, this makes the frozen recent-days filter
+    // deterministic across English and Vietnamese layouts.
+    const chronologicalUrl = new URL(groupUrl);
+    chronologicalUrl.searchParams.set('sorting_setting', 'CHRONOLOGICAL');
+    try { await gotoPlatformPage(page, chronologicalUrl.toString(), undefined, { timeoutMs: this.timing.mainTimeoutMs ?? 45_000 }); }
     catch { return manual('Không tải được nhóm Facebook; chưa bình luận bài viết.', { groupUrl, postsFound: 0, postsCommented: 0 }); }
     const blocked = await guard(page);
     if (blocked) return blocked;
     const main = page.locator('[role="main"], main').filter({ visible: true }).first();
     await main.waitFor({ state: 'visible', timeout: this.timing.mainTimeoutMs ?? 45_000 }).catch(() => undefined);
     if (!(await main.isVisible().catch(() => false))) return manual('Không xác định được nội dung nhóm Facebook; chưa bình luận bài viết.', { groupUrl, postsFound: 0, postsCommented: 0 });
-    const posts = await discoverGroupPosts(page, groupUrl, filters, this.timing.controlTimeoutMs ?? 30_000);
-    if (!posts.length) return manual('Không tìm thấy bài viết phù hợp bộ lọc trong nhóm; chưa bình luận.', { groupUrl, postsFound: 0, postsCommented: 0, filters });
+    const discovery = await discoverGroupPosts(page, groupUrl, { ...filters, maxPosts: filters.maxPosts + 10 }, this.timing.controlTimeoutMs ?? 30_000);
+    const candidates = discovery.posts;
+    if (!candidates.length) return manual('Không tìm thấy bài viết phù hợp bộ lọc trong nhóm; chưa bình luận.', {
+      groupUrl,
+      postsFound: 0,
+      postsCommented: 0,
+      filters,
+      postDiscovery: discovery.diagnostics,
+    });
     let postsCommented = 0;
     let sideEffectStarted = false;
     const results: Array<Record<string, unknown>> = [];
-    for (const post of posts) {
-      const result = await this.commentSinglePost(session, post.postUrl, text, mediaAssetIds);
+    const posts: typeof candidates = [];
+    for (const post of candidates) {
+      if (posts.length >= filters.maxPosts) break;
+      if (await session.reserveFacebookTarget?.({ action: 'COMMENT', targetKey: post.targetKey }) === false) {
+        results.push({ postUrl: post.postUrl, reactions: post.reactions, comments: post.comments, commentStatus: 'SKIPPED_DUPLICATE', deduplicated: true });
+        continue;
+      }
+      posts.push(post);
+    }
+    if (!posts.length) return {
+      ok: true,
+      data: { groupUrl, postsFound: candidates.length, postsCommented: 0, filters, posts: results, deduplicated: true, actionStatus: 'SKIPPED' },
+    };
+    for (const [postIndex, post] of posts.entries()) {
+      const result = post.feedAnchorHref
+        ? await this.commentFeedPost(session, post.feedAnchorHref, post.targetKey, text, mediaAssetIds)
+        : await this.commentSinglePost(session, post.postUrl, text, mediaAssetIds);
       const row = { postUrl: post.postUrl, reactions: post.reactions, comments: post.comments, ...(post.createdAt ? { createdAt: post.createdAt.toISOString() } : {}), ...(result.data ?? {}) };
       results.push(row);
       if (result.data?.sideEffectStarted === true) sideEffectStarted = true;
-      if (result.ok) postsCommented += 1;
-      else if (sideEffectStarted) break;
+      if (result.ok) {
+        postsCommented += 1;
+        await session.completeFacebookTarget?.({ action: 'COMMENT', targetKey: post.targetKey });
+      } else if (sideEffectStarted) {
+        for (const pending of posts.slice(postIndex + 1)) {
+          await session.releaseFacebookTarget?.({ action: 'COMMENT', targetKey: pending.targetKey });
+        }
+        break;
+      }
+      else await session.releaseFacebookTarget?.({ action: 'COMMENT', targetKey: post.targetKey });
       await page.waitForTimeout(750);
     }
-    const data = { groupUrl, postsFound: posts.length, postsCommented, filters, posts: results, ...(sideEffectStarted ? { sideEffectStarted: true } : {}) };
+    const data = { groupUrl, postsFound: candidates.length, postsRequested: posts.length, postsCommented, filters, posts: results, ...(sideEffectStarted ? { sideEffectStarted: true } : {}) };
     if (postsCommented === posts.length) return { ok: true, data };
     return manual(postsCommented ? 'Đã bình luận một phần; dừng để kiểm tra các bài còn lại, không tự gửi lại.' : 'Không xác nhận được bình luận vào bài viết; chưa gửi thêm.', data);
   }
@@ -150,6 +185,45 @@ export class FacebookCommentsAutomation {
     }
     if (!confirmed) return manual('Đã gửi thao tác nhưng chưa xác nhận được bình luận; không tự gửi lại.', { postUrl, replyStatus: 'UNKNOWN', sideEffectStarted: true });
     return { ok: true, data: { postUrl, commentStatus: 'SENT', sideEffectStarted: true } };
+  }
+
+  private async commentFeedPost(session: PlatformSession, feedAnchorHref: string, targetKey: string, text: string, mediaAssetIds: string[]): Promise<ActionResult> {
+    const page = session.page as Page;
+    const marked = await page.locator('a[href]').evaluateAll((anchors, href) => {
+      const anchor = anchors.find(element => (element as HTMLAnchorElement).href === href);
+      if (!anchor) return false;
+      anchor.setAttribute('data-socio-feed-target', 'true');
+      return true;
+    }, feedAnchorHref).catch(() => false);
+    if (!marked) return manual('Không còn thấy bài viết đã chọn trong feed; chưa bình luận.', { targetKey });
+    const anchor = page.locator('a[data-socio-feed-target="true"]').first();
+    const scope = anchor.locator('xpath=ancestor::*[.//*[@role="textbox" or self::textarea or @contenteditable="true"]][1]');
+    if (!(await scope.isVisible().catch(() => false))) return manual('Không xác định được card bài viết trong feed; chưa bình luận.', { targetKey });
+    const textbox = await topLevelCommentTextbox(scope, page);
+    if (!textbox) return manual('Không tìm thấy ô bình luận của bài viết trong feed; chưa gửi.', { targetKey });
+    const beforeMatches = await visiblePostedReplyCount(scope, text);
+    const beforeImageSources = mediaAssetIds.length ? await visibleImageSources(scope) : [];
+    await textbox.fill(text);
+    if ((await editorText(textbox)).trim() !== text.trim()) return manual('Nội dung bình luận chưa khớp; chưa gửi.', { targetKey });
+    const formComposer = textbox.locator('xpath=ancestor::form[1]');
+    const editorSurface = textbox.locator('xpath=ancestor::*[.//*[@role="textbox"] and .//*[@role="button"]][1]');
+    const composer = await formComposer.count() ? formComposer : editorSurface;
+    const send = composer.getByRole('button', { name: REPLY_SEND }).filter({ visible: true }).last();
+    if (mediaAssetIds.length) {
+      if (!session.resolveMediaAssets) throw new Error('Worker chưa hỗ trợ tải ảnh; chưa gửi bình luận.');
+      const images = await session.resolveMediaAssets(mediaAssetIds);
+      if (images.length !== mediaAssetIds.length) throw new Error('Không tải đủ ảnh của bình luận; chưa gửi.');
+      await attachFacebookImages(page, composer, images, this.timing.controlTimeoutMs ?? 60_000, send, scope, scope);
+    }
+    await session.beforeExternalAction?.();
+    await textbox.press('Enter').catch(() => undefined);
+    let confirmed = await waitForPostedReply(scope, textbox, text, beforeMatches, this.timing.controlTimeoutMs ?? 15_000, beforeImageSources, mediaAssetIds.length > 0);
+    if (!confirmed && await send.isVisible().catch(() => false) && await send.isEnabled().catch(() => false)) {
+      await send.click({ timeout: 5_000 }).catch(() => undefined);
+      confirmed = await waitForPostedReply(scope, textbox, text, beforeMatches, this.timing.controlTimeoutMs ?? 15_000, beforeImageSources, mediaAssetIds.length > 0);
+    }
+    if (!confirmed) return manual('Đã gửi thao tác nhưng chưa xác nhận được bình luận; không tự gửi lại.', { targetKey, replyStatus: 'UNKNOWN', sideEffectStarted: true });
+    return { ok: true, data: { targetKey, commentStatus: 'SENT', sideEffectStarted: true } };
   }
 
   async replyPostComments(session: PlatformSession, inputPostUrl: string, text: string, maxReplies: number, mediaAssetIds: string[] = []): Promise<ActionResult> {
@@ -469,40 +543,156 @@ async function resolveReplyScope(page: Page, postUrl: string): Promise<Locator |
 
 interface DiscoveredGroupPost {
   postUrl: string;
+  targetKey: string;
+  feedAnchorHref?: string;
   createdAt?: Date;
   reactions: number;
   comments: number;
 }
 
-async function discoverGroupPosts(page: Page, groupUrl: string, filters: FacebookGroupPostCommentFilters, timeoutMs: number): Promise<DiscoveredGroupPost[]> {
+async function discoverGroupPosts(page: Page, groupUrl: string, filters: FacebookGroupPostCommentFilters, timeoutMs: number): Promise<{ posts: DiscoveredGroupPost[]; diagnostics: Record<string, unknown> }> {
   const deadline = Date.now() + Math.max(timeoutMs, 30_000);
   const posts = new Map<string, DiscoveredGroupPost>();
+  let observedRows = 0;
+  let matchingGroupRows = 0;
+  let parsedDates = 0;
+  let iterations = 0;
   let stagnant = 0;
   let previousCount = 0;
   while (Date.now() < deadline && stagnant < 6 && posts.size < Math.max(filters.maxPosts * 3, 20)) {
-    const articles = page.locator('[role="article"]').filter({ visible: true });
-    const rows = await articles.evaluateAll((elements) => elements.map(element => {
-      const links = Array.from(element.querySelectorAll<HTMLAnchorElement>('a[href]')).map(anchor => anchor.href);
-      const postHref = links.find(href => /\/groups\/[^/]+\/(?:posts|permalink)\/\d+/i.test(href))
-        ?? links.find(href => /\/[^/]+\/(?:posts|permalink)\/\d+/i.test(href));
-      if (!postHref) return undefined;
-      const timeNode = element.querySelector<HTMLElement>('time[datetime], abbr[title], [data-utime]');
-      const labels = Array.from(element.querySelectorAll<HTMLElement>('[aria-label], [title]')).map(node => `${node.getAttribute('aria-label') ?? ''} ${node.getAttribute('title') ?? ''}`);
-      return {
-        href: postHref,
-        text: (element.textContent ?? '').replace(/\s+/g, ' ').trim(),
-        time: timeNode?.getAttribute('datetime') ?? timeNode?.getAttribute('title') ?? timeNode?.getAttribute('data-utime') ?? timeNode?.textContent ?? '',
-        labels: labels.join(' '),
+    iterations += 1;
+    const rows = await page.evaluate(() => {
+      const visible = (element: Element): element is HTMLElement => {
+        const node = element as HTMLElement;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
       };
-    }).filter((value): value is { href: string; text: string; time: string; labels: string } => Boolean(value))).catch(() => []);
+      const postControl = (element: Element): boolean => {
+        const role = element.getAttribute('role') ?? '';
+        const interactive = ['BUTTON', 'A'].includes(element.tagName) || ['button', 'link'].includes(role);
+        if (!interactive) return false;
+        const label = element.getAttribute('aria-label') ?? (element.textContent ?? '').trim();
+        return /comment on .*post|bình luận (?:về|trên) bài viết|comment(?:s)? on post|^(?:comment|leave a comment|bình luận|viết bình luận)$/i.test(label);
+      };
+      const canonicalPostHref = (root: Element): string | undefined => {
+        const links = Array.from(root.querySelectorAll<HTMLAnchorElement>('a[href]')).map(anchor => anchor.href);
+        return links.find(href => /\/groups\/[^/]+\/(?:posts|permalink)\/\d+/i.test(href))
+          ?? links.find(href => /\/[^/]+\/(?:posts|permalink)\/\d+/i.test(href));
+      };
+      const feedPostHref = (root: Element): string | undefined => Array.from(root.querySelectorAll<HTMLAnchorElement>('a[href]'))
+        .map(anchor => anchor.href)
+        .find(href => /\/groups\/[^/?]+\/?\?/.test(href) && /(?:%5B|\[)0(?:%5D|\])=/i.test(href) && /__cft__/i.test(href));
+      // Facebook now renders the post card itself as anonymous divs and uses
+      // role=article mostly for comments. Anchor each card at its semantic
+      // comment control. Stop at the smallest ancestor that owns a canonical
+      // post link; a strict control-count check is too fragile because some
+      // builds render duplicated desktop/mobile action controls in one card.
+      const inferredRoots: HTMLElement[] = [];
+      const interactiveControls = 'button, a, [role="button"], [role="link"]';
+      for (const control of Array.from(document.querySelectorAll<HTMLElement>(interactiveControls)).filter(element => visible(element) && postControl(element))) {
+        let root = control;
+        while (root.parentElement) {
+          const parent = root.parentElement;
+          if (['feed', 'main'].includes(parent.getAttribute('role') ?? '')) break;
+          root = parent;
+          if (canonicalPostHref(root) || (feedPostHref(root) && root.querySelector('[role="textbox"], textarea, [contenteditable="true"]'))) break;
+        }
+        if ((canonicalPostHref(root) || feedPostHref(root)) && !inferredRoots.includes(root)) inferredRoots.push(root);
+      }
+
+      // Some layouts temporarily omit/rename the Comment action while still
+      // exposing a canonical timestamp link. Use that link as a second anchor
+      // and accept the card once it owns a post action or comment composer.
+      const canonicalLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/groups/"]'))
+        .filter(anchor => visible(anchor) && /\/groups\/[^/]+\/(?:posts|permalink)\/\d+/i.test(anchor.href));
+      for (const anchor of canonicalLinks) {
+        let root: HTMLElement = anchor;
+        while (root.parentElement) {
+          const parent = root.parentElement;
+          if (['feed', 'main'].includes(parent.getAttribute('role') ?? '')) break;
+          root = parent;
+          const hasCommentAction = Array.from(root.querySelectorAll(interactiveControls)).some(postControl);
+          const hasComposer = Array.from(root.querySelectorAll<HTMLElement>('[role="textbox"], textarea, [contenteditable="true"]')).some(element => {
+            const label = `${element.getAttribute('aria-label') ?? ''} ${element.getAttribute('placeholder') ?? ''}`;
+            return /comment as|answer as|write a comment|bình luận|trả lời với tư cách/i.test(label);
+          });
+          if (hasCommentAction || hasComposer) break;
+        }
+        if (!inferredRoots.includes(root)) inferredRoots.push(root);
+      }
+
+      // Keep the older semantic cards for layouts where they still represent
+      // posts, but reject comment articles unless they contain a post control.
+      const semanticRoots = Array.from(document.querySelectorAll<HTMLElement>('[role="article"]'))
+        .filter(element => visible(element) && Array.from(element.querySelectorAll(interactiveControls)).some(postControl));
+      const roots = [...new Set([...inferredRoots, ...semanticRoots])];
+
+      const visualText = (element: HTMLElement): string => {
+        const bounds = element.getBoundingClientRect();
+        const leaves = Array.from(element.querySelectorAll<HTMLElement>('span'))
+          .filter(span => span.children.length === 0 && Boolean(span.textContent?.trim()))
+          .map(span => ({
+            text: (span.textContent ?? '').replace(/\u034f/g, ''),
+            rect: span.getBoundingClientRect(),
+            order: Number.parseFloat(window.getComputedStyle(span).order) || 0,
+          }))
+          // Recent Facebook builds insert dozens of decoy timestamp letters
+          // below an overflow-clipped flex row. Only characters intersecting
+          // the clickable link are actually visible to the user.
+          .filter(item => item.rect.bottom > bounds.top && item.rect.top < bounds.bottom
+            && item.rect.right > bounds.left && item.rect.left < bounds.right)
+          .sort((left, right) => left.order - right.order);
+        const rendered = leaves.map(item => item.text).join('').replace(/\s+/g, ' ').trim();
+        return rendered || (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+      };
+      const looksLikeDate = (value: string): boolean => /(?:just now|moments? ago|vừa xong|(?:about\s+)?(?:a|an|one|\d+)\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|d|h|m|w)(?:\s+ago)?|yesterday|hôm qua|\d{1,2}\s+th(?:á|a)ng|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2})/i.test(value);
+
+      return roots.map(element => {
+        const canonicalHref = canonicalPostHref(element);
+        const feedHref = feedPostHref(element);
+        const postHref = canonicalHref ?? feedHref;
+        if (!postHref) return undefined;
+        const timeNode = element.querySelector<HTMLElement>('time[datetime], abbr[title], [data-utime]');
+        const explicitTime = timeNode?.getAttribute('datetime') ?? timeNode?.getAttribute('title') ?? timeNode?.getAttribute('data-utime') ?? timeNode?.textContent ?? '';
+        const visualTime = Array.from(element.querySelectorAll<HTMLAnchorElement>('a[href]'))
+          .map(anchor => ({ value: visualText(anchor), top: anchor.getBoundingClientRect().top }))
+          .filter(candidate => looksLikeDate(candidate.value))
+          .sort((left, right) => left.top - right.top)[0]?.value ?? '';
+        const labels = Array.from(element.querySelectorAll<HTMLElement>('[aria-label], [title]'))
+          .map(node => `${node.getAttribute('aria-label') ?? ''} ${node.getAttribute('title') ?? ''}`);
+        return {
+          href: postHref,
+          canonical: Boolean(canonicalHref),
+          text: (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim(),
+          time: explicitTime || visualTime,
+          labels: labels.join(' '),
+        };
+      }).filter((value): value is { href: string; canonical: boolean; text: string; time: string; labels: string } => Boolean(value));
+    }).catch(() => [] as Array<{ href: string; canonical: boolean; text: string; time: string; labels: string }>);
+    observedRows = Math.max(observedRows, rows.length);
     for (const row of rows) {
-      let postUrl: string;
-      try { postUrl = normalizeFacebookPostUrl(row.href); } catch { continue; }
-      if (!postUrl.includes(new URL(groupUrl).pathname.split('/').filter(Boolean)[1] ?? '')) continue;
+      const groupId = new URL(groupUrl).pathname.split('/').filter(Boolean)[1] ?? '';
+      if (!row.href.includes(`/groups/${groupId}`)) continue;
+      let postUrl = groupUrl;
+      let targetKey: string;
+      let feedAnchorHref: string | undefined;
+      if (row.canonical) {
+        try { postUrl = normalizeFacebookPostUrl(row.href); } catch { continue; }
+        targetKey = postUrl;
+      } else {
+        feedAnchorHref = row.href;
+        // __cft__ is regenerated on reload, so it is only a locator for this
+        // browser session. Use the visible card content for cross-campaign
+        // deduplication instead of persisting that ephemeral token.
+        targetKey = `facebook-group-feed:${groupId}:${stableStringHash(row.text)}`;
+      }
+      matchingGroupRows += 1;
       const createdAt = parseFacebookPostDate(row.time, row.text);
+      if (createdAt) parsedDates += 1;
       const reactions = parseFacebookMetric(row.labels, row.text, /(?:like|likes|reaction|reactions|lượt thích|lượt bày tỏ|cảm xúc|tim)/i);
       const comments = parseFacebookMetric(row.labels, row.text, /(?:comment|comments|bình luận)/i);
-      posts.set(postUrl, { postUrl, ...(createdAt ? { createdAt } : {}), reactions, comments });
+      posts.set(targetKey, { postUrl, targetKey, ...(feedAnchorHref ? { feedAnchorHref } : {}), ...(createdAt ? { createdAt } : {}), reactions, comments });
     }
     if (posts.size === previousCount) stagnant += 1; else stagnant = 0;
     previousCount = posts.size;
@@ -518,13 +708,56 @@ async function discoverGroupPosts(page: Page, groupUrl: string, filters: Faceboo
     await page.waitForTimeout(400);
   }
   const cutoff = Date.now() - filters.daysRecent * 24 * 60 * 60 * 1000;
-  return [...posts.values()]
+  const filtered = [...posts.values()]
     // Never treat an unparsed timestamp as recent: the requested time window
     // is a safety boundary, so an ambiguous post must not receive a comment.
     .filter(post => Boolean(post.createdAt && post.createdAt.getTime() >= cutoff))
     .filter(post => post.reactions >= filters.minReactions && (filters.maxReactions == null || post.reactions <= filters.maxReactions))
     .filter(post => post.comments >= filters.minComments && (filters.maxComments == null || post.comments <= filters.maxComments))
     .slice(0, filters.maxPosts);
+  const domDiagnostics = await page.evaluate(() => {
+    const visible = (element: Element): element is HTMLElement => {
+      const node = element as HTMLElement;
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const interactive = Array.from(document.querySelectorAll<HTMLElement>('button, a, [role="button"], [role="link"]')).filter(visible);
+    const labels = interactive.map(element => (element.getAttribute('aria-label') ?? element.textContent ?? '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+    const commentLabels = labels.filter(label => /comment|bình luận|nhận xét/i.test(label)).slice(0, 12);
+    const canonicalPostLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))
+      .filter(visible)
+      .map(anchor => anchor.href)
+      .filter(href => /\/groups\/[^/]+\/(?:posts|permalink)\/\d+/i.test(href))
+      .slice(0, 12);
+    const composerLabels = Array.from(document.querySelectorAll<HTMLElement>('[role="textbox"], textarea, [contenteditable="true"]'))
+      .filter(visible)
+      .map(element => `${element.getAttribute('aria-label') ?? ''} ${element.getAttribute('placeholder') ?? ''}`.trim())
+      .filter(Boolean)
+      .slice(0, 12);
+    return { visibleInteractiveCount: interactive.length, commentLabels, canonicalPostLinks, composerLabels };
+  }).catch(() => ({ visibleInteractiveCount: 0, commentLabels: [] as string[], canonicalPostLinks: [] as string[], composerLabels: [] as string[] }));
+  return {
+    posts: filtered,
+    diagnostics: {
+      actualUrl: page.url(),
+      requestedFeedUrl: `${groupUrl}${groupUrl.includes('?') ? '&' : '?'}sorting_setting=CHRONOLOGICAL`,
+      title: await page.title().catch(() => ''),
+      iterations,
+      observedRows,
+      matchingGroupRows,
+      normalizedPosts: posts.size,
+      parsedDates,
+      eligiblePosts: filtered.length,
+      discoveredPosts: [...posts.values()].slice(0, 12).map(post => ({
+        targetKey: post.targetKey,
+        createdAt: post.createdAt?.toISOString(),
+        reactions: post.reactions,
+        comments: post.comments,
+      })),
+      ...domDiagnostics,
+    },
+  };
 }
 
 async function topLevelCommentTextbox(scope: Locator, page: Page): Promise<Locator | undefined> {
@@ -533,7 +766,7 @@ async function topLevelCommentTextbox(scope: Locator, page: Page): Promise<Locat
   for (let index = count - 1; index >= 0; index -= 1) {
     const candidate = candidates.nth(index);
     const label = `${await candidate.getAttribute('aria-label').catch(() => '')} ${await candidate.getAttribute('placeholder').catch(() => '')} ${await candidate.getAttribute('data-placeholder').catch(() => '')}`;
-    if (/(comment|bình luận|viết bình luận|write a comment|nhận xét)/i.test(label)) return candidate;
+    if (/(comment|bình luận|viết bình luận|write (?:a )?(?:public )?comment|nhận xét)/i.test(label)) return candidate;
   }
   const fallback = replyTextboxes(page.locator('body')).last();
   return await fallback.isVisible().catch(() => false) ? fallback : undefined;
@@ -564,8 +797,39 @@ function parseFacebookCount(value: string): number {
   return Number.isFinite(decimal) ? Math.round(decimal * multiplier) : Number(digits) * multiplier;
 }
 
+function stableStringHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function parseFacebookPostDate(value: string, text: string): Date | undefined {
   const raw = value.trim();
+  if (/just now|moments? ago|vừa xong|a few seconds ago/i.test(`${raw} ${text}`)) return new Date();
+  const singularRelative = `${raw} ${text}`.match(/(?:^|\s)(?:about\s+)?(?:a|an|one)\s+(second|minute|hour|day)(?:\s+ago)?(?:\s|$)/i);
+  if (singularRelative) {
+    const milliseconds = singularRelative[1]!.toLowerCase().startsWith('second') ? 1_000
+      : singularRelative[1]!.toLowerCase().startsWith('minute') ? 60_000
+        : singularRelative[1]!.toLowerCase().startsWith('hour') ? 3_600_000
+          : 86_400_000;
+    return new Date(Date.now() - milliseconds);
+  }
+  // Parse the rendered timestamp before inspecting post content. Facebook
+  // can put campaign dates, years or prices inside the post body; treating
+  // those as publication time incorrectly drops a fresh post.
+  const numericRelative = raw.match(/(?:^|\s)(\d+)\s*(seconds?|secs?|phút|minutes?|mins?|giờ|hours?|hrs?|ngày|days?|d|h|m)(?:\s+ago)?(?:\s|$)/i);
+  if (numericRelative) {
+    const amount = Number(numericRelative[1]);
+    const unit = numericRelative[2]!.toLowerCase();
+    const milliseconds = /second|sec/.test(unit) ? amount * 1_000
+      : /minute|min|phút|^m$/.test(unit) ? amount * 60_000
+        : /hour|hr|giờ|^h$/.test(unit) ? amount * 3_600_000
+          : amount * 86_400_000;
+    return new Date(Date.now() - milliseconds);
+  }
   // Facebook's Vietnamese locale renders absolute timestamps like
   // "18 Tháng 9 lúc 23:20".  They are not parseable by Date.parse, and
   // treating them as unknown would incorrectly drop otherwise eligible
