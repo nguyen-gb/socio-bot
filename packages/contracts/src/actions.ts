@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { platformSchema } from './status';
 import { facebookGroupUrlSchema, facebookPostRecipientSourceSchema, facebookPostUrlSchema, facebookProfileUrlSchema } from './facebook';
 import { facebookMediaIdsSchema } from './media';
+import { intervalRangeFields, refineIntervalRange } from './interval';
 import {
   autoCommentTikTokHomePayloadSchema,
   commentTikTokVideosPayloadSchema,
@@ -89,10 +90,11 @@ export const replyFacebookPostCommentsActionSchema = baseActionSchema.extend({
     text: z.string().trim().max(5_000).default(''),
     mediaAssetIds: facebookMediaIdsSchema,
     maxReplies: z.number().int().min(1).max(50),
+    ...intervalRangeFields(86_400),
   }).refine(
     payload => payload.text.length > 0 || payload.mediaAssetIds.length > 0,
     'Nhập nội dung hoặc chọn ít nhất một ảnh',
-  ),
+  ).superRefine(refineIntervalRange),
 });
 export const commentFacebookGroupPostsActionSchema = baseActionSchema.extend({
   platform: z.literal('FACEBOOK'),
@@ -107,7 +109,8 @@ export const commentFacebookGroupPostsActionSchema = baseActionSchema.extend({
     minComments: z.number().int().min(0).max(10_000_000).default(0),
     maxComments: z.number().int().min(0).max(10_000_000).optional(),
     maxPosts: z.number().int().min(1).max(50).default(10),
-  }),
+    ...intervalRangeFields(86_400),
+  }).superRefine(refineIntervalRange),
 });
 
 const tiktokActionBase = baseActionSchema.extend({ platform: z.literal('TIKTOK') });

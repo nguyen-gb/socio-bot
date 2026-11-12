@@ -26,7 +26,7 @@ interface TikTokReportEntry {
   reason?: string;
   completedAt?: string;
 }
-interface TikTokPayload { name?: string; query?: string; username?: string; videoUrls?: string[]; text?: string; mediaAssetIds?: string[]; maxVideos?: number; maxFollowers?: number; maxReplies?: number; maxLikes?: number; minLikes?: number; intervalSeconds?: number; excludeVideoUrls?: string[]; excludeUsernames?: string[]; resumeCompletedCount?: number; completedCountsByVideo?: Record<string, number> }
+interface TikTokPayload { name?: string; query?: string; username?: string; videoUrls?: string[]; text?: string; mediaAssetIds?: string[]; maxVideos?: number; maxFollowers?: number; maxReplies?: number; maxLikes?: number; minLikes?: number; intervalSeconds?: number; intervalMinSeconds?: number; intervalMaxSeconds?: number; excludeVideoUrls?: string[]; excludeUsernames?: string[]; resumeCompletedCount?: number; completedCountsByVideo?: Record<string, number> }
 interface TaskItem { id: string; batchId?: string | null; action: string; status: string; approvalStatus?: string; attemptCount?: number; createdAt: string; lastError?: string; pausedAt?: string | null; cancelledAt?: string | null; createdBy?: { id: string; email: string; displayName?: string | null } | null; account: Account; payload?: TikTokPayload; runs?: Array<{ startedAt?: string; result?: unknown }> }
 interface TikTokCampaign { id: string; tasks: TaskItem[]; representative: TaskItem; status: string }
 interface TikTokWorkspaceProps { accounts: Account[]; canOperate: boolean; canAdmin: boolean; onNavigateProfiles: () => void }
@@ -276,6 +276,19 @@ function NumberField({ label, value, onChange, min, max, placeholder, required =
   return <div className="tiktok-field tiktok-number-field"><label htmlFor={id}>{label}{required ? <span className="field-required" aria-hidden="true"> *</span> : null}</label><InputNumber id={id} min={min} max={max} value={value} onChange={next => onChange(next ?? undefined)} placeholder={placeholder} /></div>;
 }
 
+function IntervalRangeField({ value, onChange, required = false }: { value: [number, number]; onChange: (value: [number, number]) => void; required?: boolean }) {
+  const minimumId = useId();
+  const maximumId = useId();
+  return <div className="tiktok-field tiktok-interval-field">
+    <label htmlFor={minimumId}>Chờ ngẫu nhiên (giây){required ? <span className="field-required" aria-hidden="true"> *</span> : null}</label>
+    <div className="tiktok-interval-inputs">
+      <div className="tiktok-interval-input"><span>Từ</span><InputNumber id={minimumId} aria-label="Thời gian chờ tối thiểu" min={5} max={86_400} value={value[0]} onChange={next => { const minimum = next ?? 8; onChange([minimum, Math.max(minimum, value[1])]); }} /></div>
+      <span className="tiktok-interval-separator" aria-hidden="true">–</span>
+      <div className="tiktok-interval-input"><span>Đến</span><InputNumber id={maximumId} aria-label="Thời gian chờ tối đa" min={value[0]} max={86_400} value={value[1]} onChange={next => onChange([value[0], Math.max(value[0], next ?? 12)])} /></div>
+    </div>
+  </div>;
+}
+
 interface TikTokTaskPlan { accountId: string; payload: Record<string, unknown> }
 
 function splitCount(total: number, count: number): number[] {
@@ -337,15 +350,15 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
   const [homeLimit, setHomeLimit] = useState(10);
   const [homeMinLikes, setHomeMinLikes] = useState(0);
   const [homeMaxLikes, setHomeMaxLikes] = useState<number>();
-  const [homeIntervalSeconds, setHomeIntervalSeconds] = useState(10);
+  const [homeIntervalRange, setHomeIntervalRange] = useState<[number, number]>([8, 12]);
   const [followerUsername, setFollowerUsername] = useState('');
   const [followerLimit, setFollowerLimit] = useState(20);
-  const [followerIntervalSeconds, setFollowerIntervalSeconds] = useState(10);
+  const [followerIntervalRange, setFollowerIntervalRange] = useState<[number, number]>([8, 12]);
   const [actionMode, setActionMode] = useState<ActionMode>('COMMENT');
   const [actionText, setActionText] = useState('');
   const [actionReplyLimit, setActionReplyLimit] = useState(10);
   const [actionLikeLimit, setActionLikeLimit] = useState(10);
-  const [actionIntervalSeconds, setActionIntervalSeconds] = useState(10);
+  const [actionIntervalRange, setActionIntervalRange] = useState<[number, number]>([8, 12]);
   const [mediaAssetIds, setMediaAssetIds] = useState<string[]>([]);
   const [selectedCampaignId, setSelectedCampaignId] = useState<string>();
   const [selectedVideoUrls, setSelectedVideoUrls] = useState<string[]>([]);
@@ -407,8 +420,8 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
     setCreationKey(crypto.randomUUID());
     setAccountScope('ALL'); setAccountIds([]);
     if (mode === 'SEARCH') { setName(''); setQuery(''); setSelectedCampaignId(undefined); setSelectedVideoUrls([]); }
-    if (mode === 'AUTO_COMMENT') { setName(''); setHomeText(''); setHomeIntervalSeconds(10); }
-    if (mode === 'MESSAGE_FOLLOWERS') { setName(''); setFollowerUsername(''); setFollowerLimit(20); setFollowerIntervalSeconds(10); setActionText(''); setMediaAssetIds([]); }
+    if (mode === 'AUTO_COMMENT') { setName(''); setHomeText(''); setHomeIntervalRange([8, 12]); }
+    if (mode === 'MESSAGE_FOLLOWERS') { setName(''); setFollowerUsername(''); setFollowerLimit(20); setFollowerIntervalRange([8, 12]); setActionText(''); setMediaAssetIds([]); }
   };
 
   const createTask = async (action: string, payload: Record<string, unknown>, successText: string, runImmediately = false) => {
@@ -456,18 +469,18 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
 
   const submitHomeComment = (runImmediately = false) => {
     if (!name.trim() || !homeText.trim()) return;
-    return createTask('AUTO_COMMENT_TIKTOK_HOME', { name, text: homeText, maxVideos: homeLimit, minLikes: homeMinLikes, ...(homeMaxLikes == null ? {} : { maxLikes: homeMaxLikes }), intervalSeconds: homeIntervalSeconds }, 'Campaign auto-comment', runImmediately);
+    return createTask('AUTO_COMMENT_TIKTOK_HOME', { name, text: homeText, maxVideos: homeLimit, minLikes: homeMinLikes, ...(homeMaxLikes == null ? {} : { maxLikes: homeMaxLikes }), intervalMinSeconds: homeIntervalRange[0], intervalMaxSeconds: homeIntervalRange[1] }, 'Campaign auto-comment', runImmediately);
   };
 
   const submitFollowerMessage = (runImmediately = false) => {
     if (!name.trim() || !followerUsername.trim() || (!actionText.trim() && !mediaAssetIds.length)) return;
-    return createTask('MESSAGE_TIKTOK_FOLLOWERS', { name, username: followerUsername, text: actionText, mediaAssetIds, maxFollowers: followerLimit, intervalSeconds: followerIntervalSeconds }, 'Campaign IB follower TikTok', runImmediately);
+    return createTask('MESSAGE_TIKTOK_FOLLOWERS', { name, username: followerUsername, text: actionText, mediaAssetIds, maxFollowers: followerLimit, intervalMinSeconds: followerIntervalRange[0], intervalMaxSeconds: followerIntervalRange[1] }, 'Campaign IB follower TikTok', runImmediately);
   };
 
   const submitAction = (runImmediately = false) => {
     if (!name.trim() || !selectedVideoUrls.length || !targetAccountIds.length) return;
     if (actionMode !== 'LIKE' && !actionText.trim()) return;
-    const shared = { name, videoUrls: selectedVideoUrls, intervalSeconds: actionIntervalSeconds };
+    const shared = { name, videoUrls: selectedVideoUrls, intervalMinSeconds: actionIntervalRange[0], intervalMaxSeconds: actionIntervalRange[1] };
     const action = actionMode === 'COMMENT' ? 'COMMENT_TIKTOK_VIDEOS' : actionMode === 'REPLY' ? 'REPLY_TIKTOK_COMMENTS' : 'LIKE_TIKTOK_COMMENTS';
     const payload = actionMode === 'COMMENT'
       ? { ...shared, text: actionText, maxVideos: selectedVideoUrls.length }
@@ -485,7 +498,7 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
     if (!selectedVideoUrls.length || !selectedCampaign) return;
     setAccountScope('SELECTED');
     setAccountIds(selectedSourceAccount && queueableAccounts.some(account => account.id === selectedSourceAccount) ? [selectedSourceAccount] : []);
-    setCreateMode('ACTION'); setCreateOpen(true); setActionMode('COMMENT'); setActionText(''); setActionIntervalSeconds(10); setMediaAssetIds([]);
+    setCreateMode('ACTION'); setCreateOpen(true); setActionMode('COMMENT'); setActionText(''); setActionIntervalRange([8, 12]); setMediaAssetIds([]);
     setName(`Hành động trên ${selectedVideoUrls.length.toString()} video`);
   };
 
@@ -659,21 +672,21 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
     {createMode === 'AUTO_COMMENT' ? <>
       <DividerLike title="Thiết lập auto-comment For You" />
       <Field label="Nội dung comment" required><Input.TextArea rows={4} value={homeText} onChange={event => setHomeText(event.target.value)} placeholder="Nội dung comment" /></Field>
-      <div className="tiktok-filter-grid tiktok-filter-grid-3">
+      <div className="tiktok-compact-settings-row">
         <NumberField label="Số video" value={homeLimit} onChange={value => setHomeLimit(value ?? 10)} min={1} max={100} />
         <NumberField label="Tim từ" value={homeMinLikes} onChange={value => setHomeMinLikes(value ?? 0)} min={0} />
         <NumberField label="Tim đến" value={homeMaxLikes} onChange={setHomeMaxLikes} min={0} placeholder="Không giới hạn" />
+        <IntervalRangeField value={homeIntervalRange} onChange={setHomeIntervalRange} />
       </div>
-      <NumberField label="Khoảng cách giữa tác vụ (giây)" value={homeIntervalSeconds} onChange={value => setHomeIntervalSeconds(value ?? 10)} min={5} max={86400} />
     </> : null}
 
     {createMode === 'MESSAGE_FOLLOWERS' ? <>
       <DividerLike title="Thiết lập IB follower" />
       <Alert type="warning" showIcon title="Tin nhắn sẽ được gửi thật sau khi campaign được duyệt" description="TikTok có thể giới hạn việc nhắn tin nếu hai tài khoản không đủ điều kiện kết nối. Hệ thống chỉ thử trong giới hạn đã chọn và lưu lại kết quả từng follower." />
       <Field label="Username kênh TikTok" required><Input value={followerUsername} onChange={event => setFollowerUsername(event.target.value)} placeholder="Ví dụ: @kenh_cua_ban" /></Field>
-      <div className="tiktok-form-grid tiktok-form-grid-2">
+      <div className="tiktok-compact-settings-row">
         <NumberField label="Số follower tối đa" required value={followerLimit} onChange={value => setFollowerLimit(value ?? 20)} min={1} max={100} />
-        <NumberField label="Khoảng cách giữa tác vụ (giây)" required value={followerIntervalSeconds} onChange={value => setFollowerIntervalSeconds(value ?? 10)} min={5} max={86400} />
+        <IntervalRangeField required value={followerIntervalRange} onChange={setFollowerIntervalRange} />
       </div>
       <Field label="Nội dung tin nhắn"><Input.TextArea rows={4} value={actionText} onChange={event => setActionText(event.target.value)} placeholder="Nội dung IB gửi tới follower" /></Field>
       <Field label="Ảnh đính kèm"><CampaignImagePicker platform="TikTok" context="message" value={mediaAssetIds} onChange={setMediaAssetIds} disabled={!canOperate || creatingTask} onUploadingChange={setUploadingImages} /></Field>
@@ -687,8 +700,11 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
       {actionMode !== 'LIKE' ? <>
         <Field label={actionMode === 'COMMENT' ? 'Nội dung comment' : 'Nội dung reply'} required><Input.TextArea rows={4} value={actionText} onChange={event => setActionText(event.target.value)} placeholder={actionMode === 'COMMENT' ? 'Nội dung comment' : 'Nội dung reply'} /></Field>
       </> : null}
-      <div className="tiktok-action-limit">{actionMode === 'REPLY' ? <NumberField label="Số reply / video" value={actionReplyLimit} onChange={value => setActionReplyLimit(value ?? 10)} min={1} max={50} /> : null}{actionMode === 'LIKE' ? <NumberField label="Số tim comment / video" value={actionLikeLimit} onChange={value => setActionLikeLimit(value ?? 10)} min={1} max={50} /> : null}</div>
-      <NumberField label="Khoảng cách giữa tác vụ (giây)" value={actionIntervalSeconds} onChange={value => setActionIntervalSeconds(value ?? 10)} min={5} max={86400} />
+      <div className="tiktok-compact-settings-row">
+        {actionMode === 'REPLY' ? <NumberField label="Số reply / video" value={actionReplyLimit} onChange={value => setActionReplyLimit(value ?? 10)} min={1} max={50} /> : null}
+        {actionMode === 'LIKE' ? <NumberField label="Số tim comment / video" value={actionLikeLimit} onChange={value => setActionLikeLimit(value ?? 10)} min={1} max={50} /> : null}
+        <IntervalRangeField value={actionIntervalRange} onChange={setActionIntervalRange} />
+      </div>
     </> : null}
   </>;
 
@@ -740,7 +756,7 @@ export default function TikTokWorkspace({ accounts, canOperate, canAdmin, onNavi
               { title: 'Cmt', dataIndex: 'comments', render: (value: number) => numberLabel(value) },
             ]} />
           </> : <Space orientation="vertical" size={12} style={{ width: '100%' }}>
-            <CampaignDetailOverview items={[{ label: 'Loại', value: actionLabel(selectedCampaign.action) }, { label: 'Profile', value: new Set((selectedGroup?.tasks ?? []).map(task => task.account.id)).size }, { label: 'Tác vụ hoàn tất', value: `${selectedGroup?.tasks.filter(task => task.status === 'SUCCEEDED' && !isIncompleteTikTokCampaign(task)).length ?? 0}/${selectedGroup?.tasks.length ?? 0}` }, { label: 'Trạng thái', value: groupedCampaignTag(selectedGroup ?? { id: selectedCampaign.id, representative: selectedCampaign, tasks: [selectedCampaign], status: selectedCampaign.status }) }]} />
+            <CampaignDetailOverview items={[{ label: 'Loại', value: actionLabel(selectedCampaign.action) }, { label: 'Profile', value: new Set((selectedGroup?.tasks ?? []).map(task => task.account.id)).size }, { label: 'Chờ ngẫu nhiên', value: `${selectedCampaign.payload?.intervalMinSeconds ?? selectedCampaign.payload?.intervalSeconds ?? 10}–${selectedCampaign.payload?.intervalMaxSeconds ?? selectedCampaign.payload?.intervalMinSeconds ?? selectedCampaign.payload?.intervalSeconds ?? 10} giây` }, { label: 'Tác vụ hoàn tất', value: `${selectedGroup?.tasks.filter(task => task.status === 'SUCCEEDED' && !isIncompleteTikTokCampaign(task)).length ?? 0}/${selectedGroup?.tasks.length ?? 0}` }, { label: 'Trạng thái', value: groupedCampaignTag(selectedGroup ?? { id: selectedCampaign.id, representative: selectedCampaign, tasks: [selectedCampaign], status: selectedCampaign.status }) }]} />
             <Table<TaskItem> className="campaign-table" rowKey="id" size="small" pagination={false} scroll={{ x: 760 }} dataSource={selectedGroup?.tasks ?? []} columns={[
               { title: 'Profile', render: (_: unknown, task) => task.account.username ?? task.account.id },
               { title: 'Kết quả', render: (_: unknown, task) => <Space orientation="vertical" size={2}><span>{campaignResult(task)}</span>{campaignResultReason(task) ? <Typography.Text type="secondary">{campaignResultReason(task)}</Typography.Text> : null}</Space> },

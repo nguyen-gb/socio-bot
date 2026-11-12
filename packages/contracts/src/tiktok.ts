@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { facebookMediaIdsSchema } from './media';
+import { intervalRangeFields, refineIntervalRange } from './interval';
 
 export const tiktokVideoUrlSchema = z.string().max(2_048).trim().refine((value) => {
   try {
@@ -45,7 +46,7 @@ export type TikTokSearchVideosInput = z.infer<typeof tiktokSearchVideosSchema>;
 const tiktokCommentContentFields = {
   name: tiktokCampaignNameSchema,
   text: z.string().trim().max(5_000).default(''),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
 };
 
 const tiktokVideoTargetFields = {
@@ -58,7 +59,8 @@ const tiktokVideoTargetFields = {
   resumeCompletedCount: z.number().int().min(0).max(100).optional(),
 };
 
-function refineTikTokComment(input: { text: string }, context: z.RefinementCtx) {
+function refineTikTokComment(input: { text: string; intervalSeconds?: number; intervalMinSeconds?: number; intervalMaxSeconds?: number }, context: z.RefinementCtx) {
+  refineIntervalRange(input, context);
   if (input.text.length === 0) {
     context.addIssue({ code: 'custom', path: ['text'], message: 'Nhập nội dung comment' });
   }
@@ -80,7 +82,7 @@ const replyTikTokCommentsPayloadShape = {
   completedCountsByVideo: z.record(tiktokVideoUrlSchema, z.number().int().min(0).max(50)).optional(),
   text: z.string().trim().max(5_000).default(''),
   maxReplies: z.number().int().min(1).max(50).default(10),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
 };
 export const replyTikTokCommentsPayloadSchema = z.object(replyTikTokCommentsPayloadShape).strict().superRefine(refineTikTokComment);
 export const replyTikTokCommentsSchema = z.object({ accountId: z.uuid(), ...replyTikTokCommentsPayloadShape }).strict().superRefine(refineTikTokComment);
@@ -93,10 +95,10 @@ const likeTikTokCommentsPayloadShape = {
   resumeCompletedCount: z.number().int().min(0).max(5_000).optional(),
   completedCountsByVideo: z.record(tiktokVideoUrlSchema, z.number().int().min(0).max(50)).optional(),
   maxLikes: z.number().int().min(1).max(50).default(10),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
 };
-export const likeTikTokCommentsPayloadSchema = z.object(likeTikTokCommentsPayloadShape);
-export const likeTikTokCommentsSchema = z.object({ accountId: z.uuid(), ...likeTikTokCommentsPayloadShape });
+export const likeTikTokCommentsPayloadSchema = z.object(likeTikTokCommentsPayloadShape).superRefine(refineIntervalRange);
+export const likeTikTokCommentsSchema = z.object({ accountId: z.uuid(), ...likeTikTokCommentsPayloadShape }).superRefine(refineIntervalRange);
 export type LikeTikTokCommentsInput = z.infer<typeof likeTikTokCommentsSchema>;
 
 const autoCommentTikTokHomePayloadShape = {
@@ -123,12 +125,13 @@ const messageTikTokFollowersPayloadShape = {
   text: z.string().trim().max(5_000).default(''),
   mediaAssetIds: facebookMediaIdsSchema,
   maxFollowers: z.number().int().min(1).max(100).default(20),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
   excludeUsernames: z.array(tiktokUsernameSchema).max(100).optional(),
   resumeCompletedCount: z.number().int().min(0).max(100).optional(),
 };
 
-const refineFollowerMessage = (input: { text: string; mediaAssetIds: string[] }, context: z.RefinementCtx) => {
+const refineFollowerMessage = (input: { text: string; mediaAssetIds: string[]; intervalSeconds?: number; intervalMinSeconds?: number; intervalMaxSeconds?: number }, context: z.RefinementCtx) => {
+  refineIntervalRange(input, context);
   if (input.text.length === 0 && input.mediaAssetIds.length === 0) {
     context.addIssue({ code: 'custom', path: ['text'], message: 'Nhập nội dung hoặc chọn ít nhất một ảnh' });
   }

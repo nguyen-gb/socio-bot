@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { commentFacebookGroupPostsSchema, messageFacebookReactorsSchema, normalizeFacebookGroupUrl, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema, type CommentFacebookGroupPostsInput, type FacebookGroupCollectionInput, type FacebookOptInRecipientInput, type JoinFacebookGroupsInput, type MessageFacebookRecipientsInput, type MessageFacebookReactorsInput, type PostFacebookGroupsInput, type ReplyFacebookPostCommentsInput, type RetryFacebookCampaignInput, type ScanFacebookPostCommentsInput, type SyncFacebookGroupsInput } from '@socio/contracts';
+import { commentFacebookGroupPostsSchema, messageFacebookReactorsSchema, normalizeFacebookGroupUrl, normalizeFacebookPostUrl, normalizeFacebookProfileUrl, randomIntervalSeconds, replyFacebookPostCommentsSchema, scanFacebookPostCommentsSchema, syncFacebookGroupsSchema, type CommentFacebookGroupPostsInput, type FacebookGroupCollectionInput, type FacebookOptInRecipientInput, type IntervalRangeInput, type JoinFacebookGroupsInput, type MessageFacebookRecipientsInput, type MessageFacebookReactorsInput, type PostFacebookGroupsInput, type ReplyFacebookPostCommentsInput, type RetryFacebookCampaignInput, type ScanFacebookPostCommentsInput, type SyncFacebookGroupsInput } from '@socio/contracts';
 import { Prisma, type TaskStatus } from '@socio/database';
 import { PrismaService } from '../database/prisma.service';
 import { TasksService } from '../tasks/tasks.service';
@@ -24,6 +24,14 @@ export function retrySafety(task: { status: string; attemptCount: number; runs: 
 
 interface PostTarget { accountId: string; groupUrl: string }
 interface MessageTarget { accountId: string; groupUrl: string; profileUrl?: string; displayName?: string }
+
+function intervalPayload(input: IntervalRangeInput) {
+  return {
+    intervalSeconds: input.intervalSeconds ?? 10,
+    ...(input.intervalMinSeconds == null ? {} : { intervalMinSeconds: input.intervalMinSeconds }),
+    ...(input.intervalMaxSeconds == null ? {} : { intervalMaxSeconds: input.intervalMaxSeconds }),
+  };
+}
 
 export function distributePostTargets(
   accountIds: string[],
@@ -350,7 +358,7 @@ export class FacebookService {
     await this.selectedAccounts(organizationId, [...new Set(campaign.tasks.map((task) => task.accountId))], this.prisma, true);
     const pending = campaign.tasks.filter((task) => task.approvalStatus === 'PENDING');
     if (!pending.length || campaign.approvedAt) throw new ConflictException('Chiến dịch không còn chờ duyệt');
-    const intervalSeconds = Number((campaign.payload as Record<string, unknown>).intervalSeconds ?? 60);
+    const interval = campaign.payload as Record<string, unknown>;
     const now = Date.now();
     let dispatches: Array<{ task: (typeof pending)[number]; scheduledAt: Date }> = [];
     await this.prisma.$transaction(async (tx) => {
@@ -369,7 +377,7 @@ export class FacebookService {
       const nextByAccount = new Map(queueTail);
       dispatches = pending.map((task) => {
         const previous = nextByAccount.get(task.accountId);
-        const scheduledAt = previous ? new Date(Math.max(now, previous.getTime() + intervalSeconds * 1000)) : new Date(now);
+        const scheduledAt = previous ? new Date(Math.max(now, previous.getTime() + randomIntervalSeconds(interval) * 1000)) : new Date(now);
         nextByAccount.set(task.accountId, scheduledAt);
         return { task, scheduledAt };
       });
@@ -473,12 +481,14 @@ export class FacebookService {
   }
 
   private async requeue(tx: Prisma.TransactionClient, campaign: { id: string; organizationId: string; payload: unknown }, tasks: Array<{ id: string; accountId: string; status: TaskStatus; workflowId: string | null; attemptCount: number }>) {
-    const intervalSeconds = Number((campaign.payload as Record<string, unknown>).intervalSeconds ?? 60);
+    const interval = campaign.payload as Record<string, unknown>;
     const now = Date.now(), sequence = new Map<string, number>();
     const dispatches: Array<{ id: string; workflowId: string; scheduledAt: Date }> = [];
     for (const task of tasks) {
-      const index = sequence.get(task.accountId) ?? 0; sequence.set(task.accountId, index + 1);
-      const workflowId = `task/${task.id}/${randomUUID()}`, scheduledAt = new Date(now + index * intervalSeconds * 1000);
+      const previousOffset = sequence.get(task.accountId);
+      const offset = previousOffset == null ? 0 : previousOffset + randomIntervalSeconds(interval) * 1000;
+      sequence.set(task.accountId, offset);
+      const workflowId = `task/${task.id}/${randomUUID()}`, scheduledAt = new Date(now + offset);
       const claimed = await tx.task.updateMany({ where: { id: task.id, organizationId: campaign.organizationId, campaignId: campaign.id, status: task.status, workflowId: task.workflowId, attemptCount: task.attemptCount, approvalStatus: 'APPROVED' }, data: { status: 'SCHEDULED', workflowId, dispatchedAt: null, scheduledAt, attemptCount: 0, lastError: null } });
       if (claimed.count !== 1) throw new ConflictException('Tác vụ đã thay đổi. Tải lại chiến dịch trước khi tiếp tục.');
       dispatches.push({ id: task.id, workflowId, scheduledAt });
@@ -563,7 +573,7 @@ export class FacebookService {
     });
     const data = {
       organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind, createdByUserId,
-      payload: { intervalSeconds: input.intervalSeconds, ...('text' in input ? {
+      payload: { ...intervalPayload(input), ...('text' in input ? {
         text: input.text, mediaAssetIds: input.mediaAssetIds ?? [], selection: input.selection,
         maxGroupsPerAccount: input.maxGroupsPerAccount,
         ...(postSnapshot ? {
@@ -618,7 +628,7 @@ export class FacebookService {
           organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'MESSAGE', createdByUserId,
           payload: {
             text: input.text, mediaAssetIds: input.mediaAssetIds, groupUrls: input.groupUrls, recipientMode: input.recipientMode, maxRecipientsPerGroup: input.maxRecipientsPerGroup,
-            intervalSeconds: input.intervalSeconds,
+            ...intervalPayload(input),
           },
           tasks: { create: targets.map(target => {
             const id = randomUUID();
@@ -650,7 +660,7 @@ export class FacebookService {
       return await this.prisma.facebookCampaign.create({
         data: {
           organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'MESSAGE_REACTORS', createdByUserId,
-          payload: { postUrl: postUrls[0], postUrls, recipientSource: input.recipientSource, text: input.text, mediaAssetIds: input.mediaAssetIds, maxRecipientsPerPost: input.maxRecipientsPerPost, intervalSeconds: input.intervalSeconds },
+          payload: { postUrl: postUrls[0], postUrls, recipientSource: input.recipientSource, text: input.text, mediaAssetIds: input.mediaAssetIds, maxRecipientsPerPost: input.maxRecipientsPerPost, ...intervalPayload(input) },
           tasks: { create: postUrls.flatMap(postUrl => taskAccounts.map(accountId => {
             const id = randomUUID();
             return {
@@ -703,7 +713,7 @@ export class FacebookService {
           organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'SCAN_COMMENTS', createdByUserId,
           // Store both forms so old clients can still display the first URL,
           // while the full list remains available after the campaign finishes.
-          payload: { postUrl: postUrls[0], postUrls, intervalSeconds: input.intervalSeconds },
+          payload: { postUrl: postUrls[0], postUrls, ...intervalPayload(input) },
           tasks: { create: postUrls.map((postUrl, index) => {
             const accountId = accountIds[index % accountIds.length]!;
             const id = randomUUID();
@@ -732,12 +742,12 @@ export class FacebookService {
       return await this.prisma.facebookCampaign.create({
         data: {
           organizationId, idempotencyKey: input.idempotencyKey, name: input.name, kind: 'REPLY_COMMENTS', createdByUserId,
-          payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies, intervalSeconds: input.intervalSeconds },
+          payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies, ...intervalPayload(input) },
           tasks: { create: [accountId].map(accountId => {
             const id = randomUUID();
             return {
               id, organizationId, accountId, idempotencyKey: `facebook:${id}`, workflowId: `task/${id}`,
-              platform: 'FACEBOOK', action: 'REPLY_FACEBOOK_POST_COMMENTS', payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies },
+              platform: 'FACEBOOK', action: 'REPLY_FACEBOOK_POST_COMMENTS', payload: { postUrl: input.postUrl, text: input.text, mediaAssetIds: input.mediaAssetIds, maxReplies: input.maxReplies, ...intervalPayload(input) },
               maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
             };
           }) },
@@ -762,7 +772,7 @@ export class FacebookService {
             groupUrls: input.groupUrls, text: input.text, mediaAssetIds: input.mediaAssetIds,
             daysRecent: input.daysRecent, minReactions: input.minReactions, maxReactions: input.maxReactions,
             minComments: input.minComments, maxComments: input.maxComments, maxPosts: input.maxPosts,
-            intervalSeconds: input.intervalSeconds,
+            ...intervalPayload(input),
           },
           tasks: { create: targets.map(target => {
             const id = randomUUID();
@@ -773,6 +783,7 @@ export class FacebookService {
                 groupUrl: target.groupUrl, text: input.text, mediaAssetIds: input.mediaAssetIds,
                 daysRecent: input.daysRecent, minReactions: input.minReactions, maxReactions: input.maxReactions,
                 minComments: input.minComments, maxComments: input.maxComments, maxPosts: input.maxPosts,
+                ...intervalPayload(input),
               },
               maxAttempts: 1, status: 'DRAFT', approvalStatus: 'PENDING',
             };

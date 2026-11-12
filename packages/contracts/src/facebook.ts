@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { facebookMediaIdsSchema } from './media';
+import { intervalRangeFields, refineIntervalRange } from './interval';
 
 export const retryFacebookCampaignSchema = z.object({
   taskIds: z.array(z.uuid()).min(1).max(500),
@@ -66,13 +67,12 @@ const campaignBase = z.object({
   name: z.string().trim().min(1).max(120),
   idempotencyKey: z.string().trim().min(8).max(128),
   accountIds: z.array(z.uuid()).max(100).default([]),
-  intervalSeconds: z.number().int().min(5).max(3600).default(10),
+  ...intervalRangeFields(3600),
 });
 
 export const joinFacebookGroupsSchema = campaignBase.extend({
-  intervalSeconds: z.number().int().min(5).max(3600).default(10),
   groupUrls: z.array(facebookGroupUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]),
-});
+}).superRefine(refineIntervalRange);
 export type JoinFacebookGroupsInput = z.infer<typeof joinFacebookGroupsSchema>;
 
 export const facebookGroupCollectionSchema = z.object({
@@ -131,10 +131,10 @@ export const messageFacebookRecipientsSchema = campaignBase.extend({
   mediaAssetIds: facebookMediaIdsSchema,
   groupUrls: z.array(facebookGroupUrlSchema).max(100).default([]).transform((urls) => [...new Set(urls)]),
   maxRecipientsPerGroup: z.number().int().min(1).max(50),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
 }).refine(input => input.text.length > 0 || input.mediaAssetIds.length > 0, {
   message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'],
-});
+}).superRefine(refineIntervalRange);
 export type MessageFacebookRecipientsInput = z.infer<typeof messageFacebookRecipientsSchema>;
 
 export const facebookPostRecipientSourceSchema = z.enum(['REACTORS', 'COMMENTERS', 'REACTORS_AND_COMMENTERS']);
@@ -149,8 +149,9 @@ export const messageFacebookReactorsSchema = campaignBase.extend({
   mediaAssetIds: facebookMediaIdsSchema,
   recipientSource: facebookPostRecipientSourceSchema.default('REACTORS'),
   maxRecipientsPerPost: z.number().int().min(1).max(50),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
 }).superRefine((input, context) => {
+  refineIntervalRange(input, context);
   if (!input.postUrl && !input.postUrls?.length) context.addIssue({ code: 'custom', message: 'Nhập ít nhất một URL bài viết Facebook', path: ['postUrls'] });
   if (!input.text.length && !input.mediaAssetIds.length) context.addIssue({ code: 'custom', message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'] });
 });
@@ -161,8 +162,8 @@ export const scanFacebookPostCommentsSchema = campaignBase.extend({
   // New campaigns may scan several posts in one campaign via `postUrls`.
   postUrl: facebookPostUrlSchema.optional(),
   postUrls: z.array(facebookPostUrlSchema).min(1).max(100).transform((urls) => [...new Set(urls)]).optional(),
-  intervalSeconds: z.number().int().min(5).max(3600).default(10),
 }).superRefine((input, context) => {
+  refineIntervalRange(input, context);
   if (!input.postUrl && !input.postUrls?.length) {
     context.addIssue({ code: 'custom', message: 'Nhập ít nhất một URL bài viết Facebook', path: ['postUrls'] });
   }
@@ -174,10 +175,10 @@ export const replyFacebookPostCommentsSchema = campaignBase.extend({
   text: z.string().trim().max(5_000).default(''),
   mediaAssetIds: facebookMediaIdsSchema,
   maxReplies: z.number().int().min(1).max(50),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
 }).refine(input => input.text.length > 0 || input.mediaAssetIds.length > 0, {
   message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'],
-});
+}).superRefine(refineIntervalRange);
 export type ReplyFacebookPostCommentsInput = z.infer<typeof replyFacebookPostCommentsSchema>;
 
 /**
@@ -195,8 +196,9 @@ export const commentFacebookGroupPostsSchema = campaignBase.extend({
   minComments: z.number().int().min(0).max(10_000_000).default(0),
   maxComments: z.number().int().min(0).max(10_000_000).optional(),
   maxPosts: z.number().int().min(1).max(50).default(10),
-  intervalSeconds: z.number().int().min(5).max(86_400).default(10),
+  ...intervalRangeFields(86_400),
 }).superRefine((input, context) => {
+  refineIntervalRange(input, context);
   if (!input.text.length && !input.mediaAssetIds.length) context.addIssue({ code: 'custom', message: 'Nhập nội dung hoặc chọn ít nhất một ảnh', path: ['text'] });
   if (input.maxReactions != null && input.maxReactions < input.minReactions) context.addIssue({ code: 'custom', message: 'Số tim tối đa phải lớn hơn hoặc bằng số tim tối thiểu', path: ['maxReactions'] });
   if (input.maxComments != null && input.maxComments < input.minComments) context.addIssue({ code: 'custom', message: 'Số bình luận tối đa phải lớn hơn hoặc bằng số bình luận tối thiểu', path: ['maxComments'] });
@@ -216,7 +218,7 @@ export const postFacebookGroupsSchema = campaignBase.extend({
   message: 'Chọn ít nhất một nhóm đã đồng bộ', path: ['groupUrls'],
 }).refine((input) => input.selection !== 'COLLECTIONS' || Boolean(input.collectionIds?.length), {
   message: 'Chọn ít nhất một tập hợp nhóm', path: ['collectionIds'],
-});
+}).superRefine(refineIntervalRange);
 export type PostFacebookGroupsInput = z.infer<typeof postFacebookGroupsSchema>;
 
 export const syncFacebookGroupsSchema = z.object({

@@ -332,11 +332,12 @@ test('comment reply campaign assigns one post to one profile to avoid duplicate 
   } };
   const campaign = await context.service.replyComments('org', {
     name: 'Rep bình luận', idempotencyKey: 'reply-comments-key', accountIds: [],
-    postUrl: 'https://www.facebook.com/groups/123/posts/456', text: 'Cảm ơn bạn', mediaAssetIds, maxReplies: 10, intervalSeconds: 120,
+    postUrl: 'https://www.facebook.com/groups/123/posts/456', text: 'Cảm ơn bạn', mediaAssetIds, maxReplies: 10, intervalSeconds: 10, intervalMinSeconds: 8, intervalMaxSeconds: 12,
   });
   const tasks = context.data().tasks.create;
   assert.equal(campaign.kind, 'REPLY_COMMENTS');
   assert.deepEqual(tasks.map((task: any) => task.payload.maxReplies), [10]);
+  assert.deepEqual(tasks.map((task: any) => [task.payload.intervalMinSeconds, task.payload.intervalMaxSeconds]), [[8, 12]]);
   assert.deepEqual(context.data().payload.mediaAssetIds, mediaAssetIds);
   assert.ok(tasks.every((task: any) => task.payload.mediaAssetIds[0] === mediaAssetIds[0]));
   assert.ok(tasks.every((task: any) => task.action === 'REPLY_FACEBOOK_POST_COMMENTS' && task.status === 'DRAFT' && task.approvalStatus === 'PENDING' && task.maxAttempts === 1));
@@ -349,7 +350,7 @@ test('group comment campaign snapshots filters and assigns each group once', asy
   const campaign = await context.service.commentGroupPosts('org', {
     name: 'Cmt bài mới', idempotencyKey: 'comment-group-posts-key', accountIds: [], groupUrls: [groupUrl],
     text: 'Bình luận thử nghiệm', mediaAssetIds: [], daysRecent: 3, minReactions: 2, maxReactions: 100,
-    minComments: 1, maxComments: 20, maxPosts: 5, intervalSeconds: 120,
+    minComments: 1, maxComments: 20, maxPosts: 5, intervalSeconds: 10, intervalMinSeconds: 8, intervalMaxSeconds: 12,
   });
   const tasks = context.data().tasks.create;
   assert.equal(campaign.kind, 'COMMENT_GROUP_POSTS');
@@ -358,6 +359,7 @@ test('group comment campaign snapshots filters and assigns each group once', asy
   assert.ok(tasks.every((task: any) => task.action === 'COMMENT_FACEBOOK_GROUP_POSTS' && task.payload.groupUrl === groupUrl && task.payload.daysRecent === 3 && task.payload.minReactions === 2 && task.payload.maxReactions === 100 && task.payload.minComments === 1 && task.payload.maxComments === 20 && task.payload.maxPosts === 5 && task.status === 'DRAFT' && task.approvalStatus === 'PENDING'));
   assert.deepEqual(context.data().payload.groupUrls, [groupUrl]);
   assert.equal(context.data().payload.maxPosts, 5);
+  assert.deepEqual(tasks.map((task: any) => [task.payload.intervalMinSeconds, task.payload.intervalMaxSeconds]), [[8, 12]]);
 });
 
 test('opt-in recipient records are workspace scoped and revocation is retained', async () => {
@@ -427,7 +429,7 @@ test('reject unavailable explicit accounts and oversized campaigns without write
 test('approval schedules spacing independently for each account and dispatches only after transaction', async () => {
   const writes: any[] = []; const starts: any[] = []; let committed = false;
   const jobs = ['a', 'a', 'b', 'b'].map((accountId, index) => ({ id: `job${index}`, workflowId: `task/job${index}`, accountId, approvalStatus: 'PENDING' }));
-  const campaign = { id: 'campaign', approvedAt: null, payload: { intervalSeconds: 60 }, tasks: jobs };
+  const campaign = { id: 'campaign', approvedAt: null, payload: { intervalSeconds: 60, intervalMinSeconds: 8, intervalMaxSeconds: 12 }, tasks: jobs };
   const tx = { $executeRaw: async () => 0, platformAccount: { findMany: async () => ['a', 'b'].map(account) }, facebookCampaign: { updateMany: async () => ({ count: 1 }) }, task: { count: async () => 0, findMany: async () => [], updateMany: async (input: any) => { writes.push(input); return { count: 1 }; } } };
   const prisma = {
     facebookCampaign: { findFirst: async (input: any) => { assert.equal(input.where.organizationId, 'org'); return campaign; }, findUniqueOrThrow: async () => campaign },
@@ -437,9 +439,11 @@ test('approval schedules spacing independently for each account and dispatches o
   const service = new FacebookService(prisma as never, {} as never, { startTask: async (...args: any[]) => { assert.equal(committed, true); starts.push(args); } } as never);
   await service.approve('org', 'campaign', 'admin');
   assert.equal(starts.length, 4); assert.equal(writes[0].data.status, 'SCHEDULED'); assert.equal(writes[0].data.approvalStatus, 'APPROVED');
-  assert.equal(starts[1][2].getTime() - starts[0][2].getTime(), 60000);
+  assert.ok(starts[1][2].getTime() - starts[0][2].getTime() >= 8_000);
+  assert.ok(starts[1][2].getTime() - starts[0][2].getTime() <= 12_000);
   assert.equal(starts[2][2].getTime(), starts[0][2].getTime());
-  assert.equal(starts[3][2].getTime() - starts[2][2].getTime(), 60000);
+  assert.ok(starts[3][2].getTime() - starts[2][2].getTime() >= 8_000);
+  assert.ok(starts[3][2].getTime() - starts[2][2].getTime() <= 12_000);
 });
 test('approval appends to the per-profile queue instead of rejecting active campaigns', async () => {
   const writes: any[] = []; const starts: any[] = []; const now = Date.now();

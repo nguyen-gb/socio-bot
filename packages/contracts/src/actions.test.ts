@@ -78,6 +78,13 @@ test('Facebook post comment replies are valid actions and require approval', () 
     },
   });
   assert.equal(result.success, true);
+  assert.equal(createTaskSchema.safeParse({
+    idempotencyKey: 'reply-comments-task-0002',
+    action: {
+      platform: 'FACEBOOK', accountId, action: 'REPLY_FACEBOOK_POST_COMMENTS',
+      payload: { postUrl: 'https://facebook.com/groups/123/posts/456', text: 'Cảm ơn bạn', maxReplies: 2, intervalMinSeconds: 12, intervalMaxSeconds: 8 },
+    },
+  }).success, false);
   assert.equal(requiresExternalApproval('REPLY_FACEBOOK_POST_COMMENTS'), true);
 });
 

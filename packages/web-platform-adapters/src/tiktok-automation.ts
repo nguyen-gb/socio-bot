@@ -4,6 +4,15 @@ import {
   type BrowserPage,
   type PlatformSession,
 } from '@socio/platform-core';
+import { randomIntervalSeconds, type IntervalRangeInput } from '@socio/contracts';
+
+function hasInterval(input: IntervalRangeInput): boolean {
+  return input.intervalSeconds != null || input.intervalMinSeconds != null || input.intervalMaxSeconds != null;
+}
+
+async function waitForRandomInterval(page: BrowserPage, input: IntervalRangeInput): Promise<void> {
+  await page.waitForTimeout?.(randomIntervalSeconds(input) * 1_000);
+}
 
 export interface TikTokVideoMetadata {
   videoUrl: string;
@@ -2749,7 +2758,9 @@ export async function autoCommentTikTokHome(
     maxVideos: number;
     minLikes: number;
     maxLikes?: number;
-    intervalSeconds: number;
+    intervalSeconds?: number;
+    intervalMinSeconds?: number;
+    intervalMaxSeconds?: number;
     excludeVideoUrls?: string[];
     resumeCompletedCount?: number;
   },
@@ -2817,7 +2828,7 @@ export async function autoCommentTikTokHome(
     }
 
     if (attempted >= remainingTarget) break;
-    if (candidate && input.intervalSeconds) await page.waitForTimeout?.(input.intervalSeconds * 1_000);
+    if (candidate && hasInterval(input)) await waitForRandomInterval(page, input);
     const advanced = await advanceTikTokForYouFeed(page);
     if (!advanced) {
       lastFailureReason = 'Không thể chuyển sang video For You tiếp theo sau khi đã thử cuộn.';
@@ -2850,7 +2861,7 @@ export async function autoCommentTikTokHome(
 
 export async function commentTikTokVideos(
   session: PlatformSession,
-  input: { videoUrls: string[]; text: string; maxVideos: number; intervalSeconds?: number; excludeVideoUrls?: string[]; resumeCompletedCount?: number },
+  input: { videoUrls: string[]; text: string; maxVideos: number; excludeVideoUrls?: string[]; resumeCompletedCount?: number } & IntervalRangeInput,
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<Record<string, unknown>> {
   const excluded = new Set(input.excludeVideoUrls ?? []);
@@ -2906,8 +2917,8 @@ export async function commentTikTokVideos(
       const entry = { action: 'COMMENT', status: 'SENT', videoUrl, completedAt: new Date().toISOString() };
       reportEntries.push(entry);
       await recordTikTokActionProgress(session, entry);
-      if (input.intervalSeconds && index < videos.length - 1) {
-        await page.waitForTimeout?.(input.intervalSeconds * 1_000);
+      if (hasInterval(input) && index < videos.length - 1) {
+        await waitForRandomInterval(page, input);
       }
     } catch (error) {
       if (!externalActionStarted) await releaseTikTokActionTarget(session, 'COMMENT', videoUrl);
@@ -2933,7 +2944,7 @@ export async function commentTikTokVideos(
 
 export async function replyTikTokComments(
   session: PlatformSession,
-  input: { videoUrls: string[]; text: string; maxReplies: number; intervalSeconds?: number; resumeCompletedCount?: number; completedCountsByVideo?: Record<string, number> },
+  input: { videoUrls: string[]; text: string; maxReplies: number; resumeCompletedCount?: number; completedCountsByVideo?: Record<string, number> } & IntervalRangeInput,
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<Record<string, unknown>> {
   const page = session.page as EvaluatablePage;
@@ -3069,7 +3080,7 @@ export async function replyTikTokComments(
           reportEntries.push(entry);
           await recordTikTokActionProgress(session, entry);
           repliedForVideo += 1;
-          if (input.intervalSeconds && (repliedForVideo < repliesPerVideo || videoIndex < input.videoUrls.length - 1)) await page.waitForTimeout?.(input.intervalSeconds * 1_000);
+          if (hasInterval(input) && (repliedForVideo < repliesPerVideo || videoIndex < input.videoUrls.length - 1)) await waitForRandomInterval(page, input);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           firstFailureReason ??= reason;
@@ -3121,7 +3132,7 @@ export async function replyTikTokComments(
 
 export async function likeTikTokComments(
   session: PlatformSession,
-  input: { videoUrls: string[]; maxLikes: number; intervalSeconds?: number; resumeCompletedCount?: number; completedCountsByVideo?: Record<string, number> },
+  input: { videoUrls: string[]; maxLikes: number; resumeCompletedCount?: number; completedCountsByVideo?: Record<string, number> } & IntervalRangeInput,
 ): Promise<Record<string, unknown>> {
   const page = session.page as EvaluatablePage;
   const likesPerVideo = Math.max(0, Math.floor(input.maxLikes));
@@ -3196,7 +3207,7 @@ export async function likeTikTokComments(
           const entry = { action: 'LIKE', status: 'LIKED', videoUrl, completedAt: new Date().toISOString() };
           reportEntries.push(entry);
           await recordTikTokActionProgress(session, entry);
-          if (input.intervalSeconds && (index < count - 1 || videoIndex < input.videoUrls.length - 1)) await page.waitForTimeout?.(input.intervalSeconds * 1_000);
+          if (hasInterval(input) && (index < count - 1 || videoIndex < input.videoUrls.length - 1)) await waitForRandomInterval(page, input);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           firstFailureReason ??= reason;
@@ -3650,7 +3661,7 @@ async function isTikTokCommentLikeActive(button: LocatorLike): Promise<boolean> 
 
 export async function messageTikTokFollowers(
   session: PlatformSession,
-  input: { username: string; text: string; mediaAssetIds: string[]; maxFollowers: number; intervalSeconds?: number; excludeUsernames?: string[]; resumeCompletedCount?: number },
+  input: { username: string; text: string; mediaAssetIds: string[]; maxFollowers: number; excludeUsernames?: string[]; resumeCompletedCount?: number } & IntervalRangeInput,
   captchaSolver?: TikTokRotateCaptchaSolver,
 ): Promise<Record<string, unknown>> {
   let page = session.page as EvaluatablePage;
@@ -3781,8 +3792,8 @@ export async function messageTikTokFollowers(
       };
       reportEntries.push(entry);
       await recordTikTokActionProgress(session, entry);
-      if (input.intervalSeconds && targetUsername !== targets[targets.length - 1]?.[0]) {
-        await page.waitForTimeout?.(input.intervalSeconds * 1_000);
+      if (hasInterval(input) && targetUsername !== targets[targets.length - 1]?.[0]) {
+        await waitForRandomInterval(page, input);
       }
     } catch (error) {
       if (!externalActionStarted) await releaseTikTokActionTarget(session, 'MESSAGE', targetUsername);

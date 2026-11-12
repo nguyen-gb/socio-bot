@@ -239,11 +239,36 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
 .tiktok-field > .ant-input-affix-wrapper,
 .tiktok-field > .ant-input-number,
 .tiktok-field > .ant-select { width: 100%; min-width: 0; }
-.tiktok-number-field { min-width: 0; }
+.tiktok-number-field { width: min(100%, 180px); min-width: 0; }
+.tiktok-compact-settings-row { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 16px; }
+.tiktok-compact-settings-row .tiktok-number-field { width: min(100%, 150px); }
+.tiktok-interval-field { width: min(100%, 350px); }
+.tiktok-interval-inputs { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 8px; }
+.tiktok-interval-input { display: grid; grid-template-columns: auto minmax(76px, 1fr); align-items: center; overflow: hidden; border: 1px solid #d7dfd8; border-radius: 8px; background: #fff; transition: border-color .2s, box-shadow .2s; }
+.tiktok-interval-input:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(54, 122, 98, .12); }
+.tiktok-interval-input > span { padding: 0 10px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.tiktok-interval-input .ant-input-number { width: 100%; border: 0; border-left: 1px solid #e3e8e4; border-radius: 0; box-shadow: none !important; }
+.tiktok-interval-separator { color: var(--muted); font-weight: 600; }
+.campaign-create-form .campaign-number-field,
+.campaign-create-form .campaign-interval-field { width: 100%; }
+.campaign-create-form .ant-flex > .campaign-number-field { flex: 0 1 220px; width: 220px; }
+.campaign-create-form .campaign-number-field .ant-input-number { width: 160px; }
+.campaign-create-form .campaign-number-field .ant-form-item-extra,
+.campaign-create-form .campaign-interval-field .ant-form-item-extra { max-width: 640px; margin-top: 7px; line-height: 1.55; }
+.campaign-create-form .campaign-interval-field { margin-top: 4px; padding-top: 18px; border-top: 1px solid var(--line-subtle); }
+.campaign-create-form .campaign-interval-controls { max-width: 380px; }
+.campaign-interval-controls .ant-input-number-group-wrapper { width: 176px; }
+.campaign-settings-row { display: grid; grid-template-columns: minmax(230px, .75fr) minmax(380px, 1.25fr); align-items: start; gap: 24px; padding-top: 4px; border-top: 1px solid var(--line-subtle); }
+.campaign-settings-row .campaign-number-field,
+.campaign-settings-row .campaign-interval-field { min-width: 0; margin-top: 0; padding-top: 0; border-top: 0; }
+.campaign-settings-row .campaign-number-field .ant-form-item-extra,
+.campaign-settings-row .campaign-interval-field .ant-form-item-extra { max-width: none; }
+.campaign-filter-grid { display: grid; grid-template-columns: repeat(4, minmax(145px, 1fr)); align-items: start; gap: 0 16px; padding-top: 4px; border-top: 1px solid var(--line-subtle); }
+.campaign-filter-grid .campaign-number-field { min-width: 0; }
+.campaign-filter-grid .campaign-interval-field { grid-column: span 2; min-width: 0; margin-top: 0; padding-top: 0; border-top: 0; }
+.campaign-filter-grid .campaign-interval-field .ant-form-item-extra { max-width: none; }
 .tiktok-search-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(150px, 1fr); gap: 16px; }
 .tiktok-filter-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
-.tiktok-filter-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.tiktok-action-limit:empty { display: none; }
 .tiktok-dialog-body .context-note { margin: 0; }
 .tiktok-dialog-body .ant-input-textarea { width: 100%; }
 .tiktok-divider { margin: 8px 0 0; padding-top: 16px; border-top: 1px solid var(--line); color: #53664c; }
@@ -366,6 +391,9 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
   .campaign-start-bar { align-items: flex-start; flex-direction: column; }
   .campaign-start-action, .campaign-start-action .ant-btn { width: 100%; }
   .campaign-detail-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .campaign-settings-row { grid-template-columns: minmax(200px, .7fr) minmax(330px, 1.3fr); gap: 16px; }
+  .campaign-filter-grid { grid-template-columns: repeat(3, minmax(145px, 1fr)); }
+  .campaign-filter-grid .campaign-interval-field { grid-column: span 2; }
   .login-story { padding: 32px; }
   .login-story h1 { font-size: 36px; }
 }
@@ -400,7 +428,15 @@ code { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; back
   .campaign-summary .summary-icon { display: none; }
   .campaign-summary strong { font-size: 23px; }
   .campaign-summary small { font-size: 10px; white-space: normal; }
-  .tiktok-form-grid-2, .tiktok-search-row, .tiktok-filter-grid, .tiktok-filter-grid-3 { grid-template-columns: 1fr; }
+  .tiktok-form-grid-2, .tiktok-search-row, .tiktok-filter-grid { grid-template-columns: 1fr; }
+  .tiktok-interval-field { width: 100%; max-width: 100%; }
+  .tiktok-compact-settings-row { display: grid; grid-template-columns: 1fr; }
+  .tiktok-compact-settings-row .tiktok-number-field { width: 100%; }
+  .campaign-settings-row, .campaign-filter-grid { grid-template-columns: 1fr; gap: 0; }
+  .campaign-settings-row .campaign-interval-field,
+  .campaign-filter-grid .campaign-interval-field { grid-column: auto; margin-top: 4px; padding-top: 18px; border-top: 1px solid var(--line-subtle); }
+  .campaign-create-form .ant-flex > .campaign-number-field { flex-basis: min(100%, 220px); width: min(100%, 220px); }
+  .campaign-interval-controls .ant-input-number-group-wrapper { flex: 1 1 150px; width: auto; }
   .campaign-start-bar { padding: 18px; }
   .campaign-detail-overview { grid-template-columns: 1fr; gap: 8px; }
   .task-drawer-grid { grid-template-columns: 1fr; }

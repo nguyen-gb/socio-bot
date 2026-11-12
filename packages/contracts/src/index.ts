@@ -1,5 +1,6 @@
 export * from './accounts';
 export * from './fingerprint';
+export * from './interval';
 export * from './facebook';
 export * from './media';
 export * from './actions';

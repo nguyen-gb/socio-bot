@@ -1,4 +1,4 @@
-import { normalizeFacebookGroupUrl, normalizeFacebookPostUrl, type ActionResult } from '@socio/contracts';
+import { normalizeFacebookGroupUrl, normalizeFacebookPostUrl, randomIntervalSeconds, type ActionResult, type IntervalRangeInput } from '@socio/contracts';
 import { gotoPlatformPage, type PlatformSession } from '@socio/platform-core';
 import type { Locator, Page } from 'playwright';
 import { attachFacebookImages } from './facebook-images';
@@ -9,6 +9,10 @@ const LOAD_MORE = /^(?:View more comments?|View previous comments?|See more comm
 const REPLY = /^(Reply|Trả lời)$/i;
 const REPLY_SEND = /^(Comment|Bình luận|Post comment|Đăng bình luận|Send|Gửi)$/i;
 const PHONE = /(?:\+?84|0084|0)(?:[\s().-]*\d){8,11}/g;
+
+function hasInterval(input: IntervalRangeInput): boolean {
+  return input.intervalSeconds != null || input.intervalMinSeconds != null || input.intervalMaxSeconds != null;
+}
 
 export interface FacebookGroupPostCommentFilters {
   daysRecent: number;
@@ -71,7 +75,7 @@ export class FacebookCommentsAutomation {
   /** Find recent group-feed posts by the frozen filters and leave one top-level
    * comment on every matching post.  Each post is opened separately so the
    * composer and confirmation stay scoped to the requested post. */
-  async commentGroupPosts(session: PlatformSession, inputGroupUrl: string, text: string, mediaAssetIds: string[] = [], filters: FacebookGroupPostCommentFilters): Promise<ActionResult> {
+  async commentGroupPosts(session: PlatformSession, inputGroupUrl: string, text: string, mediaAssetIds: string[] = [], filters: FacebookGroupPostCommentFilters, interval: IntervalRangeInput = {}): Promise<ActionResult> {
     const page = session.page as Page;
     const groupUrl = normalizeFacebookGroupUrl(inputGroupUrl);
     // Open the chronological feed directly. Besides saving a brittle click on
@@ -129,6 +133,7 @@ export class FacebookCommentsAutomation {
       }
       else await session.releaseFacebookTarget?.({ action: 'COMMENT', targetKey: post.targetKey });
       await page.waitForTimeout(750);
+      if (postIndex < posts.length - 1 && hasInterval(interval)) await page.waitForTimeout(randomIntervalSeconds(interval) * 1_000);
     }
     const data = { groupUrl, postsFound: candidates.length, postsRequested: posts.length, postsCommented, filters, posts: results, ...(sideEffectStarted ? { sideEffectStarted: true } : {}) };
     if (postsCommented === posts.length) return { ok: true, data };
@@ -226,7 +231,7 @@ export class FacebookCommentsAutomation {
     return { ok: true, data: { targetKey, commentStatus: 'SENT', sideEffectStarted: true } };
   }
 
-  async replyPostComments(session: PlatformSession, inputPostUrl: string, text: string, maxReplies: number, mediaAssetIds: string[] = []): Promise<ActionResult> {
+  async replyPostComments(session: PlatformSession, inputPostUrl: string, text: string, maxReplies: number, mediaAssetIds: string[] = [], interval: IntervalRangeInput = {}): Promise<ActionResult> {
     const page = session.page as Page;
     const postUrl = normalizeFacebookPostUrl(inputPostUrl);
     try {
@@ -398,6 +403,7 @@ export class FacebookCommentsAutomation {
       repliesSent += 1;
       await control.evaluate(element => element.setAttribute('data-socio-replied', 'true')).catch(() => undefined);
       await page.waitForTimeout(250);
+      if (repliesSent < Math.min(maxReplies, commentsAvailable) && hasInterval(interval)) await page.waitForTimeout(randomIntervalSeconds(interval) * 1_000);
     }
     if (repliesSent < maxReplies) return manual('Không còn đủ bình luận có thể trả lời để đạt số lượt yêu cầu.', { postUrl, repliesRequested: maxReplies, repliesSent, commentsAvailable });
     return { ok: true, data: { postUrl, repliesRequested: maxReplies, repliesSent, commentsAvailable, replyStatus: 'SENT' } };

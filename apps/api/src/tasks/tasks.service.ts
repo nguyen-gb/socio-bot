@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { requiresExternalApproval, type CreateTaskBatchInput, type CreateTaskInput } from '@socio/contracts';
+import { maximumIntervalSeconds, requiresExternalApproval, type CreateTaskBatchInput, type CreateTaskInput } from '@socio/contracts';
 import { Prisma, type Task, type TaskStatus } from '@socio/database';
 import { PrismaService } from '../database/prisma.service';
 import { TemporalClientService } from '../temporal/temporal-client.service';
@@ -759,7 +759,9 @@ export class TasksService {
     const payload = task.payload && typeof task.payload === 'object' && !Array.isArray(task.payload)
       ? task.payload as Record<string, unknown>
       : {};
-    const intervalSeconds = this.positiveNumber(payload.intervalSeconds, 120);
+    // Reserve the worst-case duration so a random delay at the top of the
+    // configured range cannot overlap another campaign on the same account.
+    const intervalSeconds = maximumIntervalSeconds(payload, 120);
     const videoCount = Array.isArray(payload.videoUrls)
       ? payload.videoUrls.length
       : this.positiveNumber(payload.maxVideos, 1);

@@ -53,7 +53,7 @@ export class FacebookAdapter implements PlatformAdapter {
         return new FacebookCommentsAutomation().scanPostComments(session, action.payload.postUrl);
       case 'REPLY_FACEBOOK_POST_COMMENTS':
         return executeFacebookOnce(session, 'REPLY', normalizeFacebookPostUrl(action.payload.postUrl),
-          () => new FacebookCommentsAutomation().replyPostComments(session, action.payload.postUrl, action.payload.text, action.payload.maxReplies, action.payload.mediaAssetIds),
+          () => new FacebookCommentsAutomation().replyPostComments(session, action.payload.postUrl, action.payload.text, action.payload.maxReplies, action.payload.mediaAssetIds, action.payload),
           { postUrl: normalizeFacebookPostUrl(action.payload.postUrl), repliesRequested: action.payload.maxReplies, repliesSent: 0, replyStatus: 'SKIPPED_DUPLICATE' });
       case 'COMMENT_FACEBOOK_GROUP_POSTS':
         return new FacebookCommentsAutomation().commentGroupPosts(session, action.payload.groupUrl, action.payload.text, action.payload.mediaAssetIds, {
@@ -63,7 +63,7 @@ export class FacebookAdapter implements PlatformAdapter {
           minComments: action.payload.minComments,
           maxComments: action.payload.maxComments,
           maxPosts: action.payload.maxPosts,
-        });
+        }, action.payload);
     }
   }
 
