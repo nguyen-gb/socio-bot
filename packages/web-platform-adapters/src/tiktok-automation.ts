@@ -2177,14 +2177,25 @@ export async function advanceTikTokForYouFeed(page: EvaluatablePage): Promise<bo
   return false;
 }
 
-/** Wait for the smooth scroll, result cards, and their thumbnails to hydrate. */
+/**
+ * Wait for the result list to react to a scroll.
+ *
+ * Search cards are actionable as soon as their video anchors are mounted. TikTok
+ * may keep one or more thumbnails in a pending state for a long time (or leave
+ * a CDN request pending indefinitely), so waiting for every image here can hold
+ * the campaign for the full hydration timeout even though the next cards are
+ * already visible and extractable.
+ */
 async function waitForTikTokResultsLoad(page: EvaluatablePage, previousVideoCount: number): Promise<void> {
   if (!page.evaluate) {
     await waitForTikTokUi(page, 500, 900);
     return;
   }
   const canWait = Boolean(page.waitForTimeout);
-  const deadline = Date.now() + tikTokResultHydrationWaitMs;
+  // Keep this bounded independently from the long safety timeout used while
+  // waiting for the very first Search result surface. A scroll only needs a
+  // short render turn; it must not wait for lazy thumbnails.
+  const deadline = Date.now() + Math.min(tikTokResultHydrationWaitMs, 3_000);
   let settledPasses = 0;
   while (Date.now() < deadline) {
     const snapshot = await page.evaluate(() => {
@@ -2216,15 +2227,22 @@ async function waitForTikTokResultsLoad(page: EvaluatablePage, previousVideoCoun
       await waitForTikTokUi(page, 300, 550);
       continue;
     }
-    if (snapshot.videoCount > previousVideoCount && !snapshot.mediaLoading) return;
-    if (snapshot.videoCount >= previousVideoCount && !snapshot.mediaLoading) settledPasses += 1;
-    else settledPasses = 0;
-    if (settledPasses >= 2) return;
+    // The URL anchors are the data we need. Do not gate progress on image
+    // readiness; one short render turn is enough for TikTok's virtualized list
+    // to expose the next card and keeps scroll-to-scroll latency predictable.
+    if (snapshot.videoCount > previousVideoCount) {
+      await waitForTikTokUi(page, 180, 320);
+      return;
+    }
+    if (snapshot.videoCount > 0) {
+      settledPasses += 1;
+      if (settledPasses >= 2) return;
+    }
     await waitForTikTokUi(page, 180, 320);
   }
   // The result list can contain cards without images (for example while the
-  // CDN is slow). Do not discard the cards just because the media deadline
-  // expired; extraction will still return their URL/title/username.
+  // CDN is slow). Do not discard the cards just because the short render
+  // deadline expired; extraction still returns their URL/title/username.
 }
 
 async function waitForTikTokUi(page: EvaluatablePage, minMs = 500, maxMs = 1_000): Promise<void> {
